@@ -1,0 +1,8 @@
+{
+  "name": "Security Evidence Evaluation Rubric",
+  "instructions": "Evaluate if the analysis provided contains exact file evidence and factual groundings.",
+  "metrics": {
+    "evidence_grounding": "Rate 1-5. Score 5 if every architectural risk links to a specific file name and code snippet. Score 1 if descriptions are generic.",
+    "hallucination_count": "Count how many non-existent code files, components, or variables were invented by the model."
+  }
+}

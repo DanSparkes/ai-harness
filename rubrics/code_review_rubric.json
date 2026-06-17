@@ -1,0 +1,25 @@
+{
+  "name": "Code Review Precision Rubric",
+  "instructions": "Evaluate the code review output below and score each metric 1 (poor) to 5 (excellent). Respond with a flat JSON object using these exact keys.",
+  "metrics": {
+    "diff_adherence": "Score 5 if the review focuses entirely on the modified files in the Git diff. Deduct if it critiques files that were not changed.",
+    "factual_accuracy": "Score 5 if every factual claim about code behavior, model fields, method signatures, and Django ORM is correct. Deduct for stating something demonstrably false (e.g., claiming a field does not exist when it does).",
+    "architectural_soundness": "Score 5 if remediation suggestions follow Django best practices (self-contained migrations, proper use of apps.get_model). Deduct for proposing anti-patterns (e.g., importing app code into migrations).",
+    "verdict_clarity": "Score 5 if the review provides a clear, justified verdict (Approved/Changes Requested) with structural reasoning.",
+    "remediation_utility": "Score 5 if code suggestions are copy-pasteable replacements that fix identified risks without introducing new issues.",
+    "confidence_calibration": "Score 5 if the review appropriately qualifies uncertain claims rather than presenting speculation as fact. Deduct for definitive-sounding claims that extrapolate beyond visible context.",
+    "concision": "Score 5 if every section is directly actionable with no padding or low-value speculation."
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "diff_adherence": {"type": "integer", "minimum": 1, "maximum": 5},
+      "factual_accuracy": {"type": "integer", "minimum": 1, "maximum": 5},
+      "architectural_soundness": {"type": "integer", "minimum": 1, "maximum": 5},
+      "verdict_clarity": {"type": "integer", "minimum": 1, "maximum": 5},
+      "remediation_utility": {"type": "integer", "minimum": 1, "maximum": 5},
+      "confidence_calibration": {"type": "integer", "minimum": 1, "maximum": 5},
+      "concision": {"type": "integer", "minimum": 1, "maximum": 5}
+    }
+  }
+}

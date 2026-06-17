@@ -1,0 +1,31 @@
+{
+  "name": "Staff Architecture Review Rubric",
+  "instructions": "Evaluate whether the architectural review demonstrates evidence-backed Staff-level judgment, pragmatic Django expertise, and actionable prioritization.",
+
+  "metrics": {
+    "evidence_quality": {
+      "weight": 30,
+      "criteria": "Rate 1-5. Score 5 if findings consistently cite specific files, repository structures, or observable implementation patterns. Score 1 if conclusions are unsupported or speculative."
+    },
+
+    "hallucination_resistance": {
+      "weight": 25,
+      "criteria": "Rate 1-5. Score 5 if uncertainty is acknowledged and unsupported claims are discarded. Score 1 if the review invents missing structures or overstates confidence."
+    },
+
+    "django_pragmatism": {
+      "weight": 20,
+      "criteria": "Rate 1-5. Score 5 if recommendations favor incremental, Django-native improvements. Score 1 if the review defaults to enterprise patterns such as unnecessary service layers, DTOs, or excessive decomposition."
+    },
+
+    "operational_reasoning": {
+      "weight": 15,
+      "criteria": "Rate 1-5. Score 5 if the review identifies realistic reliability, observability, performance, or scaling risks grounded in the codebase. Score 1 if recommendations remain purely theoretical."
+    },
+
+    "prioritization_quality": {
+      "weight": 10,
+      "criteria": "Rate 1-5. Score 5 if recommendations are ranked according to impact, effort, and business trade-offs. Score 1 if the report treats all findings as equally important."
+    }
+  }
+}

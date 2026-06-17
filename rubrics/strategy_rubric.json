@@ -1,0 +1,9 @@
+{
+  "name": "Staff Engineer Strategic Alignment Rubric",
+  "instructions": "Evaluate whether the onboarding roadmap provides deeply contextual, prioritized engineering strategy based on the parsed codebase topology.",
+  "metrics": {
+    "strategic_actionability": "Rate 1-5. Score 5 if every phase lists specific files/modules and explicitly dictates what to modify. Score 1 if recommendations are generic engineering platitudes.",
+    "topography_adherence": "Rate 1-5. Score 5 if the risks and quick wins focus strictly on classes or boundaries present in the parsed map. Deduct points if the model targets components that do not exist.",
+    "coverage_index": "Rate 1-5. Did the roadmap comprehensively cover all 5 dimensions requested (quick wins, major risks, org adjustments, architecture investments, observability/testing)?"
+  }
+}

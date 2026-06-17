@@ -1,0 +1,9 @@
+{
+  "name": "Architectural Exploration Quality Rubric",
+  "instructions": "Evaluate if the exploratory analysis successfully clarifies ambiguous product requirements and maps them accurately to existing codebase elements.",
+  "metrics": {
+    "endpoint_mapping_precision": "Rate 1-5. Score 5 if the model pinpoints specific, existing view and serializer classes from the topography map for the journal, coach, and insights tools. Score 1 if it only lists the abstract URLs provided in the prompt.",
+    "tradeof_depth": "Rate 1-5. Did the model critically evaluate Enums vs. AWS Secrets vs. DB options, detailing performance, deployment complexity, and latency impact?",
+    "insights_resolution": "Rate 1-5. Did the model inspect the topography map to explicitly determine the current structure of the insights endpoints and provide a concrete gating strategy for them?"
+  }
+}
