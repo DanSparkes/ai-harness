@@ -1,5 +1,5 @@
 {
-  "description": "MCP server configuration. git, memory, and django are free and installable via pip. filesystem and thinking require Node.js/npx.",
+  "description": "MCP servers for Python/Django projects (memores-api). Includes django-ai-boost for live ORM introspection.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",

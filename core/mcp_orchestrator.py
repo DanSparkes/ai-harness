@@ -88,6 +88,7 @@ class MCPOrchestrator:
         started = []
         for name, cfg in self._server_config.items():
             try:
+                cfg = self._resolve_template_vars(cfg)
                 client = MCPClient(name, cfg)
                 info = client.connect(init_timeout=120.0)
                 print(f"  MCP [{name}] connected: {info.get('name', 'unknown')} v{info.get('version', '?')}")
@@ -99,6 +100,22 @@ class MCPOrchestrator:
                 print(f"  MCP [{name}] unexpected error: {e}")
         self._started = True
         return started
+
+    def _resolve_template_vars(self, cfg: dict) -> dict:
+        """Replace {{REPO_PATH}} in config values with the target repo path."""
+        if not self._target_repo:
+            return cfg
+        resolved = {}
+        for key, val in cfg.items():
+            if isinstance(val, str):
+                resolved[key] = val.replace("{{REPO_PATH}}", self._target_repo)
+            elif isinstance(val, list):
+                resolved[key] = [item.replace("{{REPO_PATH}}", self._target_repo) if isinstance(item, str) else item for item in val]
+            elif isinstance(val, dict):
+                resolved[key] = self._resolve_template_vars(val)
+            else:
+                resolved[key] = val
+        return resolved
 
     def stop(self):
         for name, client in self._clients.items():

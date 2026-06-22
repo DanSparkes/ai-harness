@@ -28,25 +28,27 @@ FALLBACK_REVIEWER     = "gemini-2.5-flash"
 HEAVY_REVIEWER        = "deepseek-r1:14b"
 # ==============================================================================
 
-TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
-MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+TARGET_DJANGO_PROJECT = os.environ.get("TARGET_REPO", "/Users/dansparkes/memores/memores-api")
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.python.json")
 
 _mcp_orch = None
 
 
-def init_mcp():
+def init_mcp(repo_path=None, config_path=None):
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
-    if not os.path.exists(MCP_CONFIG_PATH):
+    cfg_path = config_path or MCP_CONFIG_PATH
+    if not os.path.exists(cfg_path):
         return None
+    path = repo_path or TARGET_DJANGO_PROJECT
     from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
+    orch = MCPOrchestrator(cfg_path, target_repo=path)
     started = orch.start()
     if started:
         _mcp_orch = orch
         try:
-            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
+            orch.call_tool("git", "git_set_repo", {"path": path})
         except Exception:
             pass
         return orch
@@ -90,12 +92,30 @@ def parse_arguments():
         default="develop", 
         help="Source branch containing new changes (default: develop)"
     )
+    parser.add_argument(
+        "--project-context", "-c",
+        default=None,
+        help="Path to a project-specific context file (markdown) with domain knowledge to inject into the review"
+    )
+    parser.add_argument(
+        "--repo", "-r",
+        default=None,
+        help="Path to the target repository (overrides TARGET_REPO env var and defaults)"
+    )
+    parser.add_argument(
+        "--mcp-config", "-m",
+        default=None,
+        help="Path to MCP server config file (overrides MCP_CONFIG env var and default)"
+    )
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
     target_branch = args.target
     source_branch = args.source
+
+    target_repo = args.repo or os.environ.get("TARGET_REPO", TARGET_DJANGO_PROJECT)
+    mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
 
     is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
@@ -105,7 +125,7 @@ def main():
 
     print(f"{'='*60}")
     print(f"🚀 Launching Local Code Review Engine (Hybrid Mode)")
-    print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
+    print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local JSON Judge : {HEAVY_REVIEWER}")
     print(f"Review Delta     : {target_branch} <--- {source_branch}")
@@ -115,12 +135,12 @@ def main():
 
     # 1. Gather Global Structural Picture
     print("📦 Step 1a: Parsing global project topography...")
-    topographer = DjangoTopographer(TARGET_DJANGO_PROJECT)
+    topographer = DjangoTopographer(target_repo)
     project_map = topographer.scan_project()
 
     # 2. Gather Local Line Changes Picture
     print("🔍 Step 1b: Extracting Git modifications...")
-    git_layer = GitDiffProvider(TARGET_DJANGO_PROJECT)
+    git_layer = GitDiffProvider(target_repo)
     raw_diff = git_layer.get_diff(target_branch, source_branch)
     changed_files = git_layer.get_changed_files(target_branch, source_branch)
 
@@ -143,12 +163,25 @@ def main():
 
     # 4b. Initialize MCP workbench for richer context
     print("   Initializing MCP workbench...")
-    orch = init_mcp()
+    orch = init_mcp(repo_path=target_repo, config_path=mcp_config_path)
     mcp_block = build_mcp_context() if orch else ""
     if orch:
         print("   [Done] MCP workbench active (git context + memory recall)\n")
     else:
         print("   [Skipped] No MCP config found\n")
+
+    # 4c. Load project-specific context file if provided
+    project_context_block = ""
+    if args.project_context:
+        ctx_path = args.project_context
+        if os.path.exists(ctx_path):
+            with open(ctx_path, "r", encoding="utf-8") as f:
+                project_context_block = f.read()
+            print(f"   [Loaded] Project context from {ctx_path}\n")
+        else:
+            print(f"   [Warning] Project context file not found: {ctx_path}\n")
+    else:
+        print("   [Skipped] No project context file specified (-c to add)\n")
 
     # 5. Build prompt context
     project_map_json = json.dumps(project_map, indent=2, default=str)
@@ -156,13 +189,14 @@ def main():
 
     # 6. Build prompts for either cloud or local mode
     mcp_prompt_section = f"\n\n### MCP-Augmented Context (Live Project State)\n{mcp_block}" if mcp_block else ""
+    project_context_section = f"\n\n### Project-Specific Context ({os.path.basename(args.project_context)})\n{project_context_block}" if project_context_block else ""
 
     # Single-pass fallback: used for local-only mode and cloud API failures
     # Keep project map clipped (it's reference context, not what we review).
     # The diff is kept in full — clipping it would skip reviewing real changes.
     clipped_map = project_map_json[:8000] + ("\n... [map truncated]" if len(project_map_json) > 8000 else "")
 
-    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}
+    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}{project_context_section}
 
 ## Project Model Map
 ```json
@@ -198,7 +232,7 @@ Here is the global system layout of the app (models with their fields, serialize
 
 Here are the files changed in this branch:
 {changed_files_json}
-{mcp_prompt_section}
+{mcp_prompt_section}{project_context_section}
 
 Analyze the structural intersection. Which upstream modules, views, or serializers could break or be impacted by changes to these specific files?
 Identify potential vulnerabilities or scaling defects introduced by the patch."""
@@ -208,7 +242,7 @@ Review the raw lines of code changed in this branch:
 ```diff
 {raw_diff}
 ```
-{mcp_prompt_section}
+{mcp_prompt_section}{project_context_section}
 
 Generate your final review report. Evaluate line changes, ensure patterns are clean, verify things are getting better and not worse, and generate code corrections where needed.
 

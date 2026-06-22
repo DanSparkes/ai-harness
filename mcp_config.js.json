@@ -1,5 +1,5 @@
 {
-  "description": "MCP server configuration. git, memory, and django are free and installable via pip. filesystem and thinking require Node.js/npx.",
+  "description": "MCP servers for JS/TS frontend projects (memores-admin). Includes Puppeteer for visual review and web fetch for API testing.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",
@@ -24,21 +24,24 @@
       "enabled": true,
       "description": "Built-in. Persistent knowledge graph: remember, recall, forget. Zero dependencies."
     },
-    "django": {
+    "puppeteer": {
       "type": "stdio",
-      "command": "uv",
+      "command": "npx",
       "args": [
-        "run",
-        "django-ai-boost",
-        "--settings",
-        "memores.settings"
+        "-y",
+        "@hisma/server-puppeteer"
       ],
-      "env": {
-        "PYTHONPATH": "{{REPO_PATH}}"
-      },
-      "cwd": "{{REPO_PATH}}",
       "enabled": true,
-      "description": "Live Django introspection: models, DB schema, URLs, settings, ORM queries, system checks, migrations. Install: pip install django-ai-boost"
+      "description": "Headless browser automation: screenshots, DOM inspection, console checks, rendered UI verification."
+    },
+    "fetch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-server-fetch"
+      ],
+      "enabled": true,
+      "description": "Fetch web pages and API endpoints. Test backend API responses while reviewing frontend code. Install: uvx mcp-server-fetch"
     },
     "thinking": {
       "type": "stdio",
