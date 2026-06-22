@@ -8,7 +8,8 @@
     "verdict_clarity": "Score 5 if the review provides a clear, justified verdict (Approved/Changes Requested) with structural reasoning.",
     "remediation_utility": "Score 5 if code suggestions are copy-pasteable replacements that fix identified risks without introducing new issues.",
     "confidence_calibration": "Score 5 if the review appropriately qualifies uncertain claims rather than presenting speculation as fact. Deduct for definitive-sounding claims that extrapolate beyond visible context.",
-    "concision": "Score 5 if every section is directly actionable with no padding or low-value speculation."
+    "concision": "Score 5 if every section is directly actionable with no padding or low-value speculation.",
+    "test_scrutiny": "Score 5 if the review identifies missing or inadequate test coverage for changed code, and flags weak/tautological assertions that don't meaningfully validate behavior. Deduct if the review ignores tests entirely."
   },
   "output_schema": {
     "type": "object",
@@ -19,7 +20,8 @@
       "verdict_clarity": {"type": "integer", "minimum": 1, "maximum": 5},
       "remediation_utility": {"type": "integer", "minimum": 1, "maximum": 5},
       "confidence_calibration": {"type": "integer", "minimum": 1, "maximum": 5},
-      "concision": {"type": "integer", "minimum": 1, "maximum": 5}
+      "concision": {"type": "integer", "minimum": 1, "maximum": 5},
+      "test_scrutiny": {"type": "integer", "minimum": 1, "maximum": 5}
     }
   }
 }

@@ -1,8 +1,10 @@
 {
   "name": "Security Evidence Evaluation Rubric",
-  "instructions": "Evaluate if the analysis provided contains exact file evidence and factual groundings.",
+  "instructions": "Evaluate the security analysis for evidence quality, severity calibration, and actionable accuracy.",
   "metrics": {
-    "evidence_grounding": "Rate 1-5. Score 5 if every architectural risk links to a specific file name and code snippet. Score 1 if descriptions are generic.",
-    "hallucination_count": "Count how many non-existent code files, components, or variables were invented by the model."
+    "evidence_grounding": "Rate 1-5. Score 5 if every finding links to a specific file path, class name, and evidence from the topography. Score 1 if descriptions are generic or reference files not in the map.",
+    "hallucination_count": "Count how many non-existent code files, components, or variables were invented by the model.",
+    "severity_calibration": "Rate 1-5. Score 5 if every HIGH/CRITICAL finding is fully justified by visible evidence and would not be a false positive upon code inspection. Score 3 if some findings are over-severed (e.g., marking methods as HIGH when they could be stubs). Score 1 if multiple findings are clearly over-stated or misclassified given the available parser data.",
+    "actionable_finding_rate": "Rate 1-5. Score 5 if 80%+ of findings would realistically warrant developer attention. Score 3 if half are false positives or informational noise. Score 1 if nearly all findings are invalid due to parser gaps (stubs, custom auth, missing attributes)."
   }
 }

@@ -21,7 +21,7 @@ ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
 # qwen3.6: 23GB, 256K context — large enough for the full diff + two-pass review
 FALLBACK_REVIEWER     = "gemini-2.5-flash"
 # Local Judge: Scoring a review against a rubric is simpler — 14B is sufficient
-HEAVY_REVIEWER        = "qwen2.5-coder:14b" 
+HEAVY_REVIEWER        = "deepseek-r1:14b" 
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
@@ -117,6 +117,7 @@ Review the diff above. For each changed file, evaluate whether the changes are c
 4. **CORRECT IS A FINDING** — If a change looks correct, say "Looks correct" explicitly. A review that finds no issues is valid.
 5. **NO GENERIC ADVICE** — Do not give generic Django/python architecture lectures. Only comment on what the diff actually changes.
 6. **FILE-BY-FILE** — Cover each changed file in order. For each one: (a) what changed, (b) is it correct, (c) any issues found.
+7. **TEST COVERAGE & VALIDITY** — For every changed source file, check that corresponding test files exist and adequately cover the new/modified logic. Flag tests that use vague or tautological assertions (e.g., `assert response.status_code == 200` without checking response body, or `assert True`). Tests must assert meaningful outcomes — request that tests validate actual state changes, error messages, or data transformations.
 
 Format as markdown with file paths as headings."""
 
