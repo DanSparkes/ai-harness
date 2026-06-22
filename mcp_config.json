@@ -1,5 +1,5 @@
 {
-  "description": "MCP server configuration. git and memory are built-in (zero dependencies). filesystem and thinking require Node.js/npx but are free.",
+  "description": "MCP server configuration. git, memory, and django are free and installable via pip. filesystem and thinking require Node.js/npx.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",
@@ -9,7 +9,7 @@
         "@modelcontextprotocol/server-filesystem",
         "/Users/dansparkes/memores/memores-api"
       ],
-      "enabled": false,
+      "enabled": true,
       "description": "Read, search, and list files. Free. Requires Node.js/npx."
     },
     "git": {
@@ -24,12 +24,31 @@
       "enabled": true,
       "description": "Built-in. Persistent knowledge graph: remember, recall, forget. Zero dependencies."
     },
+    "django": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "django-ai-boost",
+        "--settings",
+        "memores.settings"
+      ],
+      "env": {
+        "PYTHONPATH": "/Users/dansparkes/memores/memores-api"
+      },
+      "cwd": "/Users/dansparkes/memores/memores-api",
+      "enabled": true,
+      "description": "Live Django introspection: models, DB schema, URLs, settings, ORM queries, system checks, migrations. Install: pip install django-ai-boost"
+    },
     "thinking": {
       "type": "stdio",
-      "command": "python3",
-      "args": [],
-      "enabled": false,
-      "description": "Sequential Thinking server. Free. Requires Python script from github.com/modelcontextprotocol/servers"
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "enabled": true,
+      "description": "Sequential thinking for complex multi-step reasoning. Free. Requires Node.js/npx."
     }
   }
 }

@@ -31,7 +31,8 @@ class GitDiffProvider:
             ".",
             ":(exclude)**/fixtures/**",
             ":(exclude)fixtures/**",
-            ":(exclude)uv.lock"
+            ":(exclude)uv.lock",
+            ":(exclude)*.md"
         ])
 
     def get_changed_files(self, target_branch: str, source_branch: str) -> list[str]:
@@ -44,6 +45,7 @@ class GitDiffProvider:
             ".",
             ":(exclude)**/fixtures/**",
             ":(exclude)fixtures/**",
-            ":(exclude)uv.lock"
+            ":(exclude)uv.lock",
+            ":(exclude)*.md"
         ])
         return [line.strip() for line in output.splitlines() if line.strip()]

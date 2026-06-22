@@ -3,17 +3,24 @@ import json
 import time
 
 class StatefulHarnessRunner:
-    """Manages multi-pass execution against any OpenAI-compatible API (mlx-lm, cloud, etc.)."""
-    def __init__(self, model_name: str, base_url: str = "http://localhost:8080", api_key: str = None, fallback_model_name: str = None):
+    """Manages multi-pass execution against local Ollama or cloud OpenAI-compatible models."""
+    def __init__(self, model_name: str, base_url: str = "http://localhost:11434", api_key: str = None, fallback_model_name: str = None, num_ctx: int = 65536):
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name or model_name
         self.api_key = api_key
-        self.is_cloud = bool(api_key)
+        self.num_ctx = num_ctx
 
-        if not base_url.endswith("/chat/completions"):
-            base_url = base_url.rstrip("/") + "/v1/chat/completions"
-        self.api_url = base_url
-        self.fallback_api_url = None
+        self.is_cloud = "gemini" in model_name.lower() or bool(api_key)
+
+        if self.is_cloud:
+            if not base_url.endswith("/chat/completions"):
+                base_url = base_url.rstrip("/") + "/chat/completions"
+            self.api_url = base_url
+        else:
+            self.api_url = f"{base_url}/api/chat"
+
+    def unload(self):
+        pass
 
     def _call_with_retry(self, url: str, payload: dict, headers: dict, max_retries: int = 5, base_delay: float = 2.0) -> requests.Response:
         retry_codes = {429, 503}
@@ -24,7 +31,7 @@ class StatefulHarnessRunner:
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 code = response.status_code
-                print(f"   ⏳ API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})...")
+                print(f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})...")
                 time.sleep(delay)
         return response
 
@@ -37,25 +44,44 @@ class StatefulHarnessRunner:
                 messages.append({"role": "user", "content": pass_prompt})
 
             headers = {"Content-Type": "application/json"}
-            if self.api_key:
+            if self.is_cloud and self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
 
-            payload = {
-                "model": self.model_name,
-                "messages": messages,
-                "stream": False,
-                "temperature": 0.0 if "coder" in self.model_name else 0.4,
-                "top_p": 0.9
-            }
+            temperature = 0.0 if "coder" in self.model_name else 0.4
 
-            response = self._call_with_retry(self.api_url, payload, headers) if self.is_cloud else requests.post(self.api_url, json=payload, headers=headers)
+            if self.is_cloud:
+                payload = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "stream": False,
+                    "temperature": temperature,
+                    "top_p": 0.9
+                }
+            else:
+                payload = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "num_ctx": self.num_ctx,
+                        "temperature": temperature,
+                        "top_p": 0.9
+                    }
+                }
+
+            print(f"   --- Pass {idx+1}/{len(passes)} ---")
+            pass_t0 = time.time()
+
+            if self.is_cloud:
+                response = self._call_with_retry(self.api_url, payload, headers)
+            else:
+                response = requests.post(self.api_url, json=payload, headers=headers)
 
             if self.is_cloud and response.status_code in (429, 503):
                 label = "429" if response.status_code == 429 else "503 (retries exhausted)"
-                print(f"   ⚠️ Cloud API unavailable ({label}). Falling back to local mlx-lm...")
+                print(f"   \u26a0\ufe0f Cloud API unavailable ({label}). Falling back to local Ollama...")
                 self.is_cloud = False
-                fallback_base = "http://localhost:8080"
-                self.api_url = fallback_base.rstrip("/") + "/v1/chat/completions"
+                self.api_url = "http://localhost:11434/api/chat"
                 self.model_name = self.fallback_model_name
 
                 fb_messages = [{"role": "system", "content": system_prompt},
@@ -64,18 +90,19 @@ class StatefulHarnessRunner:
                     "model": self.model_name,
                     "messages": fb_messages,
                     "stream": False,
-                    "temperature": 0.4,
-                    "top_p": 0.9
+                    "options": {
+                        "num_ctx": self.num_ctx,
+                        "temperature": temperature,
+                        "top_p": 0.9
+                    }
                 }
                 headers = {"Content-Type": "application/json"}
                 response = requests.post(self.api_url, json=payload, headers=headers)
 
                 response.raise_for_status()
                 response_data = response.json()
-                assistant_response = response_data["choices"][0]["message"]["content"]
+                assistant_response = response_data.get("message", {}).get("content", "")
                 if not assistant_response:
-                    print(f"   ⚠️ LLM returned empty or unexpected response")
-                    print(f"   Response keys: {list(response_data.keys())}")
                     assistant_response = "# Basic Diff Scan\n\nUnable to generate review.\n"
 
                 execution_history.append({
@@ -83,20 +110,21 @@ class StatefulHarnessRunner:
                     "prompt": "(fallback)",
                     "output": assistant_response
                 })
-
                 break
 
             response.raise_for_status()
             response_data = response.json()
 
-            assistant_response = response_data["choices"][0]["message"]["content"]
-            if not assistant_response:
-                print(f"   ⚠️ LLM returned empty or unexpected response")
-                print(f"   Response keys: {list(response_data.keys())}")
-                assistant_response = "# Basic Diff Scan\n\nUnable to generate review.\n"
-
             if self.is_cloud:
-                messages.append({"role": "assistant", "content": assistant_response})
+                assistant_response = response_data["choices"][0]["message"]["content"]
+            else:
+                assistant_response = response_data.get("message", {}).get("content", "")
+                if not assistant_response:
+                    print(f"   \u26a0\ufe0f LLM returned empty or unexpected response")
+                    assistant_response = "# Basic Diff Scan\n\nUnable to generate review.\n"
+
+            elapsed = time.time() - pass_t0
+            print(f"   [Done] Pass {idx+1} in {elapsed:.1f}s  ({len(assistant_response)} chars)")
 
             execution_history.append({
                 "pass_index": idx + 1,

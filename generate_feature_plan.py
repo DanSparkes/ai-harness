@@ -30,9 +30,9 @@ from typing import Any
 # ── Defaults ──────────────────────────────────────────────────────────────────
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
-MLX_LM_URL = "http://localhost:8080/v1/chat/completions"
+_mlx_cache = {}
 
-ARCHITECT_MODEL = "mlx-community/Qwen3-14B-4bit"
+ARCHITECT_MODEL = "mlx-community/Qwen3.6-27B-4bit"
 ARCHITECT_ENGINE = "mlx-lm"
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -245,22 +245,20 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
 
 
 def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "temperature": 0.0,
-    }
-    try:
-        resp = requests.post(MLX_LM_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"mlx-lm error: {e}")
-        sys.exit(1)
+    from mlx_lm import load, generate
+    if model not in _mlx_cache:
+        print(f"   Loading {model}...")
+        _mlx_cache[model] = load(model)
+    mlx_model, mlx_tokenizer = _mlx_cache[model]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt = mlx_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    t0 = time.time()
+    result = generate(mlx_model, mlx_tokenizer, prompt=prompt, verbose=False, max_tokens=8192)
+    print(f"   -> Generated {len(result)} chars in {time.time() - t0:.1f}s")
+    return result
 
 
 def execute_agent(engine: str, model: str, system_prompt: str, user_prompt: str) -> str:

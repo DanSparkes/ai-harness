@@ -12,19 +12,20 @@ from core.warehouse import HarnessWarehouse
 # ==============================================================================
 # MODEL & API CONFIGURATION
 # ==============================================================================
-# Architect: Large model for the heavy code review reasoning.
-# Set to a Gemini model (via Google's OpenAI-compatible endpoint) when
-# GEMINI_API_KEY is set, otherwise uses local mlx-lm.
-CLOUD_MODEL           = "gemini-2.5-flash"
-LOCAL_MODEL           = "mlx-community/Qwen3-32B-4bit"
-REASONING_ARCHITECT   = CLOUD_MODEL if os.getenv("GEMINI_API_KEY") else LOCAL_MODEL
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if os.getenv("GEMINI_API_KEY") else "http://localhost:8080"
-ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
+# Default is local Ollama. Set USE_GEMINI=true to use Gemini cloud API.
+USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-# Local Fallback: Smaller mlx-lm model used when the cloud API is unavailable
-FALLBACK_REVIEWER     = "mlx-community/Qwen3-8B-4bit"
-# Local Judge: Scores the review against a rubric — 14B is sufficient
-HEAVY_REVIEWER        = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit"
+CLOUD_MODEL           = "gemini-2.5-flash"
+LOCAL_MODEL           = "qwen3.6:latest"
+
+REASONING_ARCHITECT   = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
+ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if USE_GEMINI else "http://localhost:11434"
+ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+
+# Local Fallback: Used when cloud API is unavailable
+FALLBACK_REVIEWER     = "gemini-2.5-flash"
+# Local Judge: Scores the review against a rubric
+HEAVY_REVIEWER        = "deepseek-r1:14b"
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
@@ -96,9 +97,9 @@ def main():
     target_branch = args.target
     source_branch = args.source
 
-    is_local_mode = "localhost" in ARCHITECT_API_BASE or not ARCHITECT_API_KEY
+    is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
-        print("❌ Error: GEMINI_API_KEY environment variable is not set.")
+        print("❌ Error: USE_GEMINI=true requires GEMINI_API_KEY to be set.")
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
@@ -157,11 +158,15 @@ def main():
     mcp_prompt_section = f"\n\n### MCP-Augmented Context (Live Project State)\n{mcp_block}" if mcp_block else ""
 
     # Single-pass fallback: used for local-only mode and cloud API failures
+    # Keep project map clipped (it's reference context, not what we review).
+    # The diff is kept in full — clipping it would skip reviewing real changes.
+    clipped_map = project_map_json[:8000] + ("\n... [map truncated]" if len(project_map_json) > 8000 else "")
+
     fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}
 
 ## Project Model Map
 ```json
-{project_map_json}
+{clipped_map}
 ```
 
 ## Git Diff
@@ -220,6 +225,7 @@ Follow the markdown schema and headers defined in your system prompt."""
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
+        num_ctx=81920,
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,

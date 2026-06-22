@@ -89,7 +89,7 @@ class MCPOrchestrator:
         for name, cfg in self._server_config.items():
             try:
                 client = MCPClient(name, cfg)
-                info = client.connect()
+                info = client.connect(init_timeout=120.0)
                 print(f"  MCP [{name}] connected: {info.get('name', 'unknown')} v{info.get('version', '?')}")
                 self._clients[name] = client
                 started.append(name)

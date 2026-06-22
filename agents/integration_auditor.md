@@ -18,6 +18,7 @@ When your prompt includes an "=== MCP TOOL WORKBENCH ===" section, you have acce
 - **Git tools:** Check `git_diff` to precisely identify what changed vs the base branch. Use `git_blame` to understand if suspicious patterns predate the change.
 - **Memory tools:** Recall stored architectural rules relevant to this project (e.g., "Do not use default Django permissions").
 - **Documentation tools:** Verify that generated code uses correct, non-deprecated framework APIs.
+- **Django tools:** Use `database_schema` to validate that new code matches actual DB constraints, indexes, and FK relationships. Use `list_models` to verify model/field names referenced in new code exist in the live project.
 
 Use the available MCP context to increase the accuracy of your delta-audit. If the MCP context confirms a pre-existing pattern is not new, exclude it from your rejection rationale.
 

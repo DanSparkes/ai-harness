@@ -23,7 +23,7 @@ You have access to an MCP tool workbench that provides additional context:
 - **Persistent Memory (memory server):** `remember`, `recall`, `list_all` — store and retrieve architectural rules across sessions (e.g., "memores-api enforces snake_case JSON payloads").
 - **Filesystem (filesystem server):** `read_file`, `search_files`, `list_directory` — explore the codebase without reading entire files sequentially.
 - **Documentation (docs server):** Query localized Django/DRF documentation to verify method signatures and avoid API drift.
-- **Web Search (brave_search server):** `brave_web_search` — search for real-time solutions to specific errors or package issues.
+- **Django Introspection (django server):** `database_schema`, `list_models`, `list_urls`, `application_info`, `list_migrations` — introspect live project models, DB schema (indexes, FKs), and URL patterns for architectural mapping without parsing source files.
 - **Sequential Thinking (thinking server):** `sequential_thinking` — work through complex architecture decisions step-by-step before finalizing.
 
 When the MCP tool context block is present in your prompt, use those tools to gather precise information. Cross-reference your architectural assumptions against live project state.

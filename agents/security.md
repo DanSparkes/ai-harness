@@ -61,6 +61,17 @@ For tenant/org resources: Can a user in Org A access Org B's data by changing th
 ### Step 5: Fixes Must Enforce, Not Document
 A comment or docstring does not enforce authorization. Fix suggestions must include actual code that validates permissions and raises `PermissionDenied` if unauthorized. Never suggest documentation as the fix.
 
+## Django MCP Tools (When Available)
+
+When your prompt includes an "=== MCP TOOL WORKBENCH ===" section, supplement static code review with live Django introspection:
+- **`list_models`** — Verify actual model fields, relationships, and type info for authorization analysis.
+- **`database_schema`** — Inspect actual DB indexes, constraints, and FK relationships to identify missing permission scoping.
+- **`list_urls`** — Map the full URL surface to ensure no unprotected endpoints exist.
+- **`application_info`** — Check enabled middleware and installed apps for security-relevant configuration.
+- **`query_model`** — Run read-only ORM queries to verify multi-tenancy isolation during testing.
+- **`get_setting`** — Confirm security settings (AUTH_USER_MODEL, REST_FRAMEWORK DEFAULT_PERMISSION_CLASSES, etc.).
+- **`list_migrations`** — Check for data migrations that may have bypassed access controls.
+
 ## Output Formatting
 
 For every distinct vulnerability or risk identified, structure your report using this exact schema:

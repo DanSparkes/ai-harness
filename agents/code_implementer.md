@@ -17,4 +17,6 @@ When your prompt includes an "=== MCP TOOL WORKBENCH ===" section, you have acce
 - **Filesystem tools:** Search the codebase for reference implementations or check related files for consistency.
 - **Documentation tools:** Query Django/DRF docs to verify correct method signatures and import paths before generating code.
 
+- **Django tools:** Query `list_models` to verify field names/types before writing ORM code. Use `get_setting` to confirm configuration values. Use `database_schema` to understand actual DB constraints.
+
 Use the available MCP context to make informed decisions, especially when modifying existing files.

@@ -1,13 +1,12 @@
-import requests
 import json
+import time
+import requests
 
 class AutomatedEvaluator:
-    """Grades model outputs against structured JSON rubrics via an OpenAI-compatible API (mlx-lm)."""
-    def __init__(self, judge_model: str = "mlx-community/Qwen2.5-14B-Instruct-4bit", base_url: str = "http://localhost:8080"):
+    """Grades model outputs against structured JSON rubrics using Ollama."""
+    def __init__(self, judge_model: str = "qwen2.5-coder:14b", base_url: str = "http://localhost:11434"):
         self.judge_model = judge_model
-        if not base_url.endswith("/chat/completions"):
-            base_url = base_url.rstrip("/") + "/v1/chat/completions"
-        self.api_url = base_url
+        self.base_url = base_url
 
     def grade_run(self, candidate_output: str, rubric_path: str, context: str = "") -> dict:
         with open(rubric_path, "r") as f:
@@ -42,17 +41,33 @@ class AutomatedEvaluator:
             f"Expected format:\n```json\n{expected_keys}\n```\n"
         )
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
         payload = {
             "model": self.judge_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            "messages": messages,
             "stream": False,
-            "temperature": 0.0
+            "options": {
+                "num_ctx": 32768,
+                "temperature": 0.0
+            }
         }
 
-        response = requests.post(self.api_url, json=payload)
+        t0 = time.time()
+        response = requests.post(f"{self.base_url}/api/chat", json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+        result = response.json()
+        raw = result.get("message", {}).get("content", "")
+        elapsed = time.time() - t0
+        print(f"   -> Scored in {elapsed:.1f}s  ({len(raw)} chars)")
+
+        # Strip think tags (DeepSeek-R1 wraps reasoning in <think>...</think>)
+        import re
+        cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        # Remove markdown code fences if present
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+        return json.loads(cleaned)

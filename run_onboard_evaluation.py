@@ -6,14 +6,17 @@ from core.runner import StatefulHarnessRunner
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
-CLOUD_MODEL           = "gemini-2.5-flash"
-LOCAL_MODEL           = "mlx-community/Qwen3-32B-4bit"
-REASONING_ARCHITECT   = CLOUD_MODEL if os.getenv("GEMINI_API_KEY") else LOCAL_MODEL
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if os.getenv("GEMINI_API_KEY") else "http://localhost:8080"
-ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
+USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-FALLBACK_REVIEWER     = "mlx-community/Qwen3-8B-4bit"
-HEAVY_REVIEWER        = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit"
+CLOUD_MODEL           = "gemini-2.5-flash"
+LOCAL_MODEL           = "qwen3.6:latest"
+
+REASONING_ARCHITECT   = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
+ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if USE_GEMINI else "http://localhost:11434"
+ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+
+FALLBACK_REVIEWER     = "gemini-2.5-flash"
+HEAVY_REVIEWER        = "deepseek-r1:14b"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -66,9 +69,9 @@ def build_mcp_context() -> str:
     return "\n\n".join(parts)
 
 def main():
-    is_local_mode = "localhost" in ARCHITECT_API_BASE or not ARCHITECT_API_KEY
+    is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
-        print("Error: GEMINI_API_KEY environment variable is not set.")
+        print("Error: USE_GEMINI=true requires GEMINI_API_KEY to be set.")
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
@@ -241,6 +244,7 @@ Generate the final report matching the schema defined in your system prompt. Inc
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
+        num_ctx=65536,
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,

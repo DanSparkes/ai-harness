@@ -11,7 +11,7 @@ from typing import Any, Callable
 JSON_RPC_VERSION = "2.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
-HEADER_DELIM = b"\r\n\r\n"
+USE_NDJSON = True  # newline-delimited JSON (modern MCP stdio)
 
 
 class MCPError(Exception):
@@ -31,30 +31,21 @@ class MCPToolError(MCPError):
 
 
 def _encode_message(msg: dict) -> bytes:
-    body = json.dumps(msg, ensure_ascii=False)
-    header = f"Content-Length: {len(body)}\r\n\r\n"
-    return header.encode() + body.encode()
+    return json.dumps(msg, ensure_ascii=False).encode() + b"\n"
 
 
 def _decode_message(data: bytes) -> tuple[dict | None, bytes]:
-    delim_pos = data.find(HEADER_DELIM)
-    if delim_pos == -1:
+    newline_pos = data.find(b"\n")
+    if newline_pos == -1:
         return None, data
-    header_part = data[:delim_pos]
-    body_start = delim_pos + len(HEADER_DELIM)
-    for line in header_part.decode().split("\r\n"):
-        if line.lower().startswith("content-length:"):
-            length = int(line.split(":", 1)[1].strip())
-            body_end = body_start + length
-            if len(data) < body_end:
-                return None, data
-            body = data[body_start:body_end]
-            remaining = data[body_end:]
-            try:
-                return json.loads(body), remaining
-            except json.JSONDecodeError as e:
-                raise MCPError(f"Failed to decode MCP message: {e}")
-    raise MCPError("Missing Content-Length header in MCP message")
+    line = data[:newline_pos]
+    remaining = data[newline_pos + 1:]
+    if not line.strip():
+        return None, remaining
+    try:
+        return json.loads(line), remaining
+    except json.JSONDecodeError as e:
+        raise MCPError(f"Failed to decode MCP message: {e}")
 
 
 class _StdioTransport:
@@ -93,6 +84,8 @@ class _StdioTransport:
         self._running = True
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
 
     def disconnect(self):
         self._running = False
@@ -141,9 +134,13 @@ class _StdioTransport:
                 self._process.stdin.flush()
 
     def _reader_loop(self):
+        import select
         while self._running and self._process and self._process.stdout:
             try:
-                chunk = self._process.stdout.read(4096)
+                r, _, _ = select.select([self._process.stdout], [], [], 0.5)
+                if not r:
+                    continue
+                chunk = os.read(self._process.stdout.fileno(), 65536)
                 if not chunk:
                     break
                 self._buf += chunk
@@ -163,6 +160,15 @@ class _StdioTransport:
             if result_queue:
                 result_queue.put(msg)
         else:
+            pass
+
+    def _drain_stderr(self):
+        if not self._process or not self._process.stderr:
+            return
+        try:
+            for _ in iter(self._process.stderr.readline, b""):
+                pass
+        except Exception:
             pass
 
 
@@ -254,7 +260,7 @@ class MCPClient:
         self._capabilities: dict[str, Any] = {}
         self._tools_cache: list[dict[str, Any]] | None = None
 
-    def connect(self):
+    def connect(self, init_timeout: float = 120.0):
         transport_type = self.config.get("type", "stdio")
         if transport_type == "stdio":
             command = self.config["command"]
@@ -278,7 +284,7 @@ class MCPClient:
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "local-harness", "version": "1.0.0"},
-        })
+        }, timeout=init_timeout)
         self._server_info = result.get("serverInfo", {})
         self._capabilities = result.get("capabilities", {})
         self._transport.send_notification("notifications/initialized")

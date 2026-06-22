@@ -2,7 +2,7 @@
 """
 new_feature_harness.py
 Reads a feature pipeline (.json or .md) and drives multi-agent coding workflows
-with local-Ollama/Gemini cloud support, human-reviewable .md report consumption,
+with local-mlx-lm/Gemini cloud support, human-reviewable .md report consumption,
 and an optional multi-MCP tool workbench for codebase exploration, git context,
 persistent memory, and structured reasoning.
 """
@@ -17,7 +17,7 @@ import requests
 from typing import Any, Dict, Tuple
 
 # Core Configurations
-MLX_LM_URL = "http://localhost:8080/v1/chat/completions"
+_mlx_cache = {}
 
 # Set up runtime agents: Options are "mlx-lm" or "gemini"
 IMPLEMENTER_ENGINE = "mlx-lm"
@@ -25,7 +25,7 @@ AUDITOR_ENGINE     = "gemini"
 
 # Model names
 MLX_IMPLEMENTER_MODEL = "mlx-community/Qwen3-14B-4bit"
-MLX_AUDITOR_MODEL     = "mlx-community/Qwen3-32B-4bit"
+MLX_AUDITOR_MODEL     = "mlx-community/Qwen3.6-27B-4bit"
 GEMINI_MODEL          = "gemini-2.5-flash"
 
 # MCP integration
@@ -97,22 +97,20 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
 
 
 def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "temperature": 0.0,
-    }
-    try:
-        response = requests.post(MLX_LM_URL, json=payload, timeout=180)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"mlx-lm connection error: {e}")
-        sys.exit(1)
+    from mlx_lm import load, generate
+    if model not in _mlx_cache:
+        print(f"   Loading {model}...")
+        _mlx_cache[model] = load(model)
+    mlx_model, mlx_tokenizer = _mlx_cache[model]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt = mlx_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    t0 = time.time()
+    result = generate(mlx_model, mlx_tokenizer, prompt=prompt, verbose=False, max_tokens=8192)
+    print(f"   -> Generated {len(result)} chars in {time.time() - t0:.1f}s")
+    return result
 
 
 def execute_agent(engine: str, local_model: str, system_prompt: str, user_prompt: str) -> str:
