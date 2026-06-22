@@ -1,167 +1,30 @@
 #!/usr/bin/env python3
 """
-run_execution_harness.py (Delta Auditing Layout)
-Automates a multi-agent generation loop featuring environmental isolation,
-in-place formatting, and delta-scoped audits to protect against legacy debt blocks.
+run_execution_harness.py (Agent/Skill Architecture)
+Reads a pipeline JSON, dispatches each step to the assigned Agent
+with its allowed Skills, and iterates on failures.
 """
 
 import os
 import sys
 import json
+import time
 import subprocess
 
-# Local Core Hardware Matrix
-IMPLEMENTER_MODEL = "mlx-community/Qwen3-14B-4bit"
-AUDITOR_MODEL     = "mlx-community/Qwen3.6-27B-4bit"
+from core.agent import AgentRegistry, build_default_registry, build_dependency_graph, skill_get_affected_files
+
 TARGET_REPO       = "/Users/dansparkes/memores/memores-api"
 
-_mlx_cache = {}
+USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
-    from mlx_lm import load, generate
-    if model not in _mlx_cache:
-        print(f"   Loading {model}...")
-        _mlx_cache[model] = load(model)
-    mlx_model, mlx_tokenizer = _mlx_cache[model]
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    prompt = mlx_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    t0 = time.time()
-    result = generate(mlx_model, mlx_tokenizer, prompt=prompt, verbose=False, max_tokens=8192)
-    print(f"   -> Generated {len(result)} chars in {time.time() - t0:.1f}s")
-    return result
-MCP_CONFIG_PATH   = os.environ.get("MCP_CONFIG", "mcp_config.json")
-
-_mcp_orch = None
-
-
-def init_mcp():
-    global _mcp_orch
-    if _mcp_orch is not None:
-        return _mcp_orch
-    if not os.path.exists(MCP_CONFIG_PATH):
-        return None
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_REPO)
-    started = orch.start()
-    if started:
-        _mcp_orch = orch
-        try:
-            orch.call_tool("git", "git_set_repo", {"path": TARGET_REPO})
-        except Exception:
-            pass
-        return orch
-    return None
-
-
-def build_mcp_context() -> str:
-    orch = _mcp_orch
-    if not orch:
-        return ""
-    parts = []
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"Working Tree:\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=10)
-        if recent and not recent.startswith("("):
-            parts.append(f"Recent Commits:\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["architectural_rule", "active"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Memory Context:\n{memory}")
-    except Exception:
-        pass
-    return "\n\n".join(parts)
-
-# Complete End-to-End Task Pipeline with Fine-Tuned System Parameters
-EXECUTION_PIPELINE = [
-    {
-        "step": 1,
-        "name": "Access Gate Registry Configuration",
-        "target_file": "memores/config/access_gates.py",
-        "instruction": "Create a pure data configuration registry dictionary named ACCESS_GATE_REGISTRY mapping frontend feature slugs to Django permission codenames. Include standard fallback messages and fallback_grant_options arrays. Provide explicit type annotations utilizing a TypedDict to satisfy strict mypy settings. Do not import views or models."
-    },
-    {
-        "step": 2,
-        "name": "DRF Custom Permission Gatekeeper",
-        "target_file": "memores/permissions.py",
-        "instruction": "Implement a reusable AccessGatePermission class extending rest_framework.permissions.BasePermission. Read the view's 'required_feature_slug' attribute at runtime. Safeguard request.user access against AnonymousUser type configurations. Call profile.resolve_feature_access(codename) if authenticated. Raise PermissionDenied with a standardized message on failure."
-    },
-    {
-        "step": 3,
-        "name": "Dynamic Access Gate Metadata Serializer",
-        "target_file": "memores/serializers/access_gates.py",
-        "instruction": "Implement DynamicAccessGateSerializer extending serializers.Serializer. Contain a single permissions field mapped via SerializerMethodField. Call user.get_all_permissions() to prime Django's permission cache in RAM before looping over the configuration registry to construct a flat camelCased output map. Ensure NO invalid 'Meta' class block is included."
-    },
-    {
-        "step": 4,
-        "name": "User Payload Schema Integration",
-        "target_file": "memores/serializers/user_serializers.py",
-        "instruction": (
-            "Locate the existing UserSerializer class within the provided file context. Do not modify or alter any other sibling classes. "
-            "1. Inside the UserSerializer class body, declare: permissions = serializers.SerializerMethodField().\n"
-            "2. Inside the UserSerializer Meta.fields tuple, append the 'permissions' string element cleanly.\n"
-            "3. Implement the 'get_permissions(self, obj: User) -> dict[str, Any]:' method on the UserSerializer class.\n"
-            "4. Inside the get_permissions method body, use a function-local lazy import for DynamicAccessGateSerializer to isolate dependencies.\n"
-            "5. Apply a strict guard: 'request = self.context.get(\"request\"); if request is None or not request.user.is_authenticated: return {}'.\n"
-            "6. Invoke the serializer directly, passing self.context, and return its results wrapped in an explicit type cast: 'from typing import cast, Any; return cast(dict[str, Any], serializer.get_permissions(obj))'."
-        )
-    },
-    {
-        "step": 5,
-        "name": "Comprehensive Access Gates Unit Test Suite",
-        "target_file": "memores/tests/test_access_gates.py",
-        "instruction": (
-            "Write a robust suite of Django unit tests targeting the new access gates infrastructure inside 'memores/tests/test_access_gates.py'. "
-            "1. NO PRODUCTION VIEW IMPORTS: Declare a local 'class MockView(views.APIView):' inside the test file and assign a 'required_feature_slug = \"reflections_journal\"' class property to it dynamically.\n"
-            "2. VALID CONTENT TYPE: Resolve a valid model ContentType from the database via 'from django.contrib.contenttypes.models import ContentType; ct = ContentType.objects.get_for_model(User)'. Never pass content_type=None.\n"
-            "3. CORRECT REQUEST MOCKING: Use 'rest_framework.test.APIRequestFactory' to build a mock request object. Attach the user instance directly to it via 'request.user = self.user' before passing it to '.has_permission(request, view)' manually.\n"
-            "4. METRIC SCENARIOS: Verify behavior across premium tiers, free tiers with fallback structures, and PermissionDenied enforcement paths."
-        )
-    }
-]
 
 def get_isolated_env() -> dict[str, str]:
     clean_env = os.environ.copy()
-    clean_env.pop("VIRTUAL_ENV", None)  
-    clean_env.pop("PYTHONPATH", None)   
+    clean_env.pop("VIRTUAL_ENV", None)
+    clean_env.pop("PYTHONPATH", None)
     return clean_env
 
-def run_formatter_toolchain(file_path: str, run_env: dict[str, str]):
-    rel_path = os.path.relpath(file_path, TARGET_REPO)
-    try:
-        subprocess.run(["uv", "run", "isort", "--profile", "black", rel_path], cwd=TARGET_REPO, env=run_env, capture_output=True)
-        subprocess.run(["uv", "run", "black", "--target-version", "py312", rel_path], cwd=TARGET_REPO, env=run_env, capture_output=True)
-        subprocess.run(["uv", "run", "ruff", "check", "--fix", rel_path], cwd=TARGET_REPO, env=run_env, capture_output=True)
-    except Exception:
-        pass 
-
-def validate_code_safety(file_path: str, run_env: dict[str, str]) -> tuple[bool, str]:
-    rel_path = os.path.relpath(file_path, TARGET_REPO)
-    try:
-        syntax_res = subprocess.run([sys.executable, "-m", "py_compile", file_path], capture_output=True, text=True)
-        if syntax_res.returncode != 0:
-            return False, f"Syntax Compilation Failure:\n{syntax_res.stderr.strip()}"
-    except Exception as e:
-        return False, f"Syntax validator error: {str(e)}"
-
-    try:
-        mypy_res = subprocess.run(["uv", "run", "mypy", "--check-untyped-defs", rel_path], cwd=TARGET_REPO, env=run_env, capture_output=True, text=True)
-        if mypy_res.returncode != 0:
-            error_log = f"STDOUT:\n{mypy_res.stdout.strip()}\nSTDERR:\n{mypy_res.stderr.strip()}"
-            return False, f"Mypy Type Guard Violation:\n{error_log.strip()}"
-    except Exception as e:
-        return False, f"Mypy execution failed to start: {str(e)}"
-        
-    return True, "Passed local verification standards."
 
 def clean_model_output(raw_output: str) -> str:
     clean_lines = []
@@ -171,168 +34,219 @@ def clean_model_output(raw_output: str) -> str:
         clean_lines.append(line)
     return "\n".join(clean_lines).strip()
 
+
+def load_pipeline(path: str) -> dict:
+    if path.endswith(".md"):
+        import re
+        with open(path) as f:
+            text = f.read()
+        blocks = re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+        for block in blocks:
+            try:
+                return json.loads(block.strip())
+            except json.JSONDecodeError:
+                continue
+        raise ValueError("No valid JSON pipeline block found in .md file")
+    with open(path) as f:
+        return json.load(f)
+
+
 def main():
-    print("=== Launching Pre-Commit Aligned Execution Workflow ===")
-    print(f"Target System Workspace: {TARGET_REPO}\n")
+    if len(sys.argv) < 2:
+        print("Usage: python3 run_execution_harness.py <plan.json|plan.md>")
+        sys.exit(1)
+
+    plan_path = sys.argv[1]
+    print(f"=== Loading plan: {plan_path} ===")
+    plan = load_pipeline(plan_path)
+
+    target_workspace = plan.get("target_workspace", TARGET_REPO)
+    pipeline = plan.get("pipeline", [])
+    if not pipeline:
+        print("❌ No pipeline steps found in plan.")
+        sys.exit(1)
+
+    print(f"Target Workspace: {target_workspace}")
+    print(f"Pipeline Steps: {len(pipeline)}")
+
+    # Build registry with all agents + skills
+    registry = build_default_registry(target_workspace, GEMINI_API_KEY if USE_GEMINI else None)
+    print(f"   Agents loaded: {registry.list_agents()}")
+    print(f"   Skills loaded: {registry.list_skills()}")
 
     isolated_env = get_isolated_env()
 
-    # Pre-Flight Sync
-    print("🔄 Pre-Flight: Synchronizing target project virtual environment dependencies...")
+    # Pre-flight sync
+    print("\n🔄 Pre-flight: Synchronizing dependencies...")
     try:
-        subprocess.run(["uv", "sync"], cwd=TARGET_REPO, env=isolated_env, check=True, capture_output=True)
-        print("   ✅ Workspace dependencies synchronized successfully.\n")
+        subprocess.run(["uv", "sync"], cwd=target_workspace, env=isolated_env, check=True, capture_output=True)
+        print("   ✅ Dependencies synchronized.\n")
     except subprocess.CalledProcessError as e:
-        print(f"   ❌ Pre-flight workspace sync failed:\n{e.stderr.decode().strip()}")
+        print(f"   ❌ Sync failed:\n{e.stderr.decode().strip()}")
         sys.exit(1)
-
-    orch = init_mcp()
-    mcp_block = build_mcp_context() if orch else ""
-    if orch:
-        print("   MCP Workbench active (git context + memory recall)\n")
-    else:
-        print("   (No MCP servers configured)\n")
-
-    with open("agents/code_implementer.md", "r", encoding="utf-8") as f:
-        implementer_persona = f.read()
-    with open("agents/integration_auditor.md", "r", encoding="utf-8") as f:
-        auditor_persona = f.read()
 
     exploration_report = ""
     if os.path.exists("reports/access_gates_architectural_exploration.md"):
-        with open("reports/access_gates_architectural_exploration.md", "r", encoding="utf-8") as f:
+        with open("reports/access_gates_architectural_exploration.md") as f:
             exploration_report = f.read()
 
-    for task in EXECUTION_PIPELINE:
-        print(f"\n[Stage {task['step']}] Initiating: {task['name']}")
-        full_target_path = os.path.join(TARGET_REPO, task["target_file"])
-        
+    # Build dependency graph once for cascading-breakage detection
+    print("\n🔍 Building dependency graph...")
+    dep_graph = build_dependency_graph(target_workspace)
+    print(f"   {len(dep_graph)} modules tracked for cascading breakage.")
+
+    for step in pipeline:
+        step_num = step.get("step", pipeline.index(step) + 1)
+        task_desc = step.get("task", step.get("name", step.get("instruction", "(unnamed step)")))
+        agent_name = step.get("assigned_agent", "Engineer")
+        skills_override = step.get("allowed_skills", None)
+
+        print(f"\n[Stage {step_num}] {task_desc}")
+        print(f"   Assigned Agent: {agent_name}")
+
+        full_target_path = None
+        target_file = step.get("target_file")
+        if target_file:
+            full_target_path = os.path.join(target_workspace, target_file)
+
         file_backup_contents = None
         existing_file_context = ""
-        is_modifying_existing_file = False
-        
-        if os.path.exists(full_target_path):
-            is_modifying_existing_file = True
-            with open(full_target_path, "r", encoding="utf-8") as f:
+        is_modifying = False
+
+        if full_target_path and os.path.exists(full_target_path):
+            is_modifying = True
+            with open(full_target_path) as f:
                 file_backup_contents = f.read()
             existing_file_context = (
-                f"\n\nCRITICAL CONTEXT: This production file already contains existing code that MUST be preserved.\n"
-                f"Do NOT remove or shorten any other classes, methods, or imports. Retain the entire content layout "
-                f"and modify or extend only what is requested:\n"
+                f"\n\nCRITICAL CONTEXT: This file already contains existing code.\n"
+                f"Do NOT remove other classes, methods, or imports. Modify/extend only what is requested:\n"
                 f"```python\n{file_backup_contents}\n```\n"
             )
 
-        code_generated = ""
-        max_attempts = 4
-        stage_completed_successfully = False
-        
+            # Check for downstream dependents (cascading breakage detection)
+            affected = skill_get_affected_files(target_file, graph=dep_graph)
+            if affected and not affected.startswith("(no"):
+                existing_file_context += f"\n\nDOWNSTREAM DEPENDENTS (files that import this module):\n{affected}\n"
+                existing_file_context += "IMPORTANT: Ensure your changes don't break these files.\n"
+
+        max_attempts = step.get("max_attempts", step.get("retry", 4))
+        stage_completed = False
+
         for attempt in range(1, max_attempts + 1):
-            print(f"  -> Generation Attempt {attempt}/{max_attempts} via [{IMPLEMENTER_MODEL}]...")
-            
+            print(f"   -> Attempt {attempt}/{max_attempts} via [{agent_name}]...")
+
             user_prompt = f"""
-            System Exploratory Analysis Context:
-            {exploration_report}
-            {existing_file_context}
-            {mcp_block}
+System Exploratory Analysis Context:
+{exploration_report}
+{existing_file_context}
 
-            Destination Target File Path: {task['target_file']}
-            Execution Requirements: {task['instruction']}
+Destination Target File Path: {target_file or '(not specified)'}
+Execution Requirements: {task_desc}
 
-            Generate the absolute, complete final production code for this file. Preserve all existing code segments if provided. Provide clean type annotations. Do not include commentary outside the code block.
-            """
-            
-            raw_response = call_mlx_lm(IMPLEMENTER_MODEL, implementer_persona, user_prompt)
-            code_generated = clean_model_output(raw_response)
-            
-            os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
-            with open(full_target_path, "w", encoding="utf-8") as f:
-                f.write(code_generated)
+Generate the absolute, complete final production code for this file. Preserve all existing code segments if provided. Use clean type annotations. Do not include commentary outside the code block.
+"""
 
-            run_formatter_toolchain(full_target_path, isolated_env)
-            
-            with open(full_target_path, "r", encoding="utf-8") as f:
-                code_generated = f.read()
+            agent = registry.get_agent(agent_name)
+            t0 = time.time()
+            raw_response = agent.execute(user_prompt, registry._skills, stream=True)
+            elapsed = time.time() - t0
+            print(f"   -> Generated in {elapsed:.1f}s")
 
-            success, log_msg = validate_code_safety(full_target_path, isolated_env)
-            if not success:
-                print(f"  ❌ Formatting/Type Check Failed on Attempt {attempt}.")
-                print(f"     --- Verification Error Output ---\n{log_msg}\n     ---------------------------------")
-                
-                if file_backup_contents is not None:
-                    with open(full_target_path, "w", encoding="utf-8") as f:
+            # Check for syntax error caught during streaming
+            if raw_response.startswith("__SYNTAX_ERROR__:"):
+                _, err, partial = raw_response.split(":", 2)
+                print(f"   ❌ Streaming Syntax Error: {err[:200]}")
+                if file_backup_contents:
+                    with open(full_target_path, "w") as f:
                         f.write(file_backup_contents)
-                elif os.path.exists(full_target_path):
-                    os.remove(full_target_path)
-                    
-                exploration_report += f"\n\n[Feedback Loop Attempt {attempt} Error Log for {task['target_file']}]:\n{log_msg}"
+                exploration_report += f"\n\n[Attempt {attempt} Syntax Error for {target_file}]:\n{err}"
                 continue
 
-            print("  ✅ Local Verification Gates Passed: Formatted code compiles cleanly.")
-            
-            print(f"  -> Initiating Architectural Integration Review via [{AUDITOR_MODEL}]...")
-            
-            # FIXED: Scope the auditor instructions based on whether we are auditing a delta or a fresh module
-            if is_modifying_existing_file:
+            code_generated = clean_model_output(raw_response)
+
+            # If a target file is specified, write it
+            if full_target_path:
+                os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
+                with open(full_target_path, "w") as f:
+                    f.write(code_generated)
+
+                # Run local verification skills if available
+                if skills_override and any(s in skills_override for s in ["run_formatter", "validate_syntax", "run_mypy"]):
+                    if "run_formatter" in (skills_override or []):
+                        registry.get_skill("run_formatter").fn(full_target_path)
+                        with open(full_target_path) as f:
+                            code_generated = f.read()
+
+                    if "validate_syntax" in (skills_override or []):
+                        syntax_result = registry.get_skill("validate_syntax").fn(full_target_path)
+                        if "Error" in syntax_result:
+                            print(f"   ❌ Syntax Error: {syntax_result}")
+                            if file_backup_contents:
+                                with open(full_target_path, "w") as f:
+                                    f.write(file_backup_contents)
+                            exploration_report += f"\n\n[Attempt {attempt} Syntax Error for {target_file}]:\n{syntax_result}"
+                            continue
+
+                    if "run_mypy" in (skills_override or []):
+                        mypy_result = registry.get_skill("run_mypy").fn(full_target_path)
+                        if "mypy OK" not in mypy_result:
+                            print(f"   ❌ Mypy Violation:\n{mypy_result}")
+                            if file_backup_contents:
+                                with open(full_target_path, "w") as f:
+                                    f.write(file_backup_contents)
+                            exploration_report += f"\n\n[Attempt {attempt} Mypy Error for {target_file}]:\n{mypy_result}"
+                            continue
+
+                print("   ✅ Local verification passed.")
+
+            # Audit step for existing-file modifications
+            if is_modifying:
+                auditor_name = step.get("auditor_agent", "QA_Tester")
+                print(f"   -> Audit via [{auditor_name}]...")
+
                 scope_directive = (
-                    "CRITICAL DIRECTION: This is an active production file update. Focus your zero-tolerance checks "
-                    "EXCLUSIVELY on the newly added 'permissions' field and 'get_permissions' method logic within the UserSerializer class. "
-                    "Do NOT reject this submission because of pre-existing legacy code patterns, missing user hashes, or structural anti-patterns "
-                    "found in adjacent legacy classes (such as ForgotPasswordSerializer or CreateUpdateProfileSerializer), as those are part of the baseline codebase debt."
+                    "CRITICAL: This is an active production file update. Focus your zero-tolerance checks "
+                    "EXCLUSIVELY on newly added code. Do NOT reject due to pre-existing legacy patterns."
                 )
+
+                audit_prompt = f"""
+Proposed Module Content for '{target_file}':
+```python
+{code_generated}
+```
+
+{scope_directive}
+
+Output your analysis and conclude with 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.
+"""
+                auditor = registry.get_agent(auditor_name)
+                t0 = time.time()
+                audit_verdict = auditor.execute(audit_prompt)
+                print(f"   -> Audit completed in {time.time() - t0:.1f}s")
+                print(f"   --- Audit ---\n{audit_verdict}\n   ------------")
+
+                if "VERDICT: APPROVED" in audit_verdict:
+                    print(f"   🎉 Audit approved.")
+                    stage_completed = True
+                    break
+                else:
+                    print(f"   🛑 Auditor rejected. Feeding critique back to implementer...")
+                    exploration_report += f"\n\n[Auditor Rejection Attempt {attempt} for {target_file}]:\n{audit_verdict}"
+                    if file_backup_contents:
+                        with open(full_target_path, "w") as f:
+                            f.write(file_backup_contents)
             else:
-                scope_directive = "Verify this implementation against our design rules: Ensure no top-level view cross-imports, no loop allocations/N+1 queries, and valid framework declarations."
-
-            audit_prompt = f"""
-            Proposed Module Content for '{task['target_file']}':
-            ```python
-            {code_generated}
-            ```
-
-            {scope_directive}
-
-            Live Project Context:
-            {mcp_block}
-            
-            Output your analysis and conclude explicitly with 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.
-            """
-            
-            audit_verdict = call_mlx_lm(AUDITOR_MODEL, auditor_persona, audit_prompt)
-            print(f"\n--- Audit Trace for Step {task['step']} (Attempt {attempt}) ---\n{audit_verdict}\n----------------------------------\n")
-            
-            if "VERDICT: APPROVED" in audit_verdict:
-                print(f"  🎉 Audit Confirmed: Safely writing production module to target workspace.")
-                stage_completed_successfully = True
+                stage_completed = True
                 break
-            else:
-                print(f"  🛑 Auditor Rejected Attempt {attempt}. Feeding critique back to implementer context...")
-                exploration_report += f"\n\n[Auditor Failure Feedback Loop Attempt {attempt} for {task['target_file']}]:\n{audit_verdict}"
-                
-                if file_backup_contents is not None:
-                    with open(full_target_path, "w", encoding="utf-8") as f:
-                        f.write(file_backup_contents)
-                elif os.path.exists(full_target_path): 
-                    os.remove(full_target_path)
 
-        if not stage_completed_successfully:
-            print(f"Critical: Maximum generation and auditing cycles exhausted for {task['name']}. Halting pipeline execution.")
+        if not stage_completed:
+            print(f"❌ Stage {step_num} failed after {max_attempts} attempts. Halting.")
             sys.exit(1)
 
-        if orch:
-            orch.remember(
-                f"exec:access_gates:step:{task['step']}",
-                f"Implemented {task['name']} in {task['target_file']}",
-                tags=["execution", "access_gates", "active"],
-            )
+        print(f"   ✅ Stage {step_num} complete.")
 
-    if orch:
-        orch.remember(
-            "exec:access_gates:complete",
-            "All 5 Access Gates pipeline stages completed successfully",
-            tags=["execution", "access_gates", "complete"],
-        )
-        orch.stop()
+    print("\n=== Pipeline Complete ===")
 
-    print("\n=== All 5 Stages of the Agentic Pipeline Completed Successfully ===")
 
 if __name__ == "__main__":
     main()

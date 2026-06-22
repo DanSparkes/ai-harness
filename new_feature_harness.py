@@ -17,18 +17,12 @@ import requests
 from typing import Any, Dict, Tuple
 
 # Core Configurations
-_mlx_cache = {}
+from core.agent import Agent
 
-# Set up runtime agents: Options are "mlx-lm" or "gemini"
-IMPLEMENTER_ENGINE = "mlx-lm"
-AUDITOR_ENGINE     = "gemini"
+IMPLEMENTER_MODEL = "qwen2.5-coder:14b"
+AUDITOR_MODEL     = "qwen3.6:latest"
+GEMINI_MODEL      = "gemini-2.5-flash"
 
-# Model names
-MLX_IMPLEMENTER_MODEL = "mlx-community/Qwen3-14B-4bit"
-MLX_AUDITOR_MODEL     = "mlx-community/Qwen3.6-27B-4bit"
-GEMINI_MODEL          = "gemini-2.5-flash"
-
-# MCP integration
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
 _mcp_orchestrator = None
 
@@ -65,58 +59,18 @@ def get_isolated_env() -> Dict[str, str]:
     return clean_env
 
 
-def call_gemini(system_prompt: str, user_prompt: str) -> str:
-    api_key = get_gemini_api_key()
-    if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is not set.")
-        sys.exit(1)
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-    }
-
-    delays = [1, 2, 4, 8, 16]
-    for attempt, delay in enumerate(delays):
-        try:
-            response = requests.post(
-                url, json=payload, headers={"Content-Type": "application/json"}, timeout=30
-            )
-            response.raise_for_status()
-            result = response.json()
-            text = result["candidates"][0]["content"]["parts"][0]["text"]
-            return text
-        except Exception as e:
-            if attempt == len(delays) - 1:
-                print(f"Gemini API exhausted: {e}")
-                sys.exit(1)
-            print(f"  Gemini retry {attempt+1}/{len(delays)}: {e}")
-            time.sleep(delay)
-    return ""
-
-
-def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
-    from mlx_lm import load, generate
-    if model not in _mlx_cache:
-        print(f"   Loading {model}...")
-        _mlx_cache[model] = load(model)
-    mlx_model, mlx_tokenizer = _mlx_cache[model]
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    prompt = mlx_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    t0 = time.time()
-    result = generate(mlx_model, mlx_tokenizer, prompt=prompt, verbose=False, max_tokens=8192)
-    print(f"   -> Generated {len(result)} chars in {time.time() - t0:.1f}s")
-    return result
-
-
-def execute_agent(engine: str, local_model: str, system_prompt: str, user_prompt: str) -> str:
-    if engine == "gemini":
-        return call_gemini(system_prompt, user_prompt)
-    return call_mlx_lm(local_model, system_prompt, user_prompt)
+def build_agent(name: str, system_prompt: str, model_name: str = None, num_ctx: int = 65536) -> Agent:
+    use_gemini = model_name and "gemini" in model_name.lower()
+    api_key = get_gemini_api_key() if use_gemini else None
+    base_url = "https://generativelanguage.googleapis.com/v1beta/openai" if use_gemini else "http://localhost:11434"
+    return Agent(
+        name=name,
+        system_prompt=system_prompt,
+        model_name=model_name or IMPLEMENTER_MODEL,
+        base_url=base_url,
+        api_key=api_key,
+        num_ctx=num_ctx,
+    )
 
 
 def run_formatter_toolchain(file_path: str, target_repo: str, run_env: Dict[str, str]) -> None:
@@ -265,17 +219,17 @@ def main() -> None:
         print(f"Error: Target workspace directory '{target_repo}' does not exist.")
         sys.exit(1)
 
-    if IMPLEMENTER_ENGINE == "gemini" or AUDITOR_ENGINE == "gemini":
-        if not get_gemini_api_key():
-            print("Setup Error: GEMINI_API_KEY is not set.")
-            print("Run: export GEMINI_API_KEY='your_api_key_here'")
-            sys.exit(1)
+    use_gemini = "gemini" in AUDITOR_MODEL.lower()
+    if use_gemini and not get_gemini_api_key():
+        print("Setup Error: GEMINI_API_KEY is not set.")
+        print("Run: export GEMINI_API_KEY='your_api_key_here'")
+        sys.exit(1)
 
     print("=== Launching Universal Hybrid Execution Workflow ===")
     print(f"Active Feature Campaign : {feature_name}")
     print(f"Target System Workspace : {target_repo}")
-    print(f"Implementer Routing     : [{IMPLEMENTER_ENGINE.upper()}]")
-    print(f"Auditor Routing         : [{AUDITOR_ENGINE.upper()}]\n")
+    print(f"Implementer Model       : [{IMPLEMENTER_MODEL}]")
+    print(f"Auditor Model           : [{AUDITOR_MODEL}]\n")
 
     isolated_env = get_isolated_env()
 
@@ -319,8 +273,18 @@ def main() -> None:
 
     markdown_fence = "`" * 3
 
+    # Use Agent/Skill registry for dispatch if available
+    implementer_agent = build_agent("Implementer", implementer_persona, IMPLEMENTER_MODEL)
+    auditor_agent = build_agent("Auditor", auditor_persona, AUDITOR_MODEL)
+    print(f"   Implementer: {implementer_agent.model_name} | Auditor: {auditor_agent.model_name}")
+
     for task in pipeline:
-        print(f"\n[Stage {task['step']}] Initiating: {task['name']}")
+        # Normalize new/old field names
+        task.setdefault("instruction", task.get("task", task.get("instruction", "")))
+        task.setdefault("assigned_agent", "Engineer")
+        task.setdefault("auditor_agent", "QA_Tester")
+
+        print(f"\n[Stage {task['step']}] Initiating: {task['name']}  Agent: {task.get('assigned_agent', 'Engineer')}")
         full_target_path = os.path.join(target_repo, task["target_file"])
 
         file_backup_contents = None
@@ -341,7 +305,7 @@ def main() -> None:
         stage_completed_successfully = False
 
         for attempt in range(1, max_attempts + 1):
-            print(f"  -> Generation Attempt {attempt}/{max_attempts} via [{IMPLEMENTER_ENGINE.upper()}]...")
+            print(f"  -> Generation Attempt {attempt}/{max_attempts} via [{IMPLEMENTER_MODEL}]...")
 
             user_prompt = f"""
             System Scope Context:
@@ -355,12 +319,7 @@ def main() -> None:
             Generate the absolute, complete final production code for this file. Provide clean type annotations. Do not include commentary outside the code block.
             """
 
-            raw_response = execute_agent(
-                IMPLEMENTER_ENGINE,
-                MLX_IMPLEMENTER_MODEL,
-                implementer_persona,
-                user_prompt,
-            )
+            raw_response = implementer_agent.execute(user_prompt)
             code_generated = clean_model_output(raw_response)
 
             os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
@@ -387,7 +346,7 @@ def main() -> None:
                 continue
 
             print("  Local Verification Gates Passed: Formatted code compiles cleanly.")
-            print(f"  -> Initiating Architectural Integration Review via [{AUDITOR_ENGINE.upper()}]...")
+            print(f"  -> Initiating Architectural Integration Review via [{AUDITOR_MODEL}]...")
 
             if is_modifying_existing_file:
                 scope_directive = (
@@ -420,12 +379,7 @@ def main() -> None:
                 if mcp_context else audit_prompt
             )
 
-            audit_verdict = execute_agent(
-                AUDITOR_ENGINE,
-                MLX_AUDITOR_MODEL,
-                auditor_persona,
-                audit_prompt_with_mcp,
-            )
+            audit_verdict = auditor_agent.execute(audit_prompt_with_mcp)
             print(f"\n--- Audit Trace for Step {task['step']} (Attempt {attempt}) ---\n{audit_verdict}\n----------------------------------\n")
 
             if "VERDICT: APPROVED" in audit_verdict:
@@ -476,10 +430,7 @@ def main() -> None:
 
                 Generate the absolute, complete test file. Provide clean type annotations. Do not include commentary outside the code block.
                 """
-                raw_test = execute_agent(
-                    IMPLEMENTER_ENGINE, MLX_IMPLEMENTER_MODEL,
-                    implementer_persona, test_user_prompt,
-                )
+                raw_test = implementer_agent.execute(test_user_prompt)
                 test_code = clean_model_output(raw_test)
 
                 os.makedirs(os.path.dirname(test_path), exist_ok=True)

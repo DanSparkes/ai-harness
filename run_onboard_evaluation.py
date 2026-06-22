@@ -2,7 +2,7 @@ import os
 import json
 import time
 from core.parser import DjangoTopographer
-from core.runner import StatefulHarnessRunner
+from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
@@ -235,24 +235,29 @@ Generate the final report matching the schema defined in your system prompt. Inc
 
         passes = [pass1, pass2]
 
-    # 4. Execute Reasoning Pass
+    # 4. Execute Reasoning Pass via Agent
     print(f"Step 3: Processing strategy analysis via [{REASONING_ARCHITECT}]...")
     pass_start = time.time()
 
-    runner = StatefulHarnessRunner(
+    analyst = Agent(
+        name="Staff_Onboarding",
+        system_prompt=system_agent_prompt,
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
-        fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=65536,
+        num_ctx=81920,
     )
-    history = runner.execute_sequence(
-        system_prompt=system_agent_prompt,
-        passes=passes,
-        fallback_prompt=fallback_prompt
-    )
-    final_analysis = history[-1]["output"]
-    model_used = runner.model_name
+
+    context = ""
+    for i, pass_prompt in enumerate(passes):
+        combined = f"{context}\n\n{pass_prompt}" if context else pass_prompt
+        t0 = time.time()
+        output = analyst.execute(combined)
+        print(f"   [Done] Pass {i+1}/{len(passes)} in {time.time() - t0:.1f}s")
+        context += f"\n\n[Pass {i+1} Output]:\n{output}"
+
+    final_analysis = output
+    model_used = analyst.model_name
 
     print(f"   [Done] Strategy analysis via {model_used} in {time.time() - pass_start:.2f}s")
 

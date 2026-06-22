@@ -28,12 +28,12 @@ import requests
 from typing import Any
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
+from core.agent import Agent
+
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
-_mlx_cache = {}
 
-ARCHITECT_MODEL = "mlx-community/Qwen3.6-27B-4bit"
-ARCHITECT_ENGINE = "mlx-lm"
+ARCHITECT_MODEL = "qwen3.6:latest"
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # MCP integration
@@ -69,7 +69,11 @@ Provide a step-by-step execution plan as a JSON code block. Each step represents
       "step": 1,
       "name": "short step name",
       "target_file": "relative/path/to/file.py",
-      "instruction": "detailed, specific implementation instruction for this file. Include class names, methods, imports, and exactly what to change."
+      "task": "detailed implementation instruction — class names, methods, imports, exactly what to change.",
+      "assigned_agent": "Engineer",
+      "auditor_agent": "QA_Tester",
+      "allowed_skills": ["write_file", "run_formatter", "validate_syntax", "run_mypy"],
+      "max_attempts": 4
     }
   ]
 }
@@ -217,54 +221,18 @@ def get_gemini_api_key() -> str:
     return os.environ.get("GEMINI_API_KEY", "")
 
 
-def call_gemini(system_prompt: str, user_prompt: str) -> str:
-    api_key = get_gemini_api_key()
-    if not api_key:
-        print("Error: GEMINI_API_KEY not set.")
-        sys.exit(1)
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-    }
-
-    delays = [1, 2, 4, 8, 16]
-    for attempt, delay in enumerate(delays):
-        try:
-            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=60)
-            resp.raise_for_status()
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            if attempt == len(delays) - 1:
-                print(f"Gemini API exhausted: {e}")
-                sys.exit(1)
-            print(f"  Gemini retry {attempt+1}/{len(delays)}: {e}")
-            time.sleep(delay)
-    return ""
-
-
-def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
-    from mlx_lm import load, generate
-    if model not in _mlx_cache:
-        print(f"   Loading {model}...")
-        _mlx_cache[model] = load(model)
-    mlx_model, mlx_tokenizer = _mlx_cache[model]
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    prompt = mlx_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    t0 = time.time()
-    result = generate(mlx_model, mlx_tokenizer, prompt=prompt, verbose=False, max_tokens=8192)
-    print(f"   -> Generated {len(result)} chars in {time.time() - t0:.1f}s")
-    return result
-
-
-def execute_agent(engine: str, model: str, system_prompt: str, user_prompt: str) -> str:
-    if engine == "gemini":
-        return call_gemini(system_prompt, user_prompt)
-    return call_mlx_lm(model, system_prompt, user_prompt)
+def build_agent(engine: str, model: str, system_prompt: str, num_ctx: int = 65536) -> Agent:
+    is_gemini = engine == "gemini"
+    api_key = get_gemini_api_key() if is_gemini else None
+    base_url = "https://generativelanguage.googleapis.com/v1beta/openai" if is_gemini else "http://localhost:11434"
+    return Agent(
+        name="Architect",
+        system_prompt=system_prompt,
+        model_name=model,
+        base_url=base_url,
+        api_key=api_key,
+        num_ctx=num_ctx,
+    )
 
 
 def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
@@ -342,7 +310,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print(f"Generating feature plan for: {name}")
-    print(f"  Architect: [{args.engine.upper()}] via {args.model}")
+    print(f"  Architect: [{'OLLAMA' if args.engine == 'ollama' else 'GEMINI'}] via {args.model}")
     print(f"  Scanning codebase: {args.target_repo}")
     if args.mcp_config:
         print(f"  MCP Config: {args.mcp_config}")
@@ -352,7 +320,8 @@ def cmd_generate(args: argparse.Namespace) -> None:
     mcp_context = get_mcp_context(args)
     user_prompt = build_feature_prompt(args.prompt, codebase_context, args.target_repo, mcp_context)
 
-    raw_output = execute_agent(args.engine, args.model, ARCHITECT_SYSTEM_PROMPT, user_prompt)
+    architect = build_agent(args.engine, args.model, ARCHITECT_SYSTEM_PROMPT, getattr(args, 'num_ctx', 65536))
+    raw_output = architect.execute(user_prompt)
 
     pipeline = extract_pipeline_json(raw_output)
     if pipeline is None:
@@ -405,8 +374,9 @@ def main() -> None:
     gen.add_argument("--target-repo", default=os.environ.get("TARGET_REPO", ""), help="Absolute path to the target repository")
     gen.add_argument("--reports-dir", default=REPORTS_DIR, help="Directory for output files (default: reports/)")
     gen.add_argument("--agents-dir", default=AGENTS_DIR, help="Directory for agent persona files (default: agents/)")
-    gen.add_argument("--engine", default=ARCHITECT_ENGINE, choices=["mlx-lm", "gemini"], help="LLM backend")
-    gen.add_argument("--model", default=ARCHITECT_MODEL, help="Model name")
+    gen.add_argument("--engine", default="ollama", choices=["ollama", "gemini"], help="LLM backend")
+    gen.add_argument("--model", default=ARCHITECT_MODEL, help="Model name (e.g. qwen3.6:latest)")
+    gen.add_argument("--num-ctx", type=int, default=65536, help="Context window size for Ollama")
     gen.add_argument("--mcp-config", help="Path to MCP server configuration JSON")
     gen.add_argument("--force", action="store_true", help="Overwrite existing report")
 

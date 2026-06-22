@@ -2,7 +2,7 @@ import os
 import json
 import time
 from core.parser import DjangoTopographer
-from core.runner import StatefulHarnessRunner
+from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
@@ -293,29 +293,30 @@ Focus on pragmatic Django evolution.""",
 
     passes = pass_templates
 
-    # 4. Execute 4-pass architecture review
+    # 4. Execute multi-pass architecture review via Agent
     print(f"Step 3: Processing architecture review via [{REASONING_ARCHITECT}]...")
     pass_start = time.time()
 
-    runner = StatefulHarnessRunner(
+    architect = Agent(
+        name="Systems_Architect",
+        system_prompt=system_agent_prompt,
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
-        fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=65536,
+        num_ctx=81920,
     )
-    history = runner.execute_sequence(
-        system_prompt=system_agent_prompt,
-        passes=passes,
-        fallback_prompt=fallback_prompt
-    )
-    draft_report = history[-1]["output"]
-    model_used = runner.model_name
 
+    context = ""
+    for i, pass_prompt in enumerate(passes):
+        combined = f"{context}\n\n{pass_prompt}" if context else pass_prompt
+        t0 = time.time()
+        output = architect.execute(combined)
+        print(f"   [Done] Pass {i+1}/{len(passes)} in {time.time() - t0:.1f}s")
+        context += f"\n\n[Pass {i+1} Output]:\n{output}"
+
+    draft_report = output
+    model_used = architect.model_name
     print(f"   [Done] Architecture review via {model_used} in {time.time() - pass_start:.2f}s")
-
-    # Free architect model before loading adversarial reviewer
-    runner.unload()
 
     # 5. Adversarial review
     print(f"Step 4: Running adversarial review via [{HEAVY_REVIEWER}]...")
@@ -346,17 +347,14 @@ Report:
 {draft_report}
 """
 
-    reviewer = StatefulHarnessRunner(
+    adversary = Agent(
+        name="Adversary",
+        system_prompt="",
         model_name=HEAVY_REVIEWER,
         num_ctx=32768,
     )
-    critique = reviewer.execute_sequence("", [adversarial_prompt])[-1]["output"]
-
+    critique = adversary.execute(adversarial_prompt)
     print(f"   [Done] Adversarial review completed in {time.time() - adv_start:.2f}s")
-
-    # Free adversarial reviewer model before loading architect model for revision
-    reviewer.unload()
-    del reviewer
 
     # 6. Revision pass
     print("Step 5: Final revision pass...")
@@ -381,13 +379,8 @@ Original Report:
 {draft_report}
 """
 
-    final_report = runner.execute_sequence("", [revision_prompt])[-1]["output"]
-
+    final_report = architect.execute(revision_prompt)
     print(f"   [Done] Revision completed in {time.time() - rev_start:.2f}s")
-
-    # Free architect model before loading judge
-    runner.unload()
-    del runner
 
     # 7. Evaluate final report quality
     print(f"Step 6: Evaluating final report via Local Judge [{HEAVY_REVIEWER}]...")
