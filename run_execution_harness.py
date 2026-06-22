@@ -12,10 +12,58 @@ import subprocess
 import requests
 
 # Local Core Hardware Matrix
-IMPLEMENTER_MODEL = "qwen3-coder:latest"  
-AUDITOR_MODEL     = "qwen3.6:latest"       
+IMPLEMENTER_MODEL = "mlx-community/Qwen3-14B-4bit"
+AUDITOR_MODEL     = "mlx-community/Qwen3-32B-4bit"
 TARGET_REPO       = "/Users/dansparkes/memores/memores-api"
-OLLAMA_URL        = "http://localhost:11434/api/chat"
+MLX_LM_URL        = "http://localhost:8080/v1/chat/completions"
+MCP_CONFIG_PATH   = os.environ.get("MCP_CONFIG", "mcp_config.json")
+
+_mcp_orch = None
+
+
+def init_mcp():
+    global _mcp_orch
+    if _mcp_orch is not None:
+        return _mcp_orch
+    if not os.path.exists(MCP_CONFIG_PATH):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_REPO)
+    started = orch.start()
+    if started:
+        _mcp_orch = orch
+        try:
+            orch.call_tool("git", "git_set_repo", {"path": TARGET_REPO})
+        except Exception:
+            pass
+        return orch
+    return None
+
+
+def build_mcp_context() -> str:
+    orch = _mcp_orch
+    if not orch:
+        return ""
+    parts = []
+    try:
+        status = orch.git_status()
+        if status and status != "(no output)":
+            parts.append(f"Working Tree:\n{status}")
+    except Exception:
+        pass
+    try:
+        recent = orch.git_log(max_count=10)
+        if recent and not recent.startswith("("):
+            parts.append(f"Recent Commits:\n{recent}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["architectural_rule", "active"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Memory Context:\n{memory}")
+    except Exception:
+        pass
+    return "\n\n".join(parts)
 
 # Complete End-to-End Task Pipeline with Fine-Tuned System Parameters
 EXECUTION_PIPELINE = [
@@ -71,7 +119,7 @@ def get_isolated_env() -> dict[str, str]:
     clean_env.pop("PYTHONPATH", None)   
     return clean_env
 
-def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
+def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -79,17 +127,14 @@ def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt}
         ],
         "stream": False,
-        "options": {
-            "temperature": 0.0,
-            "num_ctx": 262144 if "3.6" in model else 16384
-        }
+        "temperature": 0.0,
     }
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
+        response = requests.post(MLX_LM_URL, json=payload)
         response.raise_for_status()
-        return response.json()["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"Ollama connection error: {e}")
+        print(f"mlx-lm connection error: {e}")
         sys.exit(1)
 
 def run_formatter_toolchain(file_path: str, run_env: dict[str, str]):
@@ -143,6 +188,13 @@ def main():
         print(f"   ❌ Pre-flight workspace sync failed:\n{e.stderr.decode().strip()}")
         sys.exit(1)
 
+    orch = init_mcp()
+    mcp_block = build_mcp_context() if orch else ""
+    if orch:
+        print("   MCP Workbench active (git context + memory recall)\n")
+    else:
+        print("   (No MCP servers configured)\n")
+
     with open("agents/code_implementer.md", "r", encoding="utf-8") as f:
         implementer_persona = f.read()
     with open("agents/integration_auditor.md", "r", encoding="utf-8") as f:
@@ -183,6 +235,7 @@ def main():
             System Exploratory Analysis Context:
             {exploration_report}
             {existing_file_context}
+            {mcp_block}
 
             Destination Target File Path: {task['target_file']}
             Execution Requirements: {task['instruction']}
@@ -190,7 +243,7 @@ def main():
             Generate the absolute, complete final production code for this file. Preserve all existing code segments if provided. Provide clean type annotations. Do not include commentary outside the code block.
             """
             
-            raw_response = call_ollama(IMPLEMENTER_MODEL, implementer_persona, user_prompt)
+            raw_response = call_mlx_lm(IMPLEMENTER_MODEL, implementer_persona, user_prompt)
             code_generated = clean_model_output(raw_response)
             
             os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
@@ -238,11 +291,14 @@ def main():
             ```
 
             {scope_directive}
+
+            Live Project Context:
+            {mcp_block}
             
             Output your analysis and conclude explicitly with 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.
             """
             
-            audit_verdict = call_ollama(AUDITOR_MODEL, auditor_persona, audit_prompt)
+            audit_verdict = call_mlx_lm(AUDITOR_MODEL, auditor_persona, audit_prompt)
             print(f"\n--- Audit Trace for Step {task['step']} (Attempt {attempt}) ---\n{audit_verdict}\n----------------------------------\n")
             
             if "VERDICT: APPROVED" in audit_verdict:
@@ -262,6 +318,21 @@ def main():
         if not stage_completed_successfully:
             print(f"Critical: Maximum generation and auditing cycles exhausted for {task['name']}. Halting pipeline execution.")
             sys.exit(1)
+
+        if orch:
+            orch.remember(
+                f"exec:access_gates:step:{task['step']}",
+                f"Implemented {task['name']} in {task['target_file']}",
+                tags=["execution", "access_gates", "active"],
+            )
+
+    if orch:
+        orch.remember(
+            "exec:access_gates:complete",
+            "All 5 Access Gates pipeline stages completed successfully",
+            tags=["execution", "access_gates", "complete"],
+        )
+        orch.stop()
 
     print("\n=== All 5 Stages of the Agentic Pipeline Completed Successfully ===")
 

@@ -2,7 +2,9 @@
 """
 new_feature_harness.py
 Reads a feature pipeline (.json or .md) and drives multi-agent coding workflows
-with local-Ollama/Gemini cloud support and human-reviewable .md report consumption.
+with local-Ollama/Gemini cloud support, human-reviewable .md report consumption,
+and an optional multi-MCP tool workbench for codebase exploration, git context,
+persistent memory, and structured reasoning.
 """
 
 import os
@@ -15,16 +17,41 @@ import requests
 from typing import Any, Dict, Tuple
 
 # Core Configurations
-OLLAMA_URL = "http://localhost:11434/api/chat"
+MLX_LM_URL = "http://localhost:8080/v1/chat/completions"
 
-# Set up runtime agents: Options are "ollama" or "gemini"
-IMPLEMENTER_ENGINE = "ollama"
+# Set up runtime agents: Options are "mlx-lm" or "gemini"
+IMPLEMENTER_ENGINE = "mlx-lm"
 AUDITOR_ENGINE     = "gemini"
 
 # Model names
-OLLAMA_IMPLEMENTER_MODEL = "qwen3-coder:latest"
-OLLAMA_AUDITOR_MODEL     = "qwen3.6:latest"
-GEMINI_MODEL             = "gemini-2.5-flash"
+MLX_IMPLEMENTER_MODEL = "mlx-community/Qwen3-14B-4bit"
+MLX_AUDITOR_MODEL     = "mlx-community/Qwen3-32B-4bit"
+GEMINI_MODEL          = "gemini-2.5-flash"
+
+# MCP integration
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+_mcp_orchestrator = None
+
+
+def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
+    global _mcp_orchestrator
+    if _mcp_orchestrator is not None:
+        return _mcp_orchestrator
+    if not os.path.exists(config_path):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(config_path, target_repo=target_repo)
+    started = orch.start()
+    if started:
+        _mcp_orchestrator = orch
+        if target_repo:
+            orch.call_tool("git", "git_set_repo", {"path": target_repo})
+        return orch
+    return None
+
+
+def get_mcp_orchestrator():
+    return _mcp_orchestrator
 
 
 def get_gemini_api_key() -> str:
@@ -69,7 +96,7 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
     return ""
 
 
-def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
+def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -77,21 +104,21 @@ def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "options": {"temperature": 0.0},
+        "temperature": 0.0,
     }
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        response = requests.post(MLX_LM_URL, json=payload, timeout=180)
         response.raise_for_status()
-        return response.json()["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"Ollama connection error: {e}")
+        print(f"mlx-lm connection error: {e}")
         sys.exit(1)
 
 
 def execute_agent(engine: str, local_model: str, system_prompt: str, user_prompt: str) -> str:
     if engine == "gemini":
         return call_gemini(system_prompt, user_prompt)
-    return call_ollama(local_model, system_prompt, user_prompt)
+    return call_mlx_lm(local_model, system_prompt, user_prompt)
 
 
 def run_formatter_toolchain(file_path: str, target_repo: str, run_env: Dict[str, str]) -> None:
@@ -206,12 +233,25 @@ def load_plan(path: str) -> Tuple[Dict[str, Any], str]:
 
 def main() -> None:
     skip_tests = "--skip-tests" in sys.argv
-    plan_path = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
+    mcp_config_override = None
+    filtered_argv = []
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == "--mcp-config" and i + 1 < len(sys.argv):
+            mcp_config_override = sys.argv[i + 1]
+            i += 2
+            continue
+        filtered_argv.append(sys.argv[i])
+        i += 1
+
+    plan_path = next((a for a in filtered_argv if not a.startswith("--")), None)
     if not plan_path:
-        print("Usage: python3 new_feature_harness.py <plan.json|plan.md> [--skip-tests]")
+        print("Usage: python3 new_feature_harness.py <plan.json|plan.md> [--skip-tests] [--mcp-config <path>]")
         print("  .json  — Direct execution plan")
         print("  .md    — Report with embedded pipeline (report used as architectural context")
         print("  --skip-tests  — Do NOT auto-generate pytest-django + factory_boy unit tests")
+        print("  --mcp-config  — Path to MCP server configuration JSON (default: $MCP_CONFIG or mcp_config.json)")
         sys.exit(1)
     if not os.path.exists(plan_path):
         print(f"Error: Plan file not found at '{plan_path}'")
@@ -249,6 +289,17 @@ def main() -> None:
         print(f"   Pre-flight workspace sync failed:\n{e.stderr.decode().strip()}")
         sys.exit(1)
 
+    mcp_cfg_path = mcp_config_override or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
+    mcp_orch = init_mcp_orchestrator(mcp_cfg_path, target_repo)
+    if mcp_orch:
+        print("  MCP Workbench active: git context, memory, and reasoning tools available.\n")
+        mcp_context = mcp_orch.build_mcp_context_block()
+        mcp_project_discovery = mcp_orch.discover_project_context()
+    else:
+        mcp_context = ""
+        mcp_project_discovery = ""
+        print("  (No MCP servers configured. Run with --mcp-config to enable.)\n")
+
     agents_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
     implementer_path = os.path.join(agents_dir, "code_implementer.md")
     auditor_path = os.path.join(agents_dir, "integration_auditor.md")
@@ -265,6 +316,8 @@ def main() -> None:
     context_history = f"Feature Engineering Campaign Context Plan for: {feature_name}\n"
     if exploration_report:
         context_history += f"\n\nArchitectural Analysis Report:\n{exploration_report}\n"
+    if mcp_project_discovery:
+        context_history += f"\n\nMCP Project Discovery Context:\n{mcp_project_discovery}\n"
 
     markdown_fence = "`" * 3
 
@@ -296,6 +349,7 @@ def main() -> None:
             System Scope Context:
             {context_history}
             {existing_file_context}
+            {mcp_context if mcp_context else ''}
 
             Destination Target File Path: {task['target_file']}
             Execution Requirements: {task['instruction']}
@@ -305,7 +359,7 @@ def main() -> None:
 
             raw_response = execute_agent(
                 IMPLEMENTER_ENGINE,
-                OLLAMA_IMPLEMENTER_MODEL,
+                MLX_IMPLEMENTER_MODEL,
                 implementer_persona,
                 user_prompt,
             )
@@ -363,11 +417,16 @@ def main() -> None:
                 f"Conclude explicitly with 'VERDICT: APPROVED' or 'VERDICT: REJECTED'."
             )
 
+            audit_prompt_with_mcp = (
+                audit_prompt + f"\n\nMCP Tool Context:\n{mcp_context}"
+                if mcp_context else audit_prompt
+            )
+
             audit_verdict = execute_agent(
                 AUDITOR_ENGINE,
-                OLLAMA_AUDITOR_MODEL,
+                MLX_AUDITOR_MODEL,
                 auditor_persona,
-                audit_prompt,
+                audit_prompt_with_mcp,
             )
             print(f"\n--- Audit Trace for Step {task['step']} (Attempt {attempt}) ---\n{audit_verdict}\n----------------------------------\n")
 
@@ -389,6 +448,14 @@ def main() -> None:
         if not stage_completed_successfully:
             print(f"Critical: Maximum cycles exhausted for {task['name']}. Halting pipeline execution.")
             sys.exit(1)
+
+        # Store implementation knowledge in MCP memory for cross-session recall
+        if mcp_orch:
+            mcp_orch.remember(
+                f"feature:{feature_name}:step:{task['step']}",
+                f"Implemented {task['name']} in {task['target_file']}",
+                tags=["feature", feature_name, "active"],
+            )
 
         # Auto-generate unit tests after a successful stage
         if not skip_tests:
@@ -412,7 +479,7 @@ def main() -> None:
                 Generate the absolute, complete test file. Provide clean type annotations. Do not include commentary outside the code block.
                 """
                 raw_test = execute_agent(
-                    IMPLEMENTER_ENGINE, OLLAMA_IMPLEMENTER_MODEL,
+                    IMPLEMENTER_ENGINE, MLX_IMPLEMENTER_MODEL,
                     implementer_persona, test_user_prompt,
                 )
                 test_code = clean_model_output(raw_test)
@@ -430,6 +497,14 @@ def main() -> None:
                     print(f"  Test file {test_rel} generated but has validation issues (will not block):")
                     print(f"     {log_msg}")
                     context_history += f"\n\n[Tests Added (with warnings): {test_rel}]\n"
+
+    if mcp_orch:
+        mcp_orch.remember(
+            f"campaign:{feature_name}:complete",
+            f"Campaign '{feature_name}' completed successfully across {len(pipeline)} stages",
+            tags=["feature", feature_name, "campaign_complete"],
+        )
+        mcp_orch.stop()
 
     print(f"\n=== Universal Engine Campaign for '{feature_name}' Completed Successfully ===")
 

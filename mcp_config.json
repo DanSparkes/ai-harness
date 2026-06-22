@@ -1,0 +1,35 @@
+{
+  "description": "MCP server configuration. git and memory are built-in (zero dependencies). filesystem and thinking require Node.js/npx but are free.",
+  "mcp_servers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/dansparkes/memores/memores-api"
+      ],
+      "enabled": false,
+      "description": "Read, search, and list files. Free. Requires Node.js/npx."
+    },
+    "git": {
+      "type": "builtin",
+      "module": "core.mcp_servers.GitServer",
+      "enabled": true,
+      "description": "Built-in. Git log, diff, blame, status, branch, show. Zero dependencies."
+    },
+    "memory": {
+      "type": "builtin",
+      "module": "core.mcp_servers.MemoryServer",
+      "enabled": true,
+      "description": "Built-in. Persistent knowledge graph: remember, recall, forget. Zero dependencies."
+    },
+    "thinking": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [],
+      "enabled": false,
+      "description": "Sequential Thinking server. Free. Requires Python script from github.com/modelcontextprotocol/servers"
+    }
+  }
+}

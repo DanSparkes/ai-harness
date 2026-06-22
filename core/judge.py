@@ -2,10 +2,12 @@ import requests
 import json
 
 class AutomatedEvaluator:
-    """Automates model grading using structured JSON schemas."""
-    def __init__(self, judge_model: str = "qwen2.5:14b", base_url: str = "http://localhost:11434"):
+    """Grades model outputs against structured JSON rubrics via an OpenAI-compatible API (mlx-lm)."""
+    def __init__(self, judge_model: str = "mlx-community/Qwen2.5-14B-Instruct-4bit", base_url: str = "http://localhost:8080"):
         self.judge_model = judge_model
-        self.api_url = f"{base_url}/api/generate"
+        if not base_url.endswith("/chat/completions"):
+            base_url = base_url.rstrip("/") + "/v1/chat/completions"
+        self.api_url = base_url
 
     def grade_run(self, candidate_output: str, rubric_path: str, context: str = "") -> dict:
         with open(rubric_path, "r") as f:
@@ -24,9 +26,12 @@ class AutomatedEvaluator:
         )
 
         context_block = f"\n## Ground Truth Context (Diff + Model Map)\n{context}\n\n" if context else "\n"
-        judge_prompt = (
+        system_prompt = (
             "You are an objective Quality Assurance Judge. Evaluate the technical analysis "
-            "below and score each metric 1 (poor) to 5 (excellent).\n\n"
+            "below and score each metric 1 (poor) to 5 (excellent). "
+            "Respond with ONLY a valid JSON object. No other text."
+        )
+        user_prompt = (
             f"## Instructions\n{instructions}\n\n"
             f"## Metrics to Score\n{metric_lines}\n\n"
             f"{context_block}"
@@ -39,12 +44,15 @@ class AutomatedEvaluator:
 
         payload = {
             "model": self.judge_model,
-            "prompt": judge_prompt,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.0}
+            "temperature": 0.0
         }
 
         response = requests.post(self.api_url, json=payload)
         response.raise_for_status()
-        return json.loads(response.json()["response"])
+        content = response.json()["choices"][0]["message"]["content"]
+        return json.loads(content)

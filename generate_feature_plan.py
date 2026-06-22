@@ -3,14 +3,16 @@
 generate_feature_plan.py
 Takes a brief feature prompt, expands it into a detailed .md architectural report
 (with human review), and produces a structured .json pipeline consumable by
-new_feature_harness.py.
+new_feature_harness.py. Optionally uses an MCP workbench for richer codebase
+exploration (git history, persistent memory, filesystem search).
 
 Usage:
   # Generate a new feature plan
-  python3 generate_feature_plan.py \\
-    --prompt "Throttle Public Onboarding Endpoints..." \\
-    --name throttle-onboarding \\
-    --target-repo /path/to/repo
+  python3 generate_feature_plan.py \
+    --prompt "Throttle Public Onboarding Endpoints..." \
+    --name throttle-onboarding \
+    --target-repo /path/to/repo \
+    --mcp-config mcp_config.json
 
   # Re-extract pipeline after editing the .md report
   python3 generate_feature_plan.py --update reports/throttle_onboarding.md
@@ -28,15 +30,20 @@ from typing import Any
 # ── Defaults ──────────────────────────────────────────────────────────────────
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
-OLLAMA_URL = "http://localhost:11434/api/chat"
+MLX_LM_URL = "http://localhost:8080/v1/chat/completions"
 
-ARCHITECT_MODEL = "qwen3-coder:latest"
-ARCHITECT_ENGINE = "ollama"
+ARCHITECT_MODEL = "mlx-community/Qwen3-14B-4bit"
+ARCHITECT_ENGINE = "mlx-lm"
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# MCP integration
+_mcp_orchestrator = None
 
 
 ARCHITECT_SYSTEM_PROMPT = """\
-You are a Staff Backend Architect designing an implementation plan for a Django REST Framework feature.
+You are a Staff Backend Architect designing an implementation plan for a Django REST Framework feature. You have access to an MCP tool workbench with servers for filesystem exploration, git history, persistent memory, documentation lookup, web search, and structured reasoning.
+
+When the prompt includes an "=== MCP-AUGMENTED CONTEXT ===" section, use the git history and memory context to understand the project's evolution and existing architectural rules before proposing changes. Cross-reference all file paths against the provided codebase scan — do not invent paths.
 
 Given a brief feature prompt and a codebase context scan, produce a detailed implementation report in markdown with the following sections:
 
@@ -95,6 +102,65 @@ Whichever option you choose, explain the decision clearly in the instructions an
 
 Output ONLY the report with the pipeline JSON embedded in a code block at the end of section 4.
 """
+
+
+# ── MCP Integration ───────────────────────────────────────────────────────────
+
+def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
+    global _mcp_orchestrator
+    if _mcp_orchestrator is not None:
+        return _mcp_orchestrator
+    if not os.path.exists(config_path):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(config_path, target_repo=target_repo)
+    started = orch.start()
+    if started:
+        _mcp_orchestrator = orch
+        if target_repo:
+            try:
+                orch.call_tool("git", "git_set_repo", {"path": target_repo})
+            except Exception:
+                pass
+        return orch
+    return None
+
+
+def get_mcp_context(args: argparse.Namespace) -> str:
+    """Gather context from MCP servers for richer architectural planning."""
+    if not args.mcp_config:
+        return ""
+    target = getattr(args, "target_repo", None)
+    orch = init_mcp_orchestrator(args.mcp_config, target)
+    if not orch:
+        return ""
+    parts = ["=== MCP-AUGMENTED CONTEXT ==="]
+    try:
+        status = orch.git_status()
+        if status and status != "(no output)":
+            parts.append(f"Git Status:\n{status}")
+    except Exception:
+        pass
+    try:
+        recent = orch.git_log(max_count=15)
+        if recent and not recent.startswith("("):
+            parts.append(f"Recent Commits:\n{recent}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["architectural_rule"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Architectural Rules:\n{memory}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["active", "campaign_complete"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Active Campaign Context:\n{memory}")
+    except Exception:
+        pass
+    orch.stop()
+    return "\n".join(parts)
 
 
 # ── Codebase Scanner ──────────────────────────────────────────────────────────
@@ -178,7 +244,7 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
     return ""
 
 
-def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
+def call_mlx_lm(model: str, system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -186,21 +252,21 @@ def call_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "options": {"temperature": 0.0},
+        "temperature": 0.0,
     }
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
+        resp = requests.post(MLX_LM_URL, json=payload, timeout=120)
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"Ollama error: {e}")
+        print(f"mlx-lm error: {e}")
         sys.exit(1)
 
 
 def execute_agent(engine: str, model: str, system_prompt: str, user_prompt: str) -> str:
     if engine == "gemini":
         return call_gemini(system_prompt, user_prompt)
-    return call_ollama(model, system_prompt, user_prompt)
+    return call_mlx_lm(model, system_prompt, user_prompt)
 
 
 def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
@@ -234,7 +300,8 @@ def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
     return None
 
 
-def build_feature_prompt(feature_prompt: str, codebase_context: str, target_repo: str) -> str:
+def build_feature_prompt(feature_prompt: str, codebase_context: str, target_repo: str, mcp_context: str = "") -> str:
+    extra = f"\n{mcp_context}\n" if mcp_context else ""
     return f"""\
 Design an implementation plan for the following feature request:
 
@@ -245,6 +312,7 @@ Target repository: {target_repo}
 === CODEBASE CONTEXT ===
 All file paths in your plan MUST come from this context. Do not invent paths.
 {codebase_context}
+{extra}
 
 Follow the structure specified in the system prompt. Ensure the pipeline JSON uses "{target_repo}" as the target_workspace value.
 """
@@ -278,10 +346,13 @@ def cmd_generate(args: argparse.Namespace) -> None:
     print(f"Generating feature plan for: {name}")
     print(f"  Architect: [{args.engine.upper()}] via {args.model}")
     print(f"  Scanning codebase: {args.target_repo}")
+    if args.mcp_config:
+        print(f"  MCP Config: {args.mcp_config}")
     print()
 
     codebase_context = build_codebase_context(args)
-    user_prompt = build_feature_prompt(args.prompt, codebase_context, args.target_repo)
+    mcp_context = get_mcp_context(args)
+    user_prompt = build_feature_prompt(args.prompt, codebase_context, args.target_repo, mcp_context)
 
     raw_output = execute_agent(args.engine, args.model, ARCHITECT_SYSTEM_PROMPT, user_prompt)
 
@@ -336,8 +407,9 @@ def main() -> None:
     gen.add_argument("--target-repo", default=os.environ.get("TARGET_REPO", ""), help="Absolute path to the target repository")
     gen.add_argument("--reports-dir", default=REPORTS_DIR, help="Directory for output files (default: reports/)")
     gen.add_argument("--agents-dir", default=AGENTS_DIR, help="Directory for agent persona files (default: agents/)")
-    gen.add_argument("--engine", default=ARCHITECT_ENGINE, choices=["ollama", "gemini"], help="LLM backend")
+    gen.add_argument("--engine", default=ARCHITECT_ENGINE, choices=["mlx-lm", "gemini"], help="LLM backend")
     gen.add_argument("--model", default=ARCHITECT_MODEL, help="Model name")
+    gen.add_argument("--mcp-config", help="Path to MCP server configuration JSON")
     gen.add_argument("--force", action="store_true", help="Overwrite existing report")
 
     upd = sub.add_parser("update", help="Re-extract pipeline JSON from an edited .md report")

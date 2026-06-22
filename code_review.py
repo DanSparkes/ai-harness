@@ -10,21 +10,72 @@ from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
 # ==============================================================================
-# 100% FREE HARDWARE-OPTIMIZED ALLOCATION
+# MODEL & API CONFIGURATION
 # ==============================================================================
-# Cloud Architect: Handles the heavy context lifting for $0 (1M token window)
-REASONING_ARCHITECT   = "qwen3.6:latest"
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if "gemini" in REASONING_ARCHITECT.lower() else "http://localhost:11434"
+# Architect: Large model for the heavy code review reasoning.
+# Set to a Gemini model (via Google's OpenAI-compatible endpoint) when
+# GEMINI_API_KEY is set, otherwise uses local mlx-lm.
+CLOUD_MODEL           = "gemini-2.5-flash"
+LOCAL_MODEL           = "mlx-community/Qwen3-32B-4bit"
+REASONING_ARCHITECT   = CLOUD_MODEL if os.getenv("GEMINI_API_KEY") else LOCAL_MODEL
+ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if os.getenv("GEMINI_API_KEY") else "http://localhost:8080"
 ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
 
-# Local Fallback: Used when cloud API is unavailable
-# qwen3.6: 23GB, 256K context — large enough for the full diff + two-pass review
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
-# Local Judge: Scoring a review against a rubric is simpler — 14B is sufficient
-HEAVY_REVIEWER        = "deepseek-r1:14b" 
+# Local Fallback: Smaller mlx-lm model used when the cloud API is unavailable
+FALLBACK_REVIEWER     = "mlx-community/Qwen3-8B-4bit"
+# Local Judge: Scores the review against a rubric — 14B is sufficient
+HEAVY_REVIEWER        = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit"
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+
+_mcp_orch = None
+
+
+def init_mcp():
+    global _mcp_orch
+    if _mcp_orch is not None:
+        return _mcp_orch
+    if not os.path.exists(MCP_CONFIG_PATH):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
+    started = orch.start()
+    if started:
+        _mcp_orch = orch
+        try:
+            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
+        except Exception:
+            pass
+        return orch
+    return None
+
+
+def build_mcp_context() -> str:
+    orch = _mcp_orch
+    if not orch:
+        return ""
+    parts = []
+    try:
+        status = orch.git_status()
+        if status and status != "(no output)":
+            parts.append(f"Working Tree:\n{status}")
+    except Exception:
+        pass
+    try:
+        recent = orch.git_log(max_count=15)
+        if recent and not recent.startswith("("):
+            parts.append(f"Recent Commits:\n{recent}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["code_review", "architectural_rule"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Review Context:\n{memory}")
+    except Exception:
+        pass
+    return "\n\n".join(parts)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Local-Cloud Hybrid Code Review Engine")
@@ -89,13 +140,24 @@ def main():
     with open(persona_path, "r", encoding="utf-8") as f:
         system_agent_prompt = f.read()
 
+    # 4b. Initialize MCP workbench for richer context
+    print("   Initializing MCP workbench...")
+    orch = init_mcp()
+    mcp_block = build_mcp_context() if orch else ""
+    if orch:
+        print("   [Done] MCP workbench active (git context + memory recall)\n")
+    else:
+        print("   [Skipped] No MCP config found\n")
+
     # 5. Build prompt context
     project_map_json = json.dumps(project_map, indent=2, default=str)
     changed_files_json = json.dumps(changed_files, indent=2)
 
     # 6. Build prompts for either cloud or local mode
+    mcp_prompt_section = f"\n\n### MCP-Augmented Context (Live Project State)\n{mcp_block}" if mcp_block else ""
+
     # Single-pass fallback: used for local-only mode and cloud API failures
-    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.
+    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}
 
 ## Project Model Map
 ```json
@@ -131,6 +193,7 @@ Here is the global system layout of the app (models with their fields, serialize
 
 Here are the files changed in this branch:
 {changed_files_json}
+{mcp_prompt_section}
 
 Analyze the structural intersection. Which upstream modules, views, or serializers could break or be impacted by changes to these specific files?
 Identify potential vulnerabilities or scaling defects introduced by the patch."""
@@ -140,6 +203,7 @@ Review the raw lines of code changed in this branch:
 ```diff
 {raw_diff}
 ```
+{mcp_prompt_section}
 
 Generate your final review report. Evaluate line changes, ensure patterns are clean, verify things are getting better and not worse, and generate code corrections where needed.
 
@@ -156,7 +220,6 @@ Follow the markdown schema and headers defined in your system prompt."""
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=65536  # qwen3.6 supports 256K; 64K is fast and fits diff + response
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
@@ -195,6 +258,14 @@ Follow the markdown schema and headers defined in your system prompt."""
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_review)
         
+    if _mcp_orch:
+        _mcp_orch.remember(
+            f"review:{source_branch}:complete",
+            f"Code review completed for {source_branch} -> {target_branch}. Report: {report_filename}",
+            tags=["code_review", source_branch, "complete"],
+        )
+        _mcp_orch.stop()
+
     total_duration = time.time() - start_time
     print(f"\n✅ Report saved to: {report_filename}")
     print(f"⏱️ Total Time: {total_duration:.2f}s  Model: {model_used}")

@@ -8,20 +8,67 @@ from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
 # ==============================================================================
-# 100% FREE HARDWARE-OPTIMIZED ALLOCATION
+# MODEL & API CONFIGURATION
 # ==============================================================================
-# Cloud Architect: Handles the heavy context lifting for $0 (1M token window)
-REASONING_ARCHITECT   = "qwen3.6:latest"
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if "gemini" in REASONING_ARCHITECT.lower() else "http://localhost:11434"
+CLOUD_MODEL           = "gemini-2.5-flash"
+LOCAL_MODEL           = "mlx-community/Qwen3-32B-4bit"
+REASONING_ARCHITECT   = CLOUD_MODEL if os.getenv("GEMINI_API_KEY") else LOCAL_MODEL
+ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if os.getenv("GEMINI_API_KEY") else "http://localhost:8080"
 ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
 
-# Local Fallback: Used when cloud API is unavailable
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
-# Local Judge: Scoring a security analysis against a rubric — 32B is authoritative
-HEAVY_REVIEWER        = "deepseek-r1:14b"
+FALLBACK_REVIEWER     = "mlx-community/Qwen3-8B-4bit"
+HEAVY_REVIEWER        = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit"
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+
+_mcp_orch = None
+
+
+def init_mcp():
+    global _mcp_orch
+    if _mcp_orch is not None:
+        return _mcp_orch
+    if not os.path.exists(MCP_CONFIG_PATH):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
+    started = orch.start()
+    if started:
+        _mcp_orch = orch
+        try:
+            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
+        except Exception:
+            pass
+        return orch
+    return None
+
+
+def build_mcp_context() -> str:
+    orch = _mcp_orch
+    if not orch:
+        return ""
+    parts = []
+    try:
+        status = orch.git_status()
+        if status and status != "(no output)":
+            parts.append(f"Working Tree:\n{status}")
+    except Exception:
+        pass
+    try:
+        recent = orch.git_log(max_count=10)
+        if recent and not recent.startswith("("):
+            parts.append(f"Recent Commits:\n{recent}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["security", "architectural_rule"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Security Context:\n{memory}")
+    except Exception:
+        pass
+    return "\n\n".join(parts)
 
 def main():
     is_local_mode = "localhost" in ARCHITECT_API_BASE or not ARCHITECT_API_KEY
@@ -58,6 +105,15 @@ def main():
     with open(persona_path, "r", encoding="utf-8") as f:
         system_agent_prompt = f.read()
     print(f"   [Done] Persona loaded")
+
+    # 2b. Initialize MCP workbench for richer context
+    print("Step 2b: Initializing MCP workbench...")
+    orch = init_mcp()
+    mcp_block = build_mcp_context() if orch else ""
+    if orch:
+        print("   [Done] MCP workbench active (git context + memory recall)\n")
+    else:
+        print("   [Skipped] No MCP config found\n")
 
     # 3. Build prompt context
     project_map_json = json.dumps(project_map, indent=2, default=str)
@@ -112,6 +168,9 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 12. **Hardcoded vs user-supplied data**: Static analysis cannot trace data flows from request → API calls. If the only evidence for an "unvalidated input" finding is the endpoint existing (no visible user-controlled data flow from request parameters to API calls), flag at INFO not LOW. An endpoint using hardcoded values with no request data consumption is a code quality concern, not a vulnerability.
 13. **Endpoint misclassification**: A class mentioning "Stripe" or "Webhook" is not necessarily a webhook handler. Check `base_classes` and `http_methods`. A Stripe Checkout Session creation endpoint makes outbound API calls — no webhook signature verification applies.
 14. **Inherited Meta fields**: Resolved `Meta.fields` lists are complete. A field not in this list cannot be mass-assigned.
+
+### MCP-Augmented Context (Live Project State)
+{mcp_block}
 
 ### Penetration Test Framing
 Treat the analysis as a manual penetration test. Think about how an attacker would chain weaknesses together into a realistic exploit path. Each step must trace back to visible evidence. Do NOT invent endpoints, data flows, or trust boundaries to satisfy a narrative. An attack path predicated on a hallucinated `queryset` or `class_attributes` value is invalid — verify every attribute against the specific view's entry."""
@@ -266,7 +325,6 @@ If all findings are low-confidence or parser-limited, state "All potential findi
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=65536
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
@@ -304,6 +362,14 @@ If all findings are low-confidence or parser-limited, state "All potential findi
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_analysis)
+
+    if _mcp_orch:
+        _mcp_orch.remember(
+            "eval:security_review:complete",
+            f"Security evaluation completed. Report: {report_filename}",
+            tags=["evaluation", "security", "complete"],
+        )
+        _mcp_orch.stop()
 
     total_duration = time.time() - start_time
     print(f"\nReport saved to: {report_filename}")

@@ -6,14 +6,64 @@ from core.runner import StatefulHarnessRunner
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
 
-REASONING_ARCHITECT   = "qwen3.6:latest"
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if "gemini" in REASONING_ARCHITECT.lower() else "http://localhost:11434"
+CLOUD_MODEL           = "gemini-2.5-flash"
+LOCAL_MODEL           = "mlx-community/Qwen3-32B-4bit"
+REASONING_ARCHITECT   = CLOUD_MODEL if os.getenv("GEMINI_API_KEY") else LOCAL_MODEL
+ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if os.getenv("GEMINI_API_KEY") else "http://localhost:8080"
 ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY")
 
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
-HEAVY_REVIEWER        = "deepseek-r1:14b"
+FALLBACK_REVIEWER     = "mlx-community/Qwen3-8B-4bit"
+HEAVY_REVIEWER        = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+
+_mcp_orch = None
+
+
+def init_mcp():
+    global _mcp_orch
+    if _mcp_orch is not None:
+        return _mcp_orch
+    if not os.path.exists(MCP_CONFIG_PATH):
+        return None
+    from core.mcp_orchestrator import MCPOrchestrator
+    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
+    started = orch.start()
+    if started:
+        _mcp_orch = orch
+        try:
+            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
+        except Exception:
+            pass
+        return orch
+    return None
+
+
+def build_mcp_context() -> str:
+    orch = _mcp_orch
+    if not orch:
+        return ""
+    parts = []
+    try:
+        status = orch.git_status()
+        if status and status != "(no output)":
+            parts.append(f"Working Tree:\n{status}")
+    except Exception:
+        pass
+    try:
+        recent = orch.git_log(max_count=10)
+        if recent and not recent.startswith("("):
+            parts.append(f"Recent Commits:\n{recent}")
+    except Exception:
+        pass
+    try:
+        memory = orch.recall(tags=["architectural_rule"])
+        if memory and memory != "(no memories)":
+            parts.append(f"Architectural Rules:\n{memory}")
+    except Exception:
+        pass
+    return "\n\n".join(parts)
 
 def main():
     is_local_mode = "localhost" in ARCHITECT_API_BASE or not ARCHITECT_API_KEY
@@ -51,6 +101,15 @@ def main():
         system_agent_prompt = f.read()
     print(f"   [Done] Persona loaded")
 
+    # 2b. Initialize MCP workbench for richer context
+    print("Step 2b: Initializing MCP workbench...")
+    orch = init_mcp()
+    mcp_block = build_mcp_context() if orch else ""
+    if orch:
+        print("   [Done] MCP workbench active (git context + memory recall)\n")
+    else:
+        print("   [Skipped] No MCP config found\n")
+
     # 3. Build prompt context
     project_map_json = json.dumps(project_map, indent=2, default=str)
 
@@ -87,7 +146,10 @@ Based on parsing, this project contains:
 1. **NEVER attribute a field to a model unless it appears in that model's `fields` list**. Each model entry has its own isolated field list.
 2. **`get_queryset` method != `queryset` attribute**: A view may define `get_queryset()` in its methods list but have no `queryset` in its `class_attributes`. These are different DRF patterns.
 3. **Each view is independent**: Every view in the topography is a separate entry with its own `class_attributes`, `methods`, and `base_classes`. Do not mix data between views.
-4. **Only reference files and classes that appear in the topography map**. Do not invent imports, dependencies, or third-party integrations not visible in the parsed structure."""
+4. **Only reference files and classes that appear in the topography map**. Do not invent imports, dependencies, or third-party integrations not visible in the parsed structure.
+
+### MCP-Augmented Context (Live Project State)
+{mcp_block}"""
 
     PARSER_LIMITATIONS_FILLED = PARSER_LIMITATIONS.format(
         model_count=len(project_map.get('models', [])),
@@ -179,7 +241,6 @@ Generate the final report matching the schema defined in your system prompt. Inc
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=65536
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
@@ -216,6 +277,14 @@ Generate the final report matching the schema defined in your system prompt. Inc
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_analysis)
+
+    if _mcp_orch:
+        _mcp_orch.remember(
+            "eval:onboarding:complete",
+            f"Onboarding strategy completed. Report: {report_filename}",
+            tags=["evaluation", "onboarding", "complete"],
+        )
+        _mcp_orch.stop()
 
     total_duration = time.time() - start_time
     print(f"\nReport saved to: {report_filename}")
