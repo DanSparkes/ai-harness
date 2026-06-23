@@ -259,6 +259,8 @@ class MemoryServer(MCPBuiltinServer):
                 json.dump({"facts": self._facts, "tags": self._tags}, f, indent=2)
         except Exception:
             pass
+
+    def handle_request(self, method: str, params: dict[str, Any]) -> Any:
         handlers = {
             "initialize": self._initialize,
             "tools/list": self._list_tools,

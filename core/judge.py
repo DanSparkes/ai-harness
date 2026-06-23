@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 import requests
@@ -48,7 +49,10 @@ class AutomatedEvaluator:
             {"role": "user", "content": user_prompt}
         ]
 
-        cache_key = make_key("judge:grade_run", self.judge_model, json.dumps(messages, sort_keys=True, default=str))
+        h = hashlib.sha256(self.judge_model.encode())
+        h.update(system_prompt.encode())
+        h.update(user_prompt.encode())
+        cache_key = make_key("judge:grade_run", h.hexdigest())
         cached = cache_get(cache_key, max_age=86400)
         if cached is not None:
             print(f"   -> Scored (cached) in 0.0s")

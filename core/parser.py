@@ -20,6 +20,25 @@ HTTP_METHOD_MAP = {
 
 AUTH_KEYWORDS = {"authorize", "check_perm", "has_perm", "is_staff", "is_superuser", "is_authenticated"}
 
+# Maps DRF HTTP handler methods to their perform_* delegation targets.
+DELEGATION_MAP = {
+    "destroy": "perform_destroy",
+    "update": "perform_update",
+    "partial_update": "perform_update",
+    "create": "perform_create",
+}
+
+# Authorization functions that have been manually verified to enforce strict
+# user or tenant scoping. Methods whose inline_auth_calls are entirely drawn
+# from this set are annotated `auth_fully_trusted: true`, which signals
+# the LLM that the authorization is verifiably correct and should not be flagged.
+TRUSTED_AUTH_FUNCTIONS = {
+    "authorize_app_user", "authorize_benefactor", "authorize_creator",
+    "authorize_superuser", "authorize_staff_or_superuser",
+    "authorize_benefactor_or_creator", "authorize_benefactor_scope",
+    "authorize_content_owner_or_staff", "authorize_benefactor_owner_or_staff",
+}
+
 DRF_BUILTIN_PERMISSIONS = {
     "IsAuthenticated", "IsAdminUser", "AllowAny",
     "IsAuthenticatedOrReadOnly", "DjangoModelPermissions",
@@ -128,12 +147,12 @@ class DjangoTopographer:
         """Resolve a Meta.fields value, including inheritance patterns like Parent.Meta.fields + [...].
 
         Recursively resolves:
-          - Direct lists: ['id', 'name']
+          - Direct lists/tuples: ['id', 'name'] or ('id', 'name')
           - String literals: '__all__'
           - Name references: some_variable
           - Binary ops: Parent.Meta.fields + ['extra']  (chained inheritance)
         """
-        if isinstance(value_node, ast.List):
+        if isinstance(value_node, (ast.List, ast.Tuple)):
             return [e.value for e in value_node.elts if isinstance(e, ast.Constant)]
 
         if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
@@ -418,12 +437,28 @@ class DjangoTopographer:
                     "stub_reason": stub_reason,
                     "inline_auth_calls": auth_calls,
                     "self_scoped": self_scoped,
+                    "auth_fully_trusted": bool(auth_calls and all(c in TRUSTED_AUTH_FUNCTIONS for c in auth_calls)),
                 }
                 if http:
                     entry["http_method"] = http
                     if not is_stub:
                         http_methods.add(http)
                 method_details.append(entry)
+
+        # Resolve DRF delegation chains: propagate inline_auth_calls from
+        # perform_* delegates (e.g., perform_destroy) up to their HTTP handlers
+        # (e.g., destroy). The LLM consistently misses this cross-reference,
+        # so make it explicit in the data.
+        delegate_by_name = {m["name"]: m for m in method_details}
+        for method in method_details:
+            name = method["name"]
+            if name in DELEGATION_MAP:
+                delegate_name = DELEGATION_MAP[name]
+                delegate = delegate_by_name.get(delegate_name)
+                if delegate and delegate.get("inline_auth_calls"):
+                    method["delegated_auth_calls"] = delegate["inline_auth_calls"]
+                    if delegate.get("auth_fully_trusted"):
+                        method["delegate_auth_fully_trusted"] = True
 
         has_read_only_base = bool(base_names & READ_ONLY_VIEW_BASES)
         only_get = http_methods == {"GET"}
@@ -468,6 +503,44 @@ class DjangoTopographer:
             # Parse imports for permission class resolution
             imports = self._parse_imports(tree, file_path)
 
+            # Scan for function-based views (decorated with @api_view)
+            for child in tree.body:
+                if isinstance(child, ast.FunctionDef) and child.decorator_list:
+                    for deco in child.decorator_list:
+                        if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Name) and deco.func.id == "api_view":
+                            http_methods = []
+                            for arg in deco.args:
+                                resolved = self._resolve_ast_value(arg)
+                                if isinstance(resolved, list):
+                                    http_methods = [m.upper() for m in resolved]
+                                    break
+                            # Scan sibling decorators for permission_classes / authentication_classes
+                            deco_attrs = {}
+                            for d in child.decorator_list:
+                                if isinstance(d, ast.Call) and isinstance(d.func, ast.Name):
+                                    if d.func.id == "permission_classes" and d.args:
+                                        deco_attrs["permission_classes"] = self._resolve_ast_value(d.args[0])
+                                    if d.func.id == "authentication_classes" and d.args:
+                                        deco_attrs["authentication_classes"] = self._resolve_ast_value(d.args[0])
+                            auth_calls = self._find_inline_auth_calls(child)
+                            topology["views"].append({
+                                "absolute_path": str(file_path),
+                                "relative_path": str(relative_path),
+                                "class": child.name,
+                                "is_function_view": True,
+                                "class_attributes": deco_attrs,
+                                "base_classes": [],
+                                "http_methods": http_methods or [],
+                                "is_read_only": set(http_methods or []) == {"GET"},
+                                "methods": [{
+                                    "name": child.name,
+                                    "is_stub": False,
+                                    "inline_auth_calls": auth_calls,
+                                    "auth_fully_trusted": bool(auth_calls and all(c in TRUSTED_AUTH_FUNCTIONS for c in auth_calls)),
+                                }],
+                            })
+                            break
+
             for child in tree.body:
                 if not isinstance(child, ast.ClassDef):
                     continue
@@ -487,10 +560,26 @@ class DjangoTopographer:
                 )
 
                 if is_model:
+                    is_abstract = any(
+                        isinstance(item, ast.ClassDef)
+                        and item.name == "Meta"
+                        and any(
+                            isinstance(meta_item, ast.Assign)
+                            and any(
+                                isinstance(t, ast.Name) and t.id == "abstract"
+                                for t in meta_item.targets
+                            )
+                            and isinstance(meta_item.value, ast.Constant)
+                            and meta_item.value.value is True
+                            for meta_item in item.body
+                        )
+                        for item in child.body
+                    )
                     topology["models"].append({
                         "absolute_path": str(file_path),
                         "relative_path": str(relative_path),
                         "class": child.name,
+                        "is_abstract": is_abstract,
                         "fields": self._extract_model_fields(child),
                         "methods": [m.name for m in child.body if isinstance(m, ast.FunctionDef)]
                     })
@@ -537,6 +626,24 @@ class DjangoTopographer:
                         "is_read_only": view_classification["is_read_only"],
                         "methods": methods,
                     }
+
+                    # Annotate get_object / get_queryset relationship.
+                    # DRF's GenericAPIView.get_object() calls self.get_queryset()
+                    # internally before filtering by PK. If get_object() is NOT
+                    # overridden, authorization in get_queryset() cascades to all
+                    # single-object lookups (retrieve, update, destroy, partial_update).
+                    method_names = {m["name"] for m in methods}
+                    has_get_object = "get_object" in method_names
+                    entry["get_object_overridden"] = has_get_object
+                    gq_method = next((m for m in methods if m["name"] == "get_queryset"), None)
+                    gq_has_auth = bool(gq_method and gq_method.get("inline_auth_calls"))
+                    if not has_get_object and gq_has_auth:
+                        entry["queryset_auth_chain"] = "scoped"
+                    elif has_get_object:
+                        entry["queryset_auth_chain"] = "overridden"
+                    else:
+                        entry["queryset_auth_chain"] = "unknown"
+
                     if permission_analysis:
                         entry["permission_class_analysis"] = permission_analysis
                     topology["views"].append(entry)
@@ -579,11 +686,13 @@ class DjangoTopographer:
                             elif isinstance(item.value.func, ast.Name):
                                 field_info["type"] = item.value.func.id
                             for kw in item.value.keywords:
-                                if kw.arg in ("required", "read_only", "allow_null", "allow_blank"):
+                                if kw.arg in ("required", "read_only", "allow_null", "allow_blank", "many", "allow_empty"):
                                     try:
                                         field_info[kw.arg] = ast.literal_eval(kw.value)
                                     except (ValueError, TypeError):
                                         field_info[kw.arg] = ast.dump(kw.value)
+                                elif kw.arg in ("queryset", "source", "child"):
+                                    field_info[kw.arg] = self._resolve_ast_value(kw.value)
                         fields.append(field_info)
             elif isinstance(item, ast.ClassDef) and item.name == "Meta":
                 meta = {"class": "Meta"}

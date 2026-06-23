@@ -1,10 +1,14 @@
 import os
+import re
 import json
 import time
 from core.parser import DjangoTopographer
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
+from core.mcp_orchestrator import init_orchestrator
+
+os.environ.setdefault("OLLAMA_MLX", "1")
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
@@ -17,6 +21,7 @@ ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER     = "gemini-2.5-flash"
 HEAVY_REVIEWER        = "deepseek-r1:14b"
+LOCAL_JUDGE           = "qwen2.5-coder:14b"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -28,23 +33,10 @@ def init_mcp():
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
-    if not os.path.exists(MCP_CONFIG_PATH):
-        return None
-    from core.mcp_servers import set_memory_persist_path
-    from core.cache import CACHE_DIR
-    memory_path = str(CACHE_DIR / "memories.json")
-    set_memory_persist_path(memory_path)
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
-    started = orch.start()
-    if started:
+    orch = init_orchestrator(MCP_CONFIG_PATH, TARGET_DJANGO_PROJECT)
+    if orch:
         _mcp_orch = orch
-        try:
-            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
-        except Exception:
-            pass
-        return orch
-    return None
+    return orch
 
 
 def build_mcp_context() -> str:
@@ -52,25 +44,27 @@ def build_mcp_context() -> str:
     if not orch:
         return ""
     parts = []
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"Working Tree:\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=10)
-        if recent and not recent.startswith("("):
-            parts.append(f"Recent Commits:\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["architectural_rule"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Architectural Rules:\n{memory}")
-    except Exception:
-        pass
+    git_block = orch.build_git_context(max_count=10)
+    if git_block:
+        parts.append(git_block)
+    memory = orch.recall_tagged(tags=["architectural_rule"])
+    if memory:
+        parts.append(f"Architectural Rules:\n{memory}")
     return "\n\n".join(parts)
+
+
+def build_django_live_context() -> tuple[str, dict]:
+    orch = _mcp_orch
+    if not orch:
+        return "", {}
+    return orch.build_django_live_context()
+
+
+def build_codebase_memory_context() -> tuple[str, dict]:
+    orch = _mcp_orch
+    if not orch:
+        return "", {}
+    return orch.build_codebase_memory_context()
 
 def main():
     is_local_mode = not ARCHITECT_API_KEY
@@ -83,7 +77,7 @@ def main():
     print(f"Launching Staff Onboarding Engine (Hybrid Mode)")
     print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local Judge      : {HEAVY_REVIEWER}")
+    print(f"Local Judge      : {LOCAL_JUDGE}")
     print(f"{'='*60}\n")
 
     start_time = time.time()
@@ -112,8 +106,18 @@ def main():
     print("Step 2b: Initializing MCP workbench...")
     orch = init_mcp()
     mcp_block = build_mcp_context() if orch else ""
+    django_block, django_data = build_django_live_context() if orch else ("", {})
+    cm_block, cm_data = build_codebase_memory_context() if orch else ("", {})
+    live_context = "\n\n".join(filter(None, [mcp_block, django_block, cm_block]))
     if orch:
-        print("   [Done] MCP workbench active (git context + memory recall)\n")
+        statuses = []
+        if mcp_block:
+            statuses.append("git + memory")
+        if django_block:
+            statuses.append("django-ai-boost")
+        if cm_block:
+            statuses.append("codebase-memory")
+        print(f"   [Done] MCP workbench active ({' + '.join(statuses)})\n")
     else:
         print("   [Skipped] No MCP config found\n")
 
@@ -125,7 +129,7 @@ def main():
 The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
 
 **CAN resolve:**
-- Model fields (name, type, null, default, unique, blank, primary_key, editable)
+- Model fields (name, type, null, default, unique, blank, primary_key, editable) with `is_abstract` flag for abstract models
 - Serializer fields (name, type, required, read_only, allow_null, allow_blank)
 - Serializer Meta (model, fields, exclude, read_only_fields) — including inherited expressions like `Parent.Meta.fields + [...]`
 - View class attributes: `permission_classes`, `authentication_classes`, `serializer_class`, `queryset`, `lookup_field`
@@ -135,33 +139,61 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 - Custom permission class resolution with `has_permission` and `has_object_permission` analysis
 - Inline authorization calls: methods list `inline_auth_calls` with function names found in method bodies
 - Celery task definitions
+- **Function-based views**: Functions decorated with `@api_view(...)` are now parsed and appear in the views list with `is_function_view: true`, their HTTP methods resolved from the decorator argument, and decorator-level `permission_classes`/`authentication_classes` extracted from sibling `@permission_classes` and `@authentication_classes` decorators
+- **Abstract model detection**: Each model entry includes `is_abstract: true/false` to distinguish concrete tables from abstract base classes
 
-**CANNOT resolve:**
+**CANNOT resolve (but see MCP-Augmented Context below for live data):**
 - Method bodies beyond stub detection and auth call scanning (no control flow, validation logic, or query filter details)
-- URL patterns or route configurations
+- URL patterns or route configurations — **filled by Live Django URL Patterns** from `django-ai-boost` in the MCP section below
 - ViewSet action-to-HTTP-method mapping beyond function names
-- Decorators — parsed as class attributes instead
 - Business logic, data flows, or runtime state
+- Database relationships, foreign keys, or cascading behavior — **filled by Live Database Schema** from `django-ai-boost`
+- Actual settings or runtime configuration values — **filled by Live Django App Info** from `django-ai-boost`
 
 ### Codebase Inventory
 Based on parsing, this project contains:
-- {model_count} models
+- {model_count} total model classes ({concrete_model_count} concrete, {abstract_model_count} abstract)
 - {serializer_count} serializers
-- {view_count} views
+- {view_count} views ({class_based_view_count} class-based, {function_based_view_count} function-based)
 
 ### Anti-Hallucination Rules
 1. **NEVER attribute a field to a model unless it appears in that model's `fields` list**. Each model entry has its own isolated field list.
 2. **`get_queryset` method != `queryset` attribute**: A view may define `get_queryset()` in its methods list but have no `queryset` in its `class_attributes`. These are different DRF patterns.
 3. **Each view is independent**: Every view in the topography is a separate entry with its own `class_attributes`, `methods`, and `base_classes`. Do not mix data between views.
 4. **Only reference files and classes that appear in the topography map**. Do not invent imports, dependencies, or third-party integrations not visible in the parsed structure.
+5. **Distinguish abstract from concrete models**: Each model entry has an `is_abstract` boolean. Abstract models (like `SoftDeleteModel`) cannot be instantiated directly. Do not count abstract models as concrete data tables. When discussing model counts, state the breakdown clearly (e.g., "36 concrete + 1 abstract").
+6. **Never invent enum values**: If you reference status enums (JobStatuses, etc.), use the EXACT values from the constants. Do not substitute synonyms like COMPLETED for FINISHED or FAILED for ERROR.
+7. **View names are exact**: Never add or remove suffixes from view class names. If the topography lists `AdminBenefactorRetrieveView`, do NOT refer to it as `AdminBenefactorRetrieveUpdateView`.
+
+### Known Ground Truth (Verified Facts — MUST Match)
+The following facts have been manually verified against the codebase. Your report MUST be consistent with them:
+- **JobStatuses enum values**: `PENDING`, `IN_PROGRESS`, `FINISHED`, `ERROR` (NOT "COMPLETED" or "FAILED")
+- **Admin benefactor view**: `AdminBenefactorRetrieveView` (NOT `AdminBenefactorRetrieveUpdateView`)
+- **Soft delete models**: `SoftDeleteModel` is abstract. Concrete soft-delete models: `UserCourseCompletion`, `CourseProgress`, `AnalysisOutput`, `SharingCode`, `CoachEntry`, `JournalEntry`, `EmailReportRequest` (7 total). These use `is_deleted` flag for soft deletion.
+- **Admin destroy views**: `AdminAnalysisOutputRetrieveDestroyView` uses `all_objects` (including deleted records). `AdminUserCompletedCourseDestroyView` and `AdminUserCourseProgressDestroyView` correctly implement soft deletes via `perform_destroy`.
+- **Course model**: `Course` inherits from `models.Model` directly (NOT `SoftDeleteModel`). `CourseDestroyView` performing hard deletes is EXPECTED behavior, not a risk.
 
 ### MCP-Augmented Context (Live Project State)
-{mcp_block}"""
+{live_context}
+
+**Note:** The sections below tagged "Live Django" come from `django-ai-boost` runtime introspection and are fully accurate (actual DB schema, URL configs, settings). Cross-reference these against the static parser data above — when they disagree, the Live Django data is authoritative. Use the URL patterns to understand actual route structure, which the parser cannot resolve statically."""
+
+    models_list = project_map.get('models', [])
+    views_list = project_map.get('views', [])
+    concrete_model_count = sum(1 for m in models_list if not m.get('is_abstract'))
+    abstract_model_count = sum(1 for m in models_list if m.get('is_abstract'))
+    class_based_view_count = sum(1 for v in views_list if not v.get('is_function_view'))
+    function_based_view_count = sum(1 for v in views_list if v.get('is_function_view'))
 
     PARSER_LIMITATIONS_FILLED = PARSER_LIMITATIONS.format(
-        model_count=len(project_map.get('models', [])),
+        model_count=len(models_list),
+        concrete_model_count=concrete_model_count,
+        abstract_model_count=abstract_model_count,
         serializer_count=len(project_map.get('serializers', [])),
-        view_count=len(project_map.get('views', []))
+        view_count=len(views_list),
+        class_based_view_count=class_based_view_count,
+        function_based_view_count=function_based_view_count,
+        live_context=live_context
     )
 
     # Single-pass fallback: used for local-only mode and cloud API failures
@@ -191,11 +223,8 @@ Construct a rigorous, realistic, and highly contextual 90-day onboarding strateg
 5. Observability, Telemetry, & Testing Enhancements
 6. Organizational & Workflow Improvement Recommendations"""
 
-    # Two-pass reasoning for cloud; single-pass with all context for local-only mode
-    if is_local_mode:
-        passes = [fallback_prompt]
-    else:
-        pass1 = f"""[Pass 1: Architecture Synthesis & Risk Discovery]
+    # Two-pass reasoning: split analysis + verification for faster per-pass generation
+    pass1 = f"""[Pass 1: Architecture Synthesis & Risk Discovery]
 Review this parsed structural layout of your new codebase:
 
 {PARSER_LIMITATIONS_FILLED}
@@ -214,7 +243,7 @@ Brainstorm a raw ledger of:
 
 Do not structure the 90-day roadmap or write final sections yet. Just map what you see."""
 
-        pass2 = f"""[Pass 2: Timeline Filtering & Production Strategy]
+    pass2 = f"""[Pass 2: Timeline Filtering & Production Strategy]
 Review your synthesis from Pass 1.
 
 {PARSER_LIMITATIONS_FILLED}
@@ -237,7 +266,7 @@ Generate the final report matching the schema defined in your system prompt. Inc
 5. **Observability, Telemetry (OpenTelemetry), & Testing Enhancements** — Gap analysis based on what visibility the topography reveals.
 6. **Organizational & Workflow Improvement Recommendations** — Process changes, ownership boundaries, code review triggers evident from the project structure."""
 
-        passes = [pass1, pass2]
+    passes = [pass1, pass2]
 
     # 4. Execute Reasoning Pass via Agent
     print(f"Step 3: Processing strategy analysis via [{REASONING_ARCHITECT}]...")
@@ -249,7 +278,7 @@ Generate the final report matching the schema defined in your system prompt. Inc
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
-        num_ctx=81920,
+        num_ctx=65536,
     )
 
     context = ""
@@ -266,30 +295,105 @@ Generate the final report matching the schema defined in your system prompt. Inc
     print(f"   [Done] Strategy analysis via {model_used} in {time.time() - pass_start:.2f}s")
 
     # 5. Evaluate analysis quality
-    print(f"Step 4: Evaluating strategy viability via Local Judge [{HEAVY_REVIEWER}]...")
+    print(f"Step 4: Evaluating strategy viability via Local Judge [{LOCAL_JUDGE}]...")
     judge_start = time.time()
 
     judge_context = f"Project Topography:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=HEAVY_REVIEWER)
+    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
     scores = evaluator.grade_run(final_analysis, "rubrics/strategy_rubric.json", context=judge_context)
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
     print(f"Strategy Reliability Scores: {scores}")
 
+    # 5b. Fact-check report against known ground truth
+    print(f"Step 4b: Fact-checking report fidelity...")
+
+    BAD_PATTERNS = [
+        (r'\bCOMPLETED\b', '"COMPLETED" (should be FINISHED for JobStatuses)'),
+        (r'\bFAILED\b', '"FAILED" (should be ERROR for JobStatuses)'),
+        (r'AdminBenefactorRetrieveUpdateView', 'view name (should be AdminBenefactorRetrieveView)'),
+    ]
+    fidelity_notes = []
+    fidelity_penalties = 0
+    for pattern, desc in BAD_PATTERNS:
+        matches = list(re.finditer(pattern, final_analysis))
+        if matches:
+            for m in matches:
+                line_num = final_analysis[:m.start()].count('\n') + 1
+                fidelity_notes.append(f"  ✗ Line {line_num}: {desc}")
+                fidelity_penalties += 1
+
+    # Check model count claims in the report
+    model_count_patterns = [
+        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+models?\b', 'model count'),
+        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+serializers?\b', 'serializer count'),
+        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+views?\b', 'view count'),
+    ]
+    parser_model_count = len(project_map.get('models', []))
+    parser_serializer_count = len(project_map.get('serializers', []))
+    parser_view_count = len(project_map.get('views', []))
+    tolerance = 3
+    for pattern, label in model_count_patterns:
+        for m in re.finditer(pattern, final_analysis, re.IGNORECASE):
+            claimed = int(m.group(1))
+            actual = {'model': parser_model_count, 'serializer': parser_serializer_count, 'view': parser_view_count}[label.split()[0]]
+            if abs(claimed - actual) > tolerance:
+                line_num = final_analysis[:m.start()].count('\n') + 1
+                fidelity_notes.append(f"  ⚠ Line {line_num}: Claims {claimed} {label} (parser found {actual})")
+                fidelity_penalties += 1
+
+    # Check for "concrete" / "abstract" model distinction in the report
+    has_concrete_abstract = bool(re.search(r'(concrete|abstract)\s*model', final_analysis, re.IGNORECASE))
+    if has_concrete_abstract:
+        fidelity_notes.append(f"  ✓ Correctly distinguishes concrete vs abstract models")
+    else:
+        fidelity_notes.append(f"  ⚠ Does not distinguish concrete vs abstract models")
+
+    fidelity_score = max(0, 10 - fidelity_penalties)
+    if fidelity_penalties == 0:
+        fidelity_rating = "Excellent"
+    elif fidelity_penalties <= 2:
+        fidelity_rating = "Good"
+    elif fidelity_penalties <= 4:
+        fidelity_rating = "Fair"
+    else:
+        fidelity_rating = "Poor"
+
+    fidelity_report = [
+        f"\n{'='*50}",
+        f"  Report Fidelity Score: {fidelity_score}/10 — {fidelity_rating}",
+        f"  Penalties: {fidelity_penalties}",
+    ]
+    if fidelity_notes:
+        fidelity_report.append("  Details:")
+        fidelity_report.extend(fidelity_notes)
+    fidelity_report.append(f"{'='*50}\n")
+    fidelity_report_str = "\n".join(fidelity_report)
+    print(fidelity_report_str)
+
     # 6. Log and Export Artifacts
     print("Step 5: Archiving run data...")
+    full_scores = {**scores, "fidelity": fidelity_score, "fidelity_max": 10, "fidelity_notes": fidelity_notes}
     warehouse = HarnessWarehouse()
     warehouse.log_run(
         model_name=model_used,
         agent_role="Incoming Staff Engineer (90-Day Strategy)",
         raw_output=final_analysis,
-        scores=scores
+        scores=full_scores
     )
 
     report_filename = "reports/staff_90_day_onboarding_roadmap.md"
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_analysis)
+        f.write(f"\n\n---\n{'-'*50}\n")
+        f.write(f"## Fidelity Check\n\n")
+        f.write(f"**Score:** {fidelity_score}/10 — {fidelity_rating}\n\n")
+        f.write(f"**Parser Ground Truth:** {concrete_model_count} concrete models, {abstract_model_count} abstract, {parser_serializer_count} serializers, {parser_view_count} views ({class_based_view_count} class-based, {function_based_view_count} function-based)\n\n")
+        if fidelity_notes:
+            f.write("**Issues Found:**\n\n")
+            for note in fidelity_notes:
+                f.write(f"{note}\n\n")
 
     if _mcp_orch:
         _mcp_orch.remember(
@@ -301,6 +405,7 @@ Generate the final report matching the schema defined in your system prompt. Inc
 
     total_duration = time.time() - start_time
     print(f"\nReport saved to: {report_filename}")
+    print(f"Fidelity Score: {fidelity_score}/10 ({fidelity_rating})")
     print(f"Total Time: {total_duration:.2f}s  Model: {model_used}")
 
 if __name__ == "__main__":

@@ -8,6 +8,9 @@ from core.git_provider import GitDiffProvider
 from core.runner import StatefulHarnessRunner
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
+from core.mcp_orchestrator import init_orchestrator
+
+os.environ.setdefault("OLLAMA_MLX", "1")
 
 # ==============================================================================
 # MODEL & API CONFIGURATION
@@ -26,6 +29,7 @@ ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 FALLBACK_REVIEWER     = "gemini-2.5-flash"
 # Local Judge: Scores the review against a rubric
 HEAVY_REVIEWER        = "deepseek-r1:14b"
+LOCAL_JUDGE           = "qwen2.5-coder:14b"
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = os.environ.get("TARGET_REPO", "/Users/dansparkes/memores/memores-api")
@@ -39,24 +43,11 @@ def init_mcp(repo_path=None, config_path=None):
     if _mcp_orch is not None:
         return _mcp_orch
     cfg_path = config_path or MCP_CONFIG_PATH
-    if not os.path.exists(cfg_path):
-        return None
     path = repo_path or TARGET_DJANGO_PROJECT
-    from core.mcp_servers import set_memory_persist_path
-    from core.cache import CACHE_DIR
-    memory_path = str(CACHE_DIR / "memories.json")
-    set_memory_persist_path(memory_path)
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(cfg_path, target_repo=path)
-    started = orch.start()
-    if started:
+    orch = init_orchestrator(cfg_path, path)
+    if orch:
         _mcp_orch = orch
-        try:
-            orch.call_tool("git", "git_set_repo", {"path": path})
-        except Exception:
-            pass
-        return orch
-    return None
+    return orch
 
 
 def build_mcp_context() -> str:
@@ -64,24 +55,12 @@ def build_mcp_context() -> str:
     if not orch:
         return ""
     parts = []
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"Working Tree:\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=15)
-        if recent and not recent.startswith("("):
-            parts.append(f"Recent Commits:\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["code_review", "architectural_rule"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Review Context:\n{memory}")
-    except Exception:
-        pass
+    git_block = orch.build_git_context(max_count=15)
+    if git_block:
+        parts.append(git_block)
+    memory = orch.recall_tagged(tags=["code_review", "architectural_rule"])
+    if memory:
+        parts.append(f"Review Context:\n{memory}")
     return "\n\n".join(parts)
 
 def parse_arguments():
@@ -131,7 +110,7 @@ def main():
     print(f"🚀 Launching Local Code Review Engine (Hybrid Mode)")
     print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local JSON Judge : {HEAVY_REVIEWER}")
+    print(f"Local JSON Judge : {LOCAL_JUDGE}")
     print(f"Review Delta     : {target_branch} <--- {source_branch}")
     print(f"{'='*60}\n")
 
@@ -226,11 +205,8 @@ Review the diff above. For each changed file, evaluate whether the changes are c
 
 Format as markdown with file paths as headings."""
 
-    # Two-pass reasoning for cloud; single-pass with all context for local-only mode
-    if is_local_mode:
-        passes = [fallback_prompt]
-    else:
-        pass1 = f"""[Pass 1: Context Alignment & Blast Radius Mapping]
+    # Two-pass reasoning: split context alignment + detailed review
+    pass1 = f"""[Pass 1: Context Alignment & Blast Radius Mapping]
 Here is the global system layout of the app (models with their fields, serializers, views):
 {project_map_json}
 
@@ -241,7 +217,7 @@ Here are the files changed in this branch:
 Analyze the structural intersection. Which upstream modules, views, or serializers could break or be impacted by changes to these specific files?
 Identify potential vulnerabilities or scaling defects introduced by the patch."""
 
-        pass2 = f"""[Pass 2: Detailed Code Review]
+    pass2 = f"""[Pass 2: Detailed Code Review]
 Review the raw lines of code changed in this branch:
 ```diff
 {raw_diff}
@@ -252,7 +228,7 @@ Generate your final review report. Evaluate line changes, ensure patterns are cl
 
 Follow the markdown schema and headers defined in your system prompt."""
 
-        passes = [pass1, pass2]
+    passes = [pass1, pass2]
 
     # 7. Execute Reasoning Pass
     print(f"🤖 Step 2: Processing Review via [{REASONING_ARCHITECT}]...")
@@ -263,7 +239,7 @@ Follow the markdown schema and headers defined in your system prompt."""
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
-        num_ctx=81920,
+        num_ctx=65536,
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
@@ -276,12 +252,12 @@ Follow the markdown schema and headers defined in your system prompt."""
     print(f"   [Done] Review generated via {model_used} in {time.time() - pass_start:.2f}s")
 
     # 8. Evaluate review quality
-    print(f"⚖️ Step 3: Checking review quality via Local Judge [{HEAVY_REVIEWER}]...")
+    print(f"⚖️ Step 3: Checking review quality via Local Judge [{LOCAL_JUDGE}]...")
     judge_start = time.time()
     
     # Provide the diff + project map as ground truth so the judge can detect fabrication
     judge_context = f"Diff:\n```diff\n{raw_diff[:10000]}\n```\n\nProject Map:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=HEAVY_REVIEWER)
+    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
     scores = evaluator.grade_run(final_review, "rubrics/code_review_rubric.json", context=judge_context)
     
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")

@@ -6,6 +6,8 @@ import time
 import ast
 import tempfile
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,26 +67,28 @@ class Agent:
         if self.is_cloud and self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        temperature = 0.0 if "coder" in self.model_name else 0.4
+        temperature = 0.0 if "qwen" in self.model_name else 0.4
         tools = None
         skill_map = {}
         if skills:
             tools = [s.to_tool() for s in skills.values()]
             skill_map = skills
 
-        _cache_key = None
-        if not skills and not stream:
-            cache_payload = json.dumps(messages, sort_keys=True, default=str)
-            _cache_key = make_key("agent:execute", self.model_name, cache_payload, str(temperature), str(self.num_ctx))
-            cached = cache_get(_cache_key, max_age=86400)
-            if cached is not None:
-                return cached
-
         # Streaming mode for code generation (local Ollama only, no tool calls)
         if stream and not self.is_cloud and not skills:
             return self._execute_stream(messages, headers, temperature)
 
         max_tool_rounds = 10
+
+        session = requests.Session()
+        retries = Retry(
+            total=2, backoff_factor=4,
+            status_forcelist=[502, 503, 504],
+            allowed_methods={"POST"},
+            raise_on_status=False,
+        )
+        session.mount("http://", HTTPAdapter(max_retries=retries))
+        session.mount("https://", HTTPAdapter(max_retries=retries))
 
         for round_idx in range(max_tool_rounds + 1):
             if self.is_cloud:
@@ -109,7 +113,8 @@ class Agent:
             if tools:
                 payload["tools"] = tools
 
-            response = requests.post(self.api_url, json=payload, headers=headers)
+            timeout = 600 if self.is_cloud else 480
+            response = session.post(self.api_url, json=payload, headers=headers, timeout=timeout)
             response.raise_for_status()
             data = response.json()
 
@@ -122,8 +127,6 @@ class Agent:
             tool_calls = msg.get("tool_calls")
 
             if not tool_calls:
-                if _cache_key is not None:
-                    cache_set(_cache_key, content)
                 return content
 
             # Append assistant message with tool_calls to conversation

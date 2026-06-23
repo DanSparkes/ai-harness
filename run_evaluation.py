@@ -5,7 +5,9 @@ from core.parser import DjangoTopographer
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
-from core.cache import CACHE_DIR as _CACHE_DIR
+from core.mcp_orchestrator import init_orchestrator
+
+os.environ.setdefault("OLLAMA_MLX", "1")
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
@@ -18,6 +20,7 @@ ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER     = "gemini-2.5-flash"
 HEAVY_REVIEWER        = "deepseek-r1:14b"
+LOCAL_JUDGE           = "qwen2.5-coder:14b"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -29,23 +32,10 @@ def init_mcp():
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
-    if not os.path.exists(MCP_CONFIG_PATH):
-        return None
-    from core.mcp_servers import set_memory_persist_path
-    from core.cache import CACHE_DIR
-    memory_path = str(CACHE_DIR / "memories.json")
-    set_memory_persist_path(memory_path)
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
-    started = orch.start()
-    if started:
+    orch = init_orchestrator(MCP_CONFIG_PATH, TARGET_DJANGO_PROJECT)
+    if orch:
         _mcp_orch = orch
-        try:
-            orch.call_tool("git", "git_set_repo", {"path": TARGET_DJANGO_PROJECT})
-        except Exception:
-            pass
-        return orch
-    return None
+    return orch
 
 
 def build_mcp_context_block() -> str:
@@ -53,24 +43,12 @@ def build_mcp_context_block() -> str:
     if not orch:
         return ""
     parts = []
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"=== Working Tree ===\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=10)
-        if recent and not recent.startswith("("):
-            parts.append(f"=== Recent Commits ===\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["architectural_rule"])
-        if memory and memory != "(no memories)":
-            parts.append(f"=== Architectural Rules ===\n{memory}")
-    except Exception:
-        pass
+    git_block = orch.build_git_context(max_count=10)
+    if git_block:
+        parts.append(git_block)
+    memory = orch.recall_tagged(tags=["architectural_rule"])
+    if memory:
+        parts.append(f"=== Architectural Rules ===\n{memory}")
     return "\n\n".join(parts)
 
 def main():
@@ -84,7 +62,7 @@ def main():
     print(f"Launching Architecture Review Engine (Hybrid Mode)")
     print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local Judge      : {HEAVY_REVIEWER}")
+    print(f"Local Judge      : {LOCAL_JUDGE}")
     print(f"{'='*60}\n")
 
     start_time = time.time()
@@ -308,7 +286,7 @@ Focus on pragmatic Django evolution.""",
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
-        num_ctx=81920,
+        num_ctx=65536,
     )
 
     context = ""
@@ -388,11 +366,11 @@ Original Report:
     print(f"   [Done] Revision completed in {time.time() - rev_start:.2f}s")
 
     # 7. Evaluate final report quality
-    print(f"Step 6: Evaluating final report via Local Judge [{HEAVY_REVIEWER}]...")
+    print(f"Step 6: Evaluating final report via Local Judge [{LOCAL_JUDGE}]...")
     judge_start = time.time()
 
     judge_context = f"Project Topography:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=HEAVY_REVIEWER)
+    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
     scores = evaluator.grade_run(final_report, "rubrics/architecture_rubric.json", context=judge_context)
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")

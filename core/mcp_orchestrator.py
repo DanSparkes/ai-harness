@@ -4,6 +4,8 @@ import sys
 from typing import Any
 
 from core.mcp_client import MCPClient, MCPError
+from core.mcp_servers import set_memory_persist_path
+from core.cache import CACHE_DIR
 
 
 MCP_CONFIG_SCHEMA = {
@@ -97,7 +99,7 @@ class MCPOrchestrator:
             except MCPError as e:
                 print(f"  MCP [{name}] failed to start: {e}")
             except Exception as e:
-                print(f"  MCP [{name}] unexpected error: {e}")
+                print(f"  MCP [{name}] unexpected error: {type(e).__name__}: {e}")
         self._started = True
         return started
 
@@ -266,25 +268,163 @@ class MCPOrchestrator:
         except MCPError:
             return "(sequential thinking server not available)"
 
-    def build_mcp_context_block(self) -> str:
+    def build_mcp_context_block(self, tags: list[str] | None = None) -> str:
         if not self.is_running:
             return ""
         sections = ["=== MCP TOOL WORKBENCH (available tools) ==="]
         sections.append(self.format_tools_for_prompt())
         sections.append("")
         sections.append("=== MCP MEMORY CONTEXT ===")
-        memory = self.recall(tags=["active"])
+        memory = self.recall(tags=tags or ["active"])
         if memory and memory != "(no memories)":
             sections.append(memory)
         else:
             sections.append("(no active session memories)")
         sections.append("")
-        sections.append("=== MCP GIT CONTEXT ===")
-        status = self.git_status()
-        if status and status != "(no output)":
-            sections.append(f"Working tree status:\n{status}")
+        git_block = self.build_git_context()
+        if git_block:
+            sections.append(git_block)
         sections.append("")
         return "\n".join(sections)
+
+    def build_git_context(self, max_count: int = 10) -> str:
+        if not self.is_running:
+            return ""
+        parts = []
+        try:
+            status = self.git_status()
+            if status and status != "(no output)":
+                parts.append(f"Working Tree:\n{status}")
+        except Exception:
+            pass
+        try:
+            recent = self.git_log(max_count=max_count)
+            if recent and not recent.startswith("("):
+                parts.append(f"Recent Commits:\n{recent}")
+        except Exception:
+            pass
+        return "\n\n".join(parts)
+
+    def recall_tagged(self, tags: list[str], default: str = "") -> str:
+        if not self.is_running:
+            return default
+        try:
+            memory = self.recall(tags=tags)
+            if memory and memory != "(no memories)":
+                return memory
+        except Exception:
+            pass
+        return default
+
+    def build_django_live_context(self) -> tuple[str, dict]:
+        if not self.is_running:
+            return "", {}
+        django_client = self.get_client("django")
+        if not django_client:
+            return "", {}
+
+        raw = {}
+        sections = []
+
+        try:
+            app_info = self.call_tool("django", "application_info", timeout=30)
+            if app_info:
+                combined = "\n".join(
+                    c["text"] for c in app_info if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["application_info"] = combined
+                sections.append(f"=== Live Django App Info ===\n{combined}")
+        except Exception:
+            pass
+
+        try:
+            urls = self.call_tool("django", "list_urls", timeout=30)
+            if urls:
+                combined = "\n".join(
+                    c["text"] for c in urls if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["urls"] = combined
+                sections.append(f"=== Live Django URL Patterns ===\n{combined}")
+        except Exception:
+            pass
+
+        try:
+            models = self.call_tool("django", "list_models", {"app_labels": ["memores"]}, timeout=30)
+            if models:
+                combined = "\n".join(
+                    c["text"] for c in models if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["models"] = combined
+                sections.append(f"=== Live Django Models (from django-ai-boost) ===\n{combined}")
+        except Exception:
+            pass
+
+        try:
+            schema = self.call_tool("django", "database_schema", timeout=30)
+            if schema:
+                combined = "\n".join(
+                    c["text"] for c in schema if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["database_schema"] = combined
+                sections.append(f"=== Live Database Schema ===\n{combined}")
+        except Exception:
+            pass
+
+        return "\n\n".join(sections), raw
+
+    def build_codebase_memory_context(self, timeout_index: float = 120.0) -> tuple[str, dict]:
+        if not self.is_running:
+            return "", {}
+        server = self.get_client("codebase-memory")
+        if not server:
+            return "", {}
+        if not self._target_repo:
+            return "", {}
+
+        raw = {}
+        sections = []
+        project_name = self._target_repo.lstrip("/").replace("/", "-")
+
+        # 1. Index (idempotent — content-hash based, only re-parses changed files)
+        try:
+            result = self.call_tool("codebase-memory", "index_repository",
+                                    {"repo_path": self._target_repo}, timeout=timeout_index)
+            if result:
+                combined = "\n".join(
+                    c["text"] for c in result if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["index_result"] = combined
+        except Exception:
+            pass
+
+        # 2. Architecture overview (languages, packages, entry points, routes,
+        #    hotspots, boundaries, layers, clusters, file tree)
+        try:
+            arch = self.call_tool("codebase-memory", "get_architecture",
+                                  {"aspects": ["all"], "project": project_name}, timeout=30)
+            if arch:
+                combined = "\n".join(
+                    c["text"] for c in arch if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["architecture"] = combined
+                sections.append(f"=== Codebase Architecture (from codebase-memory-mcp) ===\n{combined}")
+        except Exception:
+            pass
+
+        # 3. Graph schema (node/edge counts for reference)
+        try:
+            schema = self.call_tool("codebase-memory", "get_graph_schema",
+                                    {"project": project_name}, timeout=15)
+            if schema:
+                combined = "\n".join(
+                    c["text"] for c in schema if isinstance(c, dict) and c.get("type") == "text"
+                )
+                raw["graph_schema"] = combined
+                sections.append(f"=== Codebase Memory Graph Schema ===\n{combined}")
+        except Exception:
+            pass
+
+        return "\n\n".join(sections), raw
 
     def discover_project_context(self) -> str:
         parts = []
@@ -296,16 +436,11 @@ class MCPOrchestrator:
                 parts.append("Project root contents:")
                 for entry in listing:
                     parts.append(f"  {entry}")
-        git_name = "git" if "git" in self._clients else None
-        if git_name:
-            recent = self.git_log(max_count=10)
-            if recent and not recent.startswith("(git_log error"):
-                parts.append(f"\nRecent git history:\n{recent}")
-            status = self.git_status()
-            if status and not status.startswith("(git_status error") and status != "(no output)":
-                parts.append(f"\nWorking tree:\n{status}")
-        memory = self.recall(tags=["architectural_rule", "active"])
-        if memory and memory != "(no memories)":
+        git_block = self.build_git_context(max_count=10)
+        if git_block:
+            parts.append(f"\n{git_block}")
+        memory = self.recall_tagged(tags=["architectural_rule", "active"])
+        if memory:
             parts.append(f"\nArchitectural rules from memory:\n{memory}")
         return "\n".join(parts)
 
@@ -329,6 +464,22 @@ class MCPOrchestrator:
             return f"Error calling {server_name}/{tool_name}: {e}"
         except Exception as e:
             return f"Unexpected error calling {server_name}/{tool_name}: {e}"
+
+
+def init_orchestrator(config_path: str, target_repo: str) -> MCPOrchestrator | None:
+    if not os.path.exists(config_path):
+        return None
+    memory_path = str(CACHE_DIR / "memories.json")
+    set_memory_persist_path(memory_path)
+    orch = MCPOrchestrator(config_path, target_repo=target_repo)
+    started = orch.start()
+    if started:
+        try:
+            orch.call_tool("git", "git_set_repo", {"path": target_repo})
+        except Exception:
+            pass
+        return orch
+    return None
 
 
 def _parse_text_content(content: Any) -> list[str]:

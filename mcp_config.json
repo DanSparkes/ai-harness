@@ -40,6 +40,13 @@
       "enabled": true,
       "description": "Live Django introspection: models, DB schema, URLs, settings, ORM queries, system checks, migrations. Install: pip install django-ai-boost"
     },
+    "codebase-memory": {
+      "type": "stdio",
+      "command": "codebase-memory-mcp",
+      "args": [],
+      "enabled": true,
+      "description": "Persistent code knowledge graph with tree-sitter AST parsing. 158 languages, call chains, architecture overview, change impact. Install: pip install codebase-memory-mcp"
+    },
     "thinking": {
       "type": "stdio",
       "command": "npx",

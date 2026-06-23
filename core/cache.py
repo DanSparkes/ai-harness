@@ -10,6 +10,9 @@ CACHE_DIR = Path.home() / ".cache" / "local-harness"
 _local_cache: dict[str, dict] = {}
 _local_lock = threading.Lock()
 
+_git_head_cache: dict[str, tuple[str, float]] = {}
+_git_head_lock = threading.Lock()
+
 
 def _ensure_cache_dir():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,6 +28,11 @@ def make_key(*parts: str) -> str:
 
 
 def get_git_head(repo_path: str) -> str | None:
+    with _git_head_lock:
+        now = time.time()
+        cached = _git_head_cache.get(repo_path)
+        if cached and now - cached[1] < 30:
+            return cached[0]
     try:
         import subprocess
         r = subprocess.run(
@@ -32,24 +40,13 @@ def get_git_head(repo_path: str) -> str | None:
             cwd=repo_path, capture_output=True, text=True, timeout=10
         )
         if r.returncode == 0:
-            return r.stdout.strip()
+            head = r.stdout.strip()
+            with _git_head_lock:
+                _git_head_cache[repo_path] = (head, time.time())
+            return head
     except Exception:
         pass
     return None
-
-
-def get_mtime_key(repo_path: str, *globs: str) -> str:
-    import glob as glob_mod
-    latest = 0.0
-    for g in globs:
-        for p in glob_mod.glob(os.path.join(repo_path, g), recursive=True):
-            try:
-                mtime = os.path.getmtime(p)
-                if mtime > latest:
-                    latest = mtime
-            except OSError:
-                pass
-    return str(latest)
 
 
 def get(key: str, max_age: float | None = 86400) -> object | None:
@@ -85,7 +82,7 @@ def set(key: str, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(path, "w") as f:
-            json.dump(entry, f, default=str)
+            f.write(json.dumps(entry, default=str, ensure_ascii=False))
     except Exception:
         pass
 

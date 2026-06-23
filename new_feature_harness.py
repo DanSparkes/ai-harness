@@ -18,9 +18,12 @@ from typing import Any, Dict, Tuple
 
 # Core Configurations
 from core.agent import Agent
+from core.mcp_orchestrator import init_orchestrator
 
-IMPLEMENTER_MODEL = "qwen2.5-coder:14b"
-AUDITOR_MODEL     = "qwen3.6:latest"
+os.environ.setdefault("OLLAMA_MLX", "1")
+
+IMPLEMENTER_MODEL = "qwen3.6:latest"
+AUDITOR_MODEL     = "deepseek-r1:14b"
 GEMINI_MODEL      = "gemini-2.5-flash"
 
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -31,21 +34,12 @@ def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
     global _mcp_orchestrator
     if _mcp_orchestrator is not None:
         return _mcp_orchestrator
-    if not os.path.exists(config_path):
+    if not target_repo:
         return None
-    from core.mcp_servers import set_memory_persist_path
-    from core.cache import CACHE_DIR
-    memory_path = str(CACHE_DIR / "memories.json")
-    set_memory_persist_path(memory_path)
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(config_path, target_repo=target_repo)
-    started = orch.start()
-    if started:
+    orch = init_orchestrator(config_path, target_repo)
+    if orch:
         _mcp_orchestrator = orch
-        if target_repo:
-            orch.call_tool("git", "git_set_repo", {"path": target_repo})
-        return orch
-    return None
+    return orch
 
 
 def get_mcp_orchestrator():

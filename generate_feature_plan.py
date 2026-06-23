@@ -29,6 +29,9 @@ from typing import Any
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 from core.agent import Agent
+from core.mcp_orchestrator import init_orchestrator
+
+os.environ.setdefault("OLLAMA_MLX", "1")
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
@@ -114,28 +117,15 @@ def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
     global _mcp_orchestrator
     if _mcp_orchestrator is not None:
         return _mcp_orchestrator
-    if not os.path.exists(config_path):
+    if not target_repo:
         return None
-    from core.mcp_servers import set_memory_persist_path
-    from core.cache import CACHE_DIR
-    memory_path = str(CACHE_DIR / "memories.json")
-    set_memory_persist_path(memory_path)
-    from core.mcp_orchestrator import MCPOrchestrator
-    orch = MCPOrchestrator(config_path, target_repo=target_repo)
-    started = orch.start()
-    if started:
+    orch = init_orchestrator(config_path, target_repo)
+    if orch:
         _mcp_orchestrator = orch
-        if target_repo:
-            try:
-                orch.call_tool("git", "git_set_repo", {"path": target_repo})
-            except Exception:
-                pass
-        return orch
-    return None
+    return orch
 
 
 def get_mcp_context(args: argparse.Namespace) -> str:
-    """Gather context from MCP servers for richer architectural planning."""
     if not args.mcp_config:
         return ""
     target = getattr(args, "target_repo", None)
@@ -143,30 +133,15 @@ def get_mcp_context(args: argparse.Namespace) -> str:
     if not orch:
         return ""
     parts = ["=== MCP-AUGMENTED CONTEXT ==="]
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"Git Status:\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=15)
-        if recent and not recent.startswith("("):
-            parts.append(f"Recent Commits:\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["architectural_rule"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Architectural Rules:\n{memory}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["active", "campaign_complete"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Active Campaign Context:\n{memory}")
-    except Exception:
-        pass
+    git_block = orch.build_git_context(max_count=15)
+    if git_block:
+        parts.append(git_block)
+    memory = orch.recall_tagged(tags=["architectural_rule"])
+    if memory:
+        parts.append(f"Architectural Rules:\n{memory}")
+    memory = orch.recall_tagged(tags=["active", "campaign_complete"])
+    if memory:
+        parts.append(f"Active Campaign Context:\n{memory}")
     orch.stop()
     return "\n".join(parts)
 
