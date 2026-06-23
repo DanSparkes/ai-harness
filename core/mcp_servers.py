@@ -219,12 +219,46 @@ class GitServer(MCPBuiltinServer):
         return self._git(["show", "--stat", "--patch", commit]) or "(not found)"
 
 
+_default_memory_persist_path: str | None = None
+
+
+def set_memory_persist_path(path: str):
+    global _default_memory_persist_path
+    _default_memory_persist_path = path
+
+
 class MemoryServer(MCPBuiltinServer):
-    def __init__(self):
+    def __init__(self, persist_path: str | None = None):
+        if persist_path is None:
+            persist_path = _default_memory_persist_path
         self._facts: dict[str, list[dict]] = {}
         self._tags: dict[str, list[str]] = {}
+        self._persist_path = persist_path
+        self._dirty = False
+        if persist_path:
+            self._load_from_disk()
 
-    def handle_request(self, method: str, params: dict[str, Any]) -> Any:
+    def _load_from_disk(self):
+        try:
+            path = Path(self._persist_path)
+            if path.exists():
+                with open(path) as f:
+                    data = json.load(f)
+                self._facts = data.get("facts", {})
+                self._tags = data.get("tags", {})
+        except Exception:
+            pass
+
+    def _save_to_disk(self):
+        if not self._persist_path:
+            return
+        try:
+            path = Path(self._persist_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"facts": self._facts, "tags": self._tags}, f, indent=2)
+        except Exception:
+            pass
         handlers = {
             "initialize": self._initialize,
             "tools/list": self._list_tools,
@@ -356,6 +390,8 @@ class MemoryServer(MCPBuiltinServer):
         }]
         for tag in tags:
             self._tags.setdefault(tag, []).append(key)
+        self._dirty = True
+        self._save_to_disk()
         return f"Stored: {key}"
 
     def _cmd_recall(self, args: dict) -> str:
@@ -389,6 +425,8 @@ class MemoryServer(MCPBuiltinServer):
             for tag, keys in self._tags.items():
                 if key in keys:
                     keys.remove(key)
+            self._dirty = True
+            self._save_to_disk()
             return f"Forgotten: {key}"
         return f"Key not found: {key}"
 
@@ -414,6 +452,8 @@ class MemoryServer(MCPBuiltinServer):
             parsed = json.loads(data)
             self._facts = parsed.get("facts", {})
             self._tags = parsed.get("tags", {})
+            self._dirty = True
+            self._save_to_disk()
             return f"Imported {len(self._facts)} memories"
         except json.JSONDecodeError as e:
             raise MCPToolError(-32000, f"Invalid memory data: {e}") from e

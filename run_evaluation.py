@@ -5,6 +5,7 @@ from core.parser import DjangoTopographer
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.warehouse import HarnessWarehouse
+from core.cache import CACHE_DIR as _CACHE_DIR
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
@@ -30,6 +31,10 @@ def init_mcp():
         return _mcp_orch
     if not os.path.exists(MCP_CONFIG_PATH):
         return None
+    from core.mcp_servers import set_memory_persist_path
+    from core.cache import CACHE_DIR
+    memory_path = str(CACHE_DIR / "memories.json")
+    set_memory_persist_path(memory_path)
     from core.mcp_orchestrator import MCPOrchestrator
     orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
     started = orch.start()

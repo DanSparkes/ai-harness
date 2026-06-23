@@ -2,93 +2,59 @@
 
 ## 1. Overall Architectural Verdict
 **APPROVED WITH CONDITIONS**
-This PR successfully introduces explicit grant provenance (`sponsored` vs `personal`) and migrates static model permissions to a dynamic registry-driven system, reducing coupling between the access control layer and individual models. The architectural delta is positive: it centralizes permission evaluation, enforces transactional integrity on grant mutations, and extracts code generation logic into reusable helpers. Minor conditions apply regarding test assertion validity and potential N+1 query patterns in the new permission service.
+This PR introduces substantial new domain capabilities (catalog grants, admin documentation browser, registration code enhancements) and successfully deprecates legacy test endpoints (`SentimentAnalysis`, `test_data.js`). However, the introduction of a client-side pagination aggregator poses a severe scalability risk for large datasets, and the complete absence of tests for newly introduced business logic (tree traversal, error extraction, grant mutations) represents a measurable regression in system reliability.
 
 ## 2. Blast Radius & Coupling Assessment
-- **Access Control Layer:** `memores/constants/profile_permissions.py` and `memores/services/profile_permission_service.py` decouple permission definitions from `Profile.Meta`. This aligns with the existing `ACCESS_GATE_REGISTRY` pattern and prevents migration drift when feature gates change.
-- **Grant Provenance:** The addition of `GrantTypes` and `grant_type` on `CourseProviderGrant` impacts serialization (`user_serializers.py`, `benefactor_serializers.py`), service logic (`course_provider_service.py`), and admin views (`course_provider_grant.py`). The changes are cohesively scoped; grant mutations are isolated to dedicated service methods, preventing accidental type overwrites.
-- **Serialization & Views:** `BenefactorUpdateSerializer` and `AdminCourseProviderGrantSerializer` introduce targeted write paths that bypass full model serialization. This reduces payload size and explicitly controls side-effects (e.g., `prune_org_grants_outside_sponsor_policy`). Coupling remains tight to admin workflows, which is appropriate for this scope.
-- **Migrations:** `0038` and `0040` are self-contained. Choices are duplicated inline per Django's frozen snapshot requirement, avoiding runtime import failures during historical replay.
+- **Pagination Abstraction:** The new `src/api/pagination.ts` replaces direct `getRequest` calls across `administration`, `benefactor`, `user`, and `dashboard` modules. This centralizes data fetching but forces all consumers to adopt a "fetch-all" contract, stripping server-side pagination cursors (`next`/`previous`) and potentially overwhelming the client with large response sets.
+- **API Contract Shifts:** `createRegistrationCode` in `src/api/administration.ts` now accepts a `body` payload instead of triggering via empty POST. This is a breaking change for any unlisted consumers expecting the previous signature.
+- **Route Coupling:** The new `/documents/*` route in `src/Router.tsx` tightly couples to `useAdminDocs`, `adminDocTreeHelpers`, and `MarkdownViewer`. Any backend schema drift in the admin docs tree will cascade through the UI without type-level enforcement.
 
 ## 3. Line-by-Line Code Critiques
 
-- **File:** `memores/tests/views/admin/test_course_provider_grant.py` — line ~128
-- **Issue Category:** Test Coverage / Assertion Quality
-- **The Defect:** `CourseProviderGrant.objects.get()` raises `DoesNotExist` if the record is missing. Asserting `self.assertTrue(grant)` is tautological and passes vacuously even if the assertion logic is flawed.
-  ```python
-  grant = CourseProviderGrant.objects.get(user=profile, course_provider=provider)
-  self.assertTrue(grant)
-  ```
-- **Remediation:** Validate the specific attribute or use `assertIsNotNone`:
-  ```python
-  self.assertIsNotNone(grant)
-  self.assertEqual(grant.grant_type, GrantTypes.PERSONAL.value)
-  ```
+- **File:** `src/api/pagination.ts` — Lines 23-38
+  - **Issue Category:** Performance / Scalability
+  - **The Defect:** `getAllPaginatedResults` eagerly fetches every page of data into a single array and returns `{ results, count: results.length, next: null, previous: null }`. If the backend returns thousands of records (e.g., users or registration codes), this will cause massive memory consumption, network latency spikes, and potential browser crashes. It also defeats the purpose of server-side pagination by stripping cursors.
+  - **Remediation:** Return the first page's cursor data intact, or implement client-side infinite scroll/pagination using React Query's `getNextPageParam`. Do not eagerly fetch all pages in a tight loop for list endpoints.
 
-- **File:** `memores/services/profile_permission_service.py` — lines ~42-47
-- **Issue Category:** Performance / Defensive Engineering
-- **The Defect:** `get_assigned_permissions()` iterates over all managed codenames and calls `permission_is_assigned()`, which triggers `profile.user.has_perm()`. While DRF caches `has_perm` per request, this service is called from `ProfileSerializer.get_permissions()` on every profile retrieval. If the permission list grows, it will execute multiple ORM queries or hit the cache repeatedly.
-  ```python
-  def get_assigned_permissions(profile: Profile) -> dict[str, bool]:
-      return {
-          codename: permission_is_assigned(profile, codename)
-          for codename in managed_permission_codenames()
-      }
-  ```
-- **Remediation:** Fetch all relevant permissions in a single query and map them to the result dictionary. This guarantees O(1) lookups regardless of list size:
-  ```python
-  def get_assigned_permissions(profile: Profile) -> dict[str, bool]:
-      assigned = set(
-          profile.user.user_permissions.values_list("codename", flat=True)
-      )
-      return {
-          codename: (codename in assigned or meta.get(codename) is True)
-          for codename in managed_permission_codenames()
-      }
-  ```
+- **File:** `src/pages/administration/RegistrationCodesTab.tsx` — Lines 63-64
+  - **Issue Category:** Maintainability / Integration Risk
+  - **The Defect:** `searchFields` includes `'benefactor.name'`. The shared `SearchTable` component is a UI primitive. Unless it explicitly implements dot-notation nested property resolution, this field will silently fail to filter results. Relying on implicit string parsing in shared table components is fragile.
+  - **Remediation:** Verify `SearchTable` supports nested key resolution. If not, flatten the data before passing it to `dataSource`, or pass a custom `searchFn` prop.
 
-- **File:** `memores/utils/registration_code_helpers.py` — lines ~6-10
-- **Issue Category:** Defensive Engineering / Scalability
-- **The Defect:** The `while True` loop performs a synchronous DB check on every iteration. Under high concurrency or as the `RegistrationCode` table grows, this can cause contention and latency spikes before generating a unique code.
-  ```python
-  while True:
-      code = str(uuid.uuid4())[:6].upper()
-      if not RegistrationCode.objects.filter(code=code).exists():
-          return code
-  ```
-- **Remediation:** Use an atomic `try/except` on save with a unique constraint, or leverage Django's `models.UUIDField` with `unique=True` and catch `IntegrityError`. For now, the current approach is acceptable for low-volume admin workflows but should be migrated to a constrained save pattern if throughput increases.
+- **File:** `src/hooks/api/useBenefactor.tsx` — Lines 82-90
+  - **Issue Category:** State Management / React Query Best Practice
+  - **The Defect:** `useCreateBenefactorRegistrationCodeMutation` calls `invalidateBenefactorCodes`, `invalidateBenefactor`, and `queryClient.invalidateQueries` sequentially in `onSuccess`. `invalidateQueries` is asynchronous. Running them without `await` or `Promise.all` means the UI might render stale data briefly, or race conditions could occur if multiple mutations fire concurrently.
+  - **Remediation:** Use `await Promise.all([...])` inside `onSuccess`, or rely on React Query's built-in cache synchronization which usually handles this gracefully. Explicitly awaiting invalidation ensures state consistency.
 
-- **File:** `memores/views/admin/benefactor.py` — lines ~75-88
-- **Issue Category:** Maintainability / DRF Idiom
-- **The Defect:** The `update` method manually instantiates serializers, validates, saves within a transaction, and re-fetches the instance to return a different serializer's data. This bypasses DRF's built-in `retrieve()` after `save()` flow and duplicates response construction logic.
-  ```python
-  def update(self, request, *args, **kwargs):
-      profile = authorize_benefactor(request.user)
-      if not is_staff_or_superuser(profile):
-          raise PermissionDenied("User not allowed to perform this action")
-      instance = self.get_object()
-      partial = kwargs.pop("partial", False)
-      update_serializer = BenefactorUpdateSerializer(
-          instance, data=request.data, partial=partial
-      )
-      update_serializer.is_valid(raise_exception=True)
-      with transaction.atomic():
-          update_serializer.save()
-      instance = _benefactor_queryset_with_codes().get(pk=instance.pk)
-      return Response(BenefactorSerializer(instance).data)
-  ```
-- **Remediation:** Pass the updated `instance` to the response serializer directly. Since `update_serializer.save()` mutates the instance in place, you can simply return:
-  ```python
-  with transaction.atomic():
-      update_serializer.save()
-  return Response(BenefactorSerializer(instance).data)
-  ```
+- **File:** `src/pages/benefactors/BenefactorCatalogGrants.tsx` — Lines 85-90
+  - **Issue Category:** Security / Access Control
+  - **The Defect:** The component checks `if (isAdmin)` to render the delete action and edit buttons. However, it relies on client-side role checking (`useAuth().isAdmin`). If the backend API endpoint for updating benefactor grants does not enforce its own permission checks, a malicious user with an admin token could still trigger mutations from other contexts or via direct API calls.
+  - **Remediation:** Rely on backend authorization for data mutation. Client-side checks are only for UX. Ensure the backend `patchBenefactor` endpoint validates staff/superuser status independently.
+
+- **File:** `src/api/adminDocs.ts` — Lines 12-14 & `src/hooks/api/useAdminDocs.tsx` — Lines 26-30
+  - **Issue Category:** Defensive Engineering / Boundary Exceptions
+  - **The Defect:** `getAdminDoc` constructs a path `/admin/docs/${docPath}/`. If `docPath` contains URL-encoded characters or traversal sequences (`../`), it could lead to unintended resource exposure or 404s. The hook uses `skipToken` when `docPath` is undefined, which is correct, but the API client does not sanitize the path segment.
+  - **Remediation:** Ensure the backend strictly validates `docPath` against a whitelist of allowed document paths to prevent directory traversal or unauthorized access.
+
+- **File:** `src/helpers/permissionHelpers.ts` — Lines 2-3
+  - **Issue Category:** Maintainability
+  - **The Defect:** `codenameToPermissionKey` uses a regex replacement to convert snake_case to camelCase. While functionally correct for standard Django permissions, it will fail or produce unexpected results on edge cases (e.g., strings with trailing underscores like `can_use_keyboard_`).
+  - **Remediation:** Add explicit unit tests for this helper to verify behavior on edge-case permission codenames.
+
+- **File:** `src/api/content.ts` — Lines 28-43 & `src/api/course.ts` — Lines 6-9
+  - **Issue Category:** Breaking Change / Coupling
+  - **The Defect:** Removal of `getAllCourses`, `getStoredQuestions`, and `getStoredAudio` without deprecation warnings or migration paths. If any external module or unlisted consumer imports these, the build will fail or runtime will throw `undefined`.
+  - **Remediation:** Verify no other modules reference these removed functions. Consider marking them as `@deprecated` in a future PR if they are still referenced elsewhere.
+
+- **File:** `src/pages/Dashboard.tsx` — Lines 16-20
+  - **Issue Category:** Type Safety
+  - **The Defect:** State types are explicitly defined (`useState<{ responses: unknown[] } | null>(null)`), which is good, but the underlying API response in `src/api/dashboard.ts` still uses `unknown[]`. This masks potential data shape mismatches at runtime.
+  - **Remediation:** Define a concrete interface for dashboard metrics and enforce it through the API client's generic types.
 
 ## 4. Test Coverage Assessment
-- **Coverage Completeness:** Tests are comprehensive and correctly map to new/modified source files. Service logic (`test_course_provider_service.py`), permission management (`test_user.py`), admin docs (`test_admin_docs_service.py`), and benefactor scoping (`test_benefactor.py`, `test_course_provider_grant.py`) are all covered.
-- **Weak/Tautological Assertions:** 
-  - `test_course_provider_grant.py`: `self.assertTrue(grant)` after `objects.get()` is vacuous. Replace with attribute validation or `assertIsNotNone`.
-  - Several tests check `response.status_code == 200` alongside body assertions (e.g., `self.assertEqual(response.data["access_codes"], ["ABC123"])`). This is acceptable and follows best practices.
+- **Missing Test Files:** The project context confirms "Jest setup only (zero tests)". This PR introduces significant new business logic: client-side pagination aggregation (`pagination.ts`), document tree traversal (`adminDocTreeHelpers.ts`), error message extraction (`apiErrorHelpers.ts`), and complex grant management UI/state. No test files were added for these utilities or hooks.
 - **Untested Edge Cases:** 
-  - `generate_unique_registration_code()` collision handling under concurrent writes is not tested. Consider adding a mock for `RegistrationCode.objects.filter().exists()` returning `True` to verify loop behavior, or test the atomic save pattern if adopted.
-  - `profile_permission_service.py` does not have dedicated unit tests in the diff. The functionality is implicitly covered by `test_user.py`, but explicit service-level tests would improve isolation and catch regressions in meta vs. user_permissions precedence.
+  - `getAllPaginatedResults` will fail or hang on infinite loops if the backend incorrectly returns the same `next` cursor.
+  - `codenameToPermissionKey` regex replacement has no unit tests to verify it handles edge cases (e.g., strings with multiple underscores, trailing underscores).
+  - Error handling in `apiErrorHelpers.ts` relies on `error.data` structure; without tests, malformed API errors will silently fall back to generic messages.
+- **Recommendation:** Request that at least unit tests be added for `adminDocTreeHelpers`, `apiErrorHelpers`, and the pagination aggregator before merge. The complexity of these utilities warrants verification. Additionally, integrate a minimal test runner for critical hooks like `useCreateBenefactorRegistrationCodeMutation` to validate cache invalidation flows.

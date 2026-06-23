@@ -42,6 +42,10 @@ def init_mcp(repo_path=None, config_path=None):
     if not os.path.exists(cfg_path):
         return None
     path = repo_path or TARGET_DJANGO_PROJECT
+    from core.mcp_servers import set_memory_persist_path
+    from core.cache import CACHE_DIR
+    memory_path = str(CACHE_DIR / "memories.json")
+    set_memory_persist_path(memory_path)
     from core.mcp_orchestrator import MCPOrchestrator
     orch = MCPOrchestrator(cfg_path, target_repo=path)
     started = orch.start()

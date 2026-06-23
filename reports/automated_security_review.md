@@ -1,122 +1,104 @@
 ## Vulnerability Findings
 
-### [MEDIUM] - Broken Object Level Authorization (BOLA) on Course Update Endpoint
-- **Target File:** `/Users/dansparkes/memores/memores-api/memores/views/management/content.py`
-- **Vulnerability Type:** BOLA / Unscoped Queryset Retrieval
+### [HIGH] - Broken Object Level Authorization on SharingCode Update
+- **Target File:** `memores/views/app/sharing_code.py`
+- **Vulnerability Type:** BOLA / IDOR
+- **Confidence:** HIGH
+- **Investigation Trace:**
+  1. Where the ID enters the system: URL path parameter (inherited from `RetrieveUpdateDestroyAPIView`)
+  2. Where data is fetched: Default `SharingCode.objects.all` (no `queryset` override in `class_attributes`)
+  3. Checks between input and data: `get_queryset()` is absent. The `update` method has an empty `inline_auth_calls` list. No object-level permission class or inline ownership check exists.
+  4. Verdict: Any authenticated user can PUT any `SharingCode` ID to modify its state (e.g., deactivate, change role/label) without verifying ownership.
 - **Evidence:** 
 ```python
-  # class_attributes in CourseUpdateView
-  "queryset": "Course.objects.all",
-  "serializer_class": "CourseUpdateSerializer",
-  
-  # methods in CourseUpdateView
-  {
-    "name": "update",
-    "is_stub": false,
-    "inline_auth_calls": ["authorize_content_owner_or_staff", "authorize_creator"],
-    ...
-  }
+# memores/views/app/sharing_code.py
+class SharingCodeRetrieveUpdateDestroyView:
+    class_attributes: {"permission_classes": ["IsAuthenticated"], ...}
+    base_classes: ["RetrieveUpdateDestroyAPIView"]
+    methods: [{"name": "update", "is_stub": false, "inline_auth_calls": [], "self_scoped": false, "http_method": "PUT"}]
 ```
-- **Analysis:** `CourseUpdateView` relies on a class-level `queryset: Course.objects.all` and does not override `get_queryset()`. DRF's `UpdateAPIView` invokes `self.get_object()` (which queries the unscoped class attribute) *before* executing the `update()` method. Inline authorization in `update()` occurs post-retrieval, allowing an authenticated attacker to PUT any course ID without tenant/user isolation checks during object resolution.
-- **Mitigation:** Override `get_queryset()` or `get_object()` to filter by `content_creator` or tenant ID before retrieval. Move object-level authorization to the class level using DRF's `HasObjectPermission`.
 
-### [MEDIUM] - Broken Object Level Authorization (BOLA) on Response Option Update
-- **Target File:** `/Users/dansparkes/memores/memores-api/memores/views/management/content.py`
-- **Vulnerability Type:** BOLA / Missing Object Permission Check
+### [MEDIUM] - Mass Assignment / IDOR Risk in Completion Serializer Design
+- **Target File:** `memores/serializers/user_course_completion_serializers.py`
+- **Vulnerability Type:** Mass Assignment / Broken Object Property Level Authorization
+- **Confidence:** MEDIUM
+- **Investigation Trace:**
+  1. Where the ID enters the system: Request body fields `user` and `course`
+  2. Where data is fetched: N/A (serializer design flaw)
+  3. Checks between input and data: `Meta.fields` explicitly includes `user` and `course`. Neither field has `read_only: true`. No visible override in the topography restricts these fields to server-side assignment.
+  4. Verdict: If this serializer is consumed by any user-facing endpoint without overriding `perform_create`/`perform_update` to strip ownership fields, attackers can mass-assign or forge completion records for arbitrary users/courses.
 - **Evidence:** 
 ```python
-  # class_attributes in UpdateResponseOptionView
-  "permission_classes": ["IsAuthenticated", "IsContentCreatorUser"],
-  "queryset": "ResponseOption.objects.all",
-  
-  # permission_class_analysis for IsContentCreatorUser
-  {
-    "name": "IsContentCreatorUser",
-    "has_object_permission": false,
-    ...
-  },
-  
-  # methods in UpdateResponseOptionView
-  {
-    "name": "update",
-    "inline_auth_calls": [],
-    ...
-  }
+# memores/serializers/user_course_completion_serializers.py
+class UserCourseCompletionCreateUpdateSerializer:
+    fields: [{"name": "user", "type": "ProfileSerializer"}, {"name": "course", "type": "CourseSerializer"}]
+    meta: {"fields": "<unresolved: Tuple(elts=[Constant(value='id'), Constant(value='user'), Constant(value='course'), ...]>"}
 ```
-- **Analysis:** The `IsContentCreatorUser` permission class explicitly lacks object-level checks (`has_object_permission: false`). Combined with an unscoped class-level queryset and zero inline auth on the `update()` method, this endpoint will accept PUT requests for any `ResponseOption` ID belonging to other tenants/users.
-- **Mitigation:** Implement `has_object_permission` in `IsContentCreatorUser` to verify ownership, or scope the queryset via a custom manager/filter before DRF processes the request.
 
-### [LOW] - Mass Assignment Surface on CourseUpdateSerializer
-- **Target File:** `/Users/dansparkes/memores/memores-api/memores/serializers/course_serializers.py`
-- **Vulnerability Type:** Mass Assignment / Unvalidated Data Mapping
+### [MEDIUM] - Unscoped Admin Data List Exposing Sensitive AI Outputs
+- **Target File:** `memores/views/admin/analysis_output.py`
+- **Vulnerability Type:** Broken Object Level Authorization / Data Exposure
+- **Confidence:** MEDIUM
+- **Investigation Trace:**
+  1. Where the ID enters the system: List endpoint (no object ID)
+  2. Where data is fetched: Default `AnalysisOutput.objects.all` (inherited from `ListAPIView`)
+  3. Checks between input and data: `get_queryset` method has empty `inline_auth_calls`. The view only enforces `IsAuthenticated` at the class level. No staff/superuser restriction or tenant/org scoping is applied to the list action.
+  4. Verdict: Any authenticated user can retrieve all `AnalysisOutput` records, which contain sensitive AI-generated analysis results and metadata for every user in the system.
 - **Evidence:** 
 ```python
-  # Meta.fields in CourseUpdateSerializer
-  "fields": [
-    "id", "title", "description", "introduction_message", "completion_message",
-    "course_type", "course_meta_data", "is_disabled", "course_key", "course_path",
-    "course_group_ids", "course_provider_ids", "explanation_prompt_template_id"
-  ],
-  "read_only_fields": ["id", "course_type"]
+# memores/views/admin/analysis_output.py
+class AdminAnalysisOutputListView:
+    class_attributes: {"permission_classes": ["IsAuthenticated"], ...}
+    base_classes: ["ListAPIView"]
+    methods: [{"name": "get_queryset", "is_stub": false, "inline_auth_calls": [], "self_scoped": false}]
 ```
-- **Analysis:** While DRF enforces explicit field whitelisting, the writable surface includes highly sensitive configuration fields (`is_disabled`, `course_key`, `course_path`). If combined with a BOLA flaw (e.g., Finding 1), these fields could be abused to disable courses or alter routing keys. The serializer relies on implicit validation rather than explicit type/format constraints for path/key fields.
-- **Mitigation:** Add explicit `validators` to `course_key` and `course_path` fields. Document writable fields in API specifications. Ensure server-side uniqueness/format checks are enforced at the model level.
 
-### [LOW] - Potential Information Disclosure on Course Retrieve Endpoint
-- **Target File:** `/Users/dansparkes/memores/memores-api/memores/views/app/course.py`
-- **Vulnerability Type:** BOLA / Unscoped Object Retrieval
+### [UNCERTAIN] - Unverified Inline Authorization Helper Dependencies
+- **Target File:** `memores/views/management/content.py`
+- **Vulnerability Type:** Authorization Bypass Risk
+- **Confidence:** UNCERTAIN
+- **Investigation Trace:**
+  1. Where the ID enters the system: URL path / request body
+  2. Where data is fetched: Default or scoped querysets depending on view
+  3. Checks between input and data: `CourseUpdateView.update` and `QuestionRetrieveUpdateDestroyView.destroy/perform_destroy` rely on inline calls to `authorize_content_owner_or_staff`, `authorize_creator`, and `authorize_superuser`. The parser cannot trace into these helpers. If they fail silently, return non-403 status codes, or lack object ownership validation, authorization is bypassed.
+  4. Verdict: Cannot confirm enforcement without helper implementation. Downgraded to UNCERTAIN per calibration rules.
 - **Evidence:** 
 ```python
-  # class_attributes in CourseRetrieveView
-  "serializer_class": "CourseFullListSerializer",
-  "lookup_field": "id"
-  
-  # methods in CourseRetrieveView
-  {
-    "name": "get_queryset",
-    "is_stub": false,
-    "inline_auth_calls": [],
-    ...
-  }
+# memores/views/management/content.py
+class CourseUpdateView: methods: [{"name": "update", "inline_auth_calls": ["authorize_content_owner_or_staff", "authorize_creator"], ...}]
+class QuestionRetrieveUpdateDestroyView: methods: [{"name": "perform_destroy", "inline_auth_calls": ["authorize_superuser"], ...}]
 ```
-- **Analysis:** `CourseRetrieveView` lists a `get_queryset` method with zero inline auth calls. If the underlying implementation defaults to `.all()` or lacks tenant filtering, `retrieve()` will expose course data outside the authenticated user's scope. Class-level `IsAuthenticated` only validates identity, not object ownership.
-- **Mitigation:** Verify `get_queryset` implementation explicitly filters by tenant/user. Add DRF's `IsAuthenticated` + custom object permission if cross-tenant retrieval is unintended.
 
----
+### [UNCERTAIN] - Queryset Initialization Defect / Parser Artifact
+- **Target File:** `memores/views/app/coach.py` & `memores/views/app/journal.py`
+- **Vulnerability Type:** Configuration Defect / Functionality Break
+- **Confidence:** UNCERTAIN
+- **Investigation Trace:**
+  1. Where the ID enters the system: URL path parameter
+  2. Where data is fetched: `queryset` explicitly set to `"objects.none"` in `class_attributes`
+  3. Checks between input and data: DRF's `get_object()` calls `self.get_queryset().filter(pk=pk).first()`. An explicit `.none()` base queryset will raise `DoesNotExist` for all lookups unless overridden by a custom manager or parser misinterpreted a string reference.
+  4. Verdict: Likely causes universal 404s or is a static analysis artifact. Not a security vulnerability but breaks retrieval functionality.
+- **Evidence:** 
+```python
+# memores/views/app/coach.py
+class CoachEntryRetrieveView: class_attributes: {"queryset": "CoachEntry.objects.none", ...}
+# memores/views/app/journal.py
+class JournalEntryDetailView: class_attributes: {"queryset": "JournalEntry.objects.none", ...}
+```
 
 ## Attack Path Analysis
 
-### Path 1: Unauthorized Course Configuration Modification via BOLA Chain
-- **Prerequisites:** Valid authenticated user token with overlapping role privileges (e.g., staff or creator role that passes `authorize_content_owner_or_staff`).
-- **Exploitation Steps:** 
-  1. Attacker enumerates or obtains a target course UUID outside their tenant.
-  2. Sends `PUT /courses/{target_id}/` to `CourseUpdateView`.
-  3. DRF's `get_object()` uses the unscoped class-level `queryset: Course.objects.all`, bypassing tenant isolation during retrieval.
-  4. The `update()` method executes inline auth (`authorize_content_owner_or_staff`). If the attacker holds a staff role or the authorization function has a logic gap, it passes.
-  5. Attacker modifies `is_disabled` to `true` or alters `course_key`/`course_path`, disrupting service availability or routing for legitimate users.
-- **Affected Endpoints:** 
-  - `/Users/dansparkes/memores/memores-api/memores/views/management/content.py::CourseUpdateView`
-  - `/Users/dansparkes/memores/memores-api/memores/serializers/course_serializers.py::CourseUpdateSerializer`
-- **Business Impact:** Integrity & Availability compromise. Unauthorized configuration changes break course delivery pipelines and disable content for targeted tenants.
-- **Mitigations:** Scope `get_object()` to tenant/user before retrieval. Enforce object-level permissions at the DRF permission class level rather than method-level inline calls.
+**No Evidence-Based Attack Paths Found**
 
-### Path 2: Cross-Tenant Response Option Tampering
-- **Prerequisites:** Valid authenticated user token with `IsContentCreatorUser` class-level pass.
-- **Exploitation Steps:** 
-  1. Attacker identifies a `ResponseOption` UUID belonging to another tenant.
-  2. Sends `PUT /response-options/{target_id}/` to `UpdateResponseOptionView`.
-  3. Class-level permission passes (user is a creator), but lacks object checks. Queryset returns the target object unscoped.
-  4. `update()` executes with no inline auth, directly serializing and saving attacker-supplied data to the foreign tenant's object.
-- **Affected Endpoints:** `/Users/dansparkes/memores/memores-api/memores/views/management/content.py::UpdateResponseOptionView`
-- **Business Impact:** Integrity compromise. Cross-tenant data pollution, potential prompt injection via response text fields, or corruption of assessment logic.
-- **Mitigations:** Implement `has_object_permission` in `IsContentCreatorUser`. Scope queryset to `creator_id=request.user.id`.
-
----
+While the HIGH BOLA on `SharingCodeRetrieveUpdateDestroyView` and MEDIUM data exposure on `AdminAnalysisOutputListView` are independently verifiable, no chained exploit path can be fully traced from the provided topography. The following controls prevent a complete narrative:
+- Public-facing endpoints (`RegistrationStartView`, `LoginView`, `StripeCheckoutSession`) correctly use `AllowAny` but lack visible unvalidated input flows to sensitive models in the view mapping.
+- Admin mutation endpoints (`AdminUserPermissionUpdateView`, `AdminAnalysisOutputRetrieveDestroyView`, `CourseDestroyView`) enforce `authorize_staff_or_superuser` or `authorize_superuser` inline, and their serializers are consumed only by staff-scoped views.
+- The parser cannot trace data flows from request parameters into internal service calls or helper functions, preventing confirmation of injection or privilege escalation chains.
 
 ## Secure Areas
 
-- **Admin & Privileged Views (`admin/content.py`, `admin/admin.py`):** Views like `AdminUserCompletedCourseDestroyView`, `CourseDestroyView`, and `AdminUserCourseProgressCreateView` use `.objects.all()` querysets paired with `authorize_superuser` or `authorize_staff_or_superuser` inline auth. Per calibration rules, superuser/staff admin patterns with cross-tenant access are expected DRF behavior. Auth gates mutation correctly via `perform_destroy`/`destroy` method calls.
-- **Public & Authentication Endpoints (`public/registration.py`, `public/user.py`, `payment/stripe.py`):** `LoginView`, `RegistrationWaitlistView`, and `StripeCheckoutSession` correctly use `AllowAny`. `StripeCheckoutSession` is a checkout session *creation* endpoint (outbound API call), not a webhook receiver, making public access appropriate per Rule 13.
-- **Serializer Definitions:** All serializers explicitly define `Meta.fields`, preventing implicit mass assignment. Nested serializers like `SimpleProfileSerializer(read_only=True)` and `AudioSerializer(read_only=True)` are correctly constrained. No `fields = '__all__'` patterns detected.
-- **Multi-Tenancy Scoping in Management Views (`management/content.py`):** `CourseGroupListCreateView` correctly scopes queryset via `authorize_benefactor_or_creator` and gates creation with `authorize_staff_or_superuser`. `QuestionRetrieveUpdateDestroyView` scopes retrieval via `get_queryset` with `authorize_creator`, mitigating BOLA on read paths.
-- **Audit & Compliance Readiness:** Destructive admin endpoints (`AdminUserCompletedCourseDestroyView`, `AdminUserCourseProgressDestroyView`) explicitly call `authorize_superuser`, satisfying SOC 2 requirements for privileged action gating. No hardcoded secrets or credentials detected in model/serializer/view topography.
+- **Admin Mutation Endpoints:** Views like `AdminUserAnalysisOutputListView`, `AdminUserJournalEntryListView`, and `CourseDestroyView` explicitly enforce `authorize_staff_or_superuser` or `authorize_superuser` inline on list/mutation actions, correctly restricting sensitive operations to privileged roles.
+- **Public Auth Flows:** `RegistrationStartView`, `RegistrationWaitlistView`, `RegistrationCompleteView`, and `LoginView` correctly use `AllowAny`/`[]` authentication classes appropriate for unauthenticated entry points. No sensitive model fields are exposed in their mapped serializers.
+- **Stripe Checkout Endpoint:** `StripeCheckoutSession` is correctly marked `AllowAny` with no authentication requirements, aligning with standard webhook/checkout initiation patterns. Requires manual signature verification review but structurally sound per topography.
+- **Serializer Field Discipline:** The majority of writable serializers (`CourseCreateSerializer`, `QuestionCreateSerializer`, `ResponseOptionCreateUpdateSerializer`, `BenefactorUpdateSerializer`) use explicit field lists or `read_only_fields`, preventing accidental mass assignment of ownership or system-critical flags.
+- **DRF Delegation Compliance:** Views utilizing destructive methods (`perform_destroy`) correctly place authorization checks in the mutation phase rather than relying solely on unscoped `get_object()` lookups, adhering to DRF's security delegation ordering.

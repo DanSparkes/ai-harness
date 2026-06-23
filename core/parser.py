@@ -1,9 +1,12 @@
 # core/parser.py
 import ast
+import hashlib
 import os
 import re
 from pathlib import Path
 from typing import Optional
+
+from core.cache import get as cache_get, set as cache_set, make_key, get_git_head
 
 EXCLUDE_DIRS = {".venv", "__pycache__", ".git", "node_modules", ".tox", "migrations", "fixtures", ".egg-info", ".mypy_cache", ".pytest_cache"}
 
@@ -78,6 +81,13 @@ class DjangoTopographer:
         return model_bases
 
     def scan_project(self) -> dict:
+        head = get_git_head(str(self.target_dir))
+        if head:
+            key = make_key("parser:scan_project", str(self.target_dir), head)
+            cached = cache_get(key, max_age=86400)
+            if cached is not None:
+                return cached
+
         topology = {"serializers": [], "views": [], "models": []}
         for app_dir in self._find_app_dirs():
             for root, dirs, files in os.walk(app_dir):
@@ -87,6 +97,9 @@ class DjangoTopographer:
                     if file.endswith(".py") and not file.startswith("test_"):
                         full_path = Path(root) / file
                         self._parse_file(full_path, topology)
+
+        if head:
+            cache_set(key, topology)
         return topology
 
     def _resolve_ast_value(self, node):
@@ -310,14 +323,24 @@ class DjangoTopographer:
         so an attacker cannot target another user.
 
         Returns True if the method:
-          1. References request.user or self.request.user
-          2. Never extracts a user identity ID (pk, id, user_id, profile_id)
-             from request.data, request.query_params, kwargs, args, or self.kwargs
+          1. References request.user or self.request.user, and never extracts a user
+             identity ID from request data, OR
+          2. Accepts request as a parameter, has no ID-like function params or catch-all
+             args, and never extracts a user identity ID — this covers inherently
+             self-scoped operations like logout(request) where Django's session
+             middleware scopes to the current request.
         """
+        USER_ID_KEYS = {"pk", "id", "user_id", "profile_id", "resource_id", "target_id", "account_id"}
+        ALLOWED_PARAMS = {"self", "request", "format"}
+
+        # Check function signature for explicit ID-like parameters
+        func_arg_names = {arg.arg for arg in func_def.args.args}
+        has_request_param = "request" in func_arg_names
+        has_explicit_id_param = bool((func_arg_names - ALLOWED_PARAMS) & USER_ID_KEYS)
+        has_catchall = func_def.args.vararg is not None or func_def.args.kwarg is not None
+
         uses_request_user = False
         extracts_user_id = False
-
-        USER_ID_KEYS = {"pk", "id", "user_id", "profile_id", "resource_id", "target_id", "account_id"}
 
         for node in ast.walk(func_def):
             if isinstance(node, ast.Attribute) and node.attr == "user":
@@ -354,7 +377,16 @@ class DjangoTopographer:
                         if node.slice.value.lower() in USER_ID_KEYS:
                             extracts_user_id = True
 
-        return uses_request_user and not extracts_user_id
+        # Self-scoped via request.user reference
+        if uses_request_user and not extracts_user_id:
+            return True
+
+        # Self-scoped via inherent request scoping (e.g., logout):
+        # method accepts request, has no way to target a different user
+        if has_request_param and not extracts_user_id and not has_explicit_id_param and not has_catchall:
+            return True
+
+        return False
 
     def _classify_view(self, class_node: ast.ClassDef) -> dict:
         """Classify a view class by its base classes, HTTP methods, and auth patterns.
@@ -463,7 +495,7 @@ class DjangoTopographer:
                         "methods": [m.name for m in child.body if isinstance(m, ast.FunctionDef)]
                     })
 
-                elif any("Serializer" in getattr(b, "id", "") for b in child.bases):
+                elif any("Serializer" in name for name in base_names):
                     fields, meta = self._parse_serializer_class(child, file_classes)
                     entry = {
                         "absolute_path": str(file_path),
@@ -475,7 +507,7 @@ class DjangoTopographer:
                         entry["meta"] = meta
                     topology["serializers"].append(entry)
 
-                elif any(any(k in getattr(b, "id", "") for k in ["View", "ViewSet", "APIView"]) for b in child.bases):
+                elif any(any(k in name for k in ["View", "ViewSet", "APIView"]) for name in base_names):
                     view_attrs = self._parse_class_body_assignments(
                         child,
                         target_names={"permission_classes", "authentication_classes",
@@ -579,14 +611,26 @@ def _walk_py_files(target_dir: str):
 
 
 def scan_file_tree(target_dir: str) -> list[str]:
-    """Return a sorted list of relative paths for all .py files in the project."""
+    head = get_git_head(target_dir)
+    if head:
+        key = make_key("parser:scan_file_tree", target_dir, head)
+        cached = cache_get(key, max_age=86400)
+        if cached is not None:
+            return cached
     paths = [rel for _, rel in _walk_py_files(target_dir)]
     paths.sort()
+    if head:
+        cache_set(key, paths)
     return paths
 
 
 def scan_celery_tasks(target_dir: str) -> list[dict]:
-    """Find Celery task definitions with their decorator and function name."""
+    head = get_git_head(target_dir)
+    if head:
+        key = make_key("parser:scan_celery_tasks", target_dir, head)
+        cached = cache_get(key, max_age=86400)
+        if cached is not None:
+            return cached
     results = []
     for root, rel in _walk_py_files(target_dir):
         path = os.path.join(root, os.path.basename(rel) if os.path.dirname(rel) == "." else rel)
@@ -604,11 +648,18 @@ def scan_celery_tasks(target_dir: str) -> list[dict]:
                 "decorator": match.group(1).strip(),
                 "function": match.group(2).strip(),
             })
+    if head:
+        cache_set(key, results)
     return results
 
 
 def scan_files_by_keyword(target_dir: str, keyword: str, max_lines: int = 80) -> list[dict]:
-    """Find files matching a keyword in their path and return their first N lines."""
+    head = get_git_head(target_dir)
+    if head:
+        key = make_key("parser:scan_files_by_keyword", target_dir, head, keyword, str(max_lines))
+        cached = cache_get(key, max_age=86400)
+        if cached is not None:
+            return cached
     results = []
     kw_lower = keyword.lower()
     for root, rel in _walk_py_files(target_dir):
@@ -620,11 +671,19 @@ def scan_files_by_keyword(target_dir: str, keyword: str, max_lines: int = 80) ->
         except Exception:
             continue
         results.append({"file": rel, "content": lines})
+    if head:
+        cache_set(key, results)
     return results
 
 
 def scan_files_by_pattern(target_dir: str, patterns: list[str], max_lines: int = 80) -> list[dict]:
-    """Show first N lines of files matching any of the given substrings in their relative path."""
+    head = get_git_head(target_dir)
+    if head:
+        patterns_key = ",".join(sorted(patterns))
+        key = make_key("parser:scan_files_by_pattern", target_dir, head, patterns_key, str(max_lines))
+        cached = cache_get(key, max_age=86400)
+        if cached is not None:
+            return cached
     results = []
     for root, rel in _walk_py_files(target_dir):
         if not any(p in rel for p in patterns):
@@ -635,6 +694,8 @@ def scan_files_by_pattern(target_dir: str, patterns: list[str], max_lines: int =
         except Exception:
             continue
         results.append({"file": rel, "content": lines})
+    if head:
+        cache_set(key, results)
     return results
 
 

@@ -2,6 +2,8 @@ import json
 import time
 import requests
 
+from core.cache import get as cache_get, set as cache_set, make_key
+
 class AutomatedEvaluator:
     """Grades model outputs against structured JSON rubrics using Ollama."""
     def __init__(self, judge_model: str = "qwen2.5-coder:14b", base_url: str = "http://localhost:11434"):
@@ -46,6 +48,12 @@ class AutomatedEvaluator:
             {"role": "user", "content": user_prompt}
         ]
 
+        cache_key = make_key("judge:grade_run", self.judge_model, json.dumps(messages, sort_keys=True, default=str))
+        cached = cache_get(cache_key, max_age=86400)
+        if cached is not None:
+            print(f"   -> Scored (cached) in 0.0s")
+            return cached
+
         payload = {
             "model": self.judge_model,
             "messages": messages,
@@ -70,4 +78,6 @@ class AutomatedEvaluator:
         # Remove markdown code fences if present
         cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
         cleaned = re.sub(r'\s*```$', '', cleaned)
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        cache_set(cache_key, parsed)
+        return parsed

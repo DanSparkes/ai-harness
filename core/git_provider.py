@@ -2,6 +2,8 @@
 import subprocess
 from pathlib import Path
 
+from core.cache import get as cache_get, set as cache_set, make_key, get_git_head
+
 class GitDiffProvider:
     """Extracts line-by-line diffs and modified file manifests, strictly excluding fixture noise."""
     def __init__(self, repo_dir: str):
@@ -44,10 +46,15 @@ class GitDiffProvider:
 
     def get_diff(self, target_branch: str, source_branch: str) -> str:
         """Returns the raw patch diff, explicitly skipping any fixtures folders and uv.lock."""
-        # Using Git pathspec exclusions ensures massive JSON/YAML data files are ignored natively
         target = self._resolve_ref(target_branch)
         source = self._resolve_ref(source_branch)
-        return self._run_git([
+        head = get_git_head(str(self.repo_dir))
+        if head:
+            key = make_key("git:get_diff", str(self.repo_dir), head, target, source)
+            cached = cache_get(key, max_age=86400)
+            if cached is not None:
+                return cached
+        result = self._run_git([
             "diff",
             f"{target}...{source}",
             "--",
@@ -57,11 +64,20 @@ class GitDiffProvider:
             ":(exclude)uv.lock",
             ":(exclude)*.md"
         ])
+        if head:
+            cache_set(key, result)
+        return result
 
     def get_changed_files(self, target_branch: str, source_branch: str) -> list[str]:
         """Returns a clean list of files modified or added, omitting fixtures and uv.lock."""
         target = self._resolve_ref(target_branch)
         source = self._resolve_ref(source_branch)
+        head = get_git_head(str(self.repo_dir))
+        if head:
+            key = make_key("git:get_changed_files", str(self.repo_dir), head, target, source)
+            cached = cache_get(key, max_age=86400)
+            if cached is not None:
+                return cached
         output = self._run_git([
             "diff",
             "--name-only",
@@ -73,4 +89,7 @@ class GitDiffProvider:
             ":(exclude)uv.lock",
             ":(exclude)*.md"
         ])
-        return [line.strip() for line in output.splitlines() if line.strip()]
+        result = [line.strip() for line in output.splitlines() if line.strip()]
+        if head:
+            cache_set(key, result)
+        return result

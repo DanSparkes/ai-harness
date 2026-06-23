@@ -33,6 +33,10 @@ def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
         return _mcp_orchestrator
     if not os.path.exists(config_path):
         return None
+    from core.mcp_servers import set_memory_persist_path
+    from core.cache import CACHE_DIR
+    memory_path = str(CACHE_DIR / "memories.json")
+    set_memory_persist_path(memory_path)
     from core.mcp_orchestrator import MCPOrchestrator
     orch = MCPOrchestrator(config_path, target_repo=target_repo)
     started = orch.start()

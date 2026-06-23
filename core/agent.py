@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import json
@@ -9,6 +10,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
+
+from core.cache import get as cache_get, set as cache_set, make_key, get_git_head
 
 AGENTS_DIR = Path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents"))
 
@@ -69,6 +72,14 @@ class Agent:
             tools = [s.to_tool() for s in skills.values()]
             skill_map = skills
 
+        _cache_key = None
+        if not skills and not stream:
+            cache_payload = json.dumps(messages, sort_keys=True, default=str)
+            _cache_key = make_key("agent:execute", self.model_name, cache_payload, str(temperature), str(self.num_ctx))
+            cached = cache_get(_cache_key, max_age=86400)
+            if cached is not None:
+                return cached
+
         # Streaming mode for code generation (local Ollama only, no tool calls)
         if stream and not self.is_cloud and not skills:
             return self._execute_stream(messages, headers, temperature)
@@ -111,6 +122,8 @@ class Agent:
             tool_calls = msg.get("tool_calls")
 
             if not tool_calls:
+                if _cache_key is not None:
+                    cache_set(_cache_key, content)
                 return content
 
             # Append assistant message with tool_calls to conversation
@@ -308,8 +321,12 @@ def _check_code_syntax(code: str) -> tuple[bool, str]:
 
 
 def build_dependency_graph(repo_path: str) -> dict[str, list[str]]:
-    """Build a reverse-dependency map: for each module, list files that import from it.
-    Returns dict mapping dotted module paths to lists of relative file paths."""
+    head = get_git_head(repo_path)
+    if head:
+        key = make_key("agent:build_dependency_graph", repo_path, head)
+        cached = cache_get(key, max_age=86400)
+        if cached is not None:
+            return cached
     imports_by_file: dict[str, list[str]] = {}
     for root, dirs, files in os.walk(repo_path):
         for f in files:
@@ -337,7 +354,10 @@ def build_dependency_graph(repo_path: str) -> dict[str, list[str]]:
     for importer, deps in imports_by_file.items():
         for dep in deps:
             reverse[dep].append(importer)
-    return dict(reverse)
+    result = dict(reverse)
+    if head:
+        cache_set(key, result)
+    return result
 
 
 def skill_get_affected_files(target_file: str, repo_path: str = None, graph: dict = None) -> str:
@@ -402,6 +422,15 @@ def skill_run_formatter(file_path: str, target_repo: str = None) -> str:
     """Run isort, black, and ruff fix on a Python file."""
     cwd = target_repo or os.path.dirname(file_path)
     rel_path = os.path.relpath(file_path, cwd)
+    try:
+        with open(file_path) as f:
+            content_hash = hashlib.sha256(f.read().encode()).hexdigest()
+        cache_key = make_key("agent:run_formatter", file_path, content_hash)
+        cached = cache_get(cache_key, max_age=86400)
+        if cached is not None:
+            return cached
+    except Exception:
+        cache_key = None
     parts = []
     for tool in [
         ["isort", "--profile", "black", rel_path],
@@ -416,25 +445,48 @@ def skill_run_formatter(file_path: str, target_repo: str = None) -> str:
                 parts.append(r.stderr.strip())
         except Exception as e:
             parts.append(f"{tool[0]}: {e}")
-    return "\n".join(parts) if parts else "(formatted cleanly)"
+    result = "\n".join(parts) if parts else "(formatted cleanly)"
+    if cache_key:
+        cache_set(cache_key, result)
+    return result
 
 
 def skill_validate_syntax(file_path: str) -> str:
     """Check Python syntax validity of a file."""
+    try:
+        with open(file_path) as f:
+            content_hash = hashlib.sha256(f.read().encode()).hexdigest()
+        cache_key = make_key("agent:validate_syntax", file_path, content_hash)
+        cached = cache_get(cache_key, max_age=86400)
+        if cached is not None:
+            return cached
+    except Exception:
+        cache_key = None
     r = subprocess.run(["python3", "-m", "py_compile", file_path], capture_output=True, text=True)
-    if r.returncode == 0:
-        return "(syntax OK)"
-    return r.stderr.strip() or r.stdout.strip()
+    result = "(syntax OK)" if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip())
+    if cache_key:
+        cache_set(cache_key, result)
+    return result
 
 
 def skill_run_mypy(file_path: str, target_repo: str = None) -> str:
     """Run mypy type checking on a file."""
     cwd = target_repo or os.path.dirname(file_path)
     rel_path = os.path.relpath(file_path, cwd)
+    try:
+        with open(file_path) as f:
+            content_hash = hashlib.sha256(f.read().encode()).hexdigest()
+        cache_key = make_key("agent:run_mypy", file_path, content_hash)
+        cached = cache_get(cache_key, max_age=86400)
+        if cached is not None:
+            return cached
+    except Exception:
+        cache_key = None
     r = subprocess.run(["uv", "run", "mypy", "--check-untyped-defs", rel_path], cwd=cwd, capture_output=True, text=True, timeout=60)
-    if r.returncode == 0:
-        return "(mypy OK)"
-    return r.stderr.strip() or r.stdout.strip()
+    result = "(mypy OK)" if r.returncode == 0 else (r.stderr.strip() or r.stdout.strip())
+    if cache_key:
+        cache_set(cache_key, result)
+    return result
 
 
 def skill_run_pytest(test_path: str, target_repo: str = None) -> str:
@@ -461,8 +513,20 @@ def skill_run_lint(file_path: str, target_repo: str = None) -> str:
     """Run ruff linter checks on a Python file."""
     cwd = target_repo or os.path.dirname(file_path)
     rel_path = os.path.relpath(file_path, cwd)
+    try:
+        with open(file_path) as f:
+            content_hash = hashlib.sha256(f.read().encode()).hexdigest()
+        cache_key = make_key("agent:run_lint", file_path, content_hash)
+        cached = cache_get(cache_key, max_age=86400)
+        if cached is not None:
+            return cached
+    except Exception:
+        cache_key = None
     r = subprocess.run(["ruff", "check", rel_path], cwd=cwd, capture_output=True, text=True, timeout=30)
-    return r.stdout.strip() or r.stderr.strip() or "(no lint issues)"
+    result = r.stdout.strip() or r.stderr.strip() or "(no lint issues)"
+    if cache_key:
+        cache_set(cache_key, result)
+    return result
 
 
 def skill_bundle_size(path: str) -> str:

@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from core.parser import DjangoTopographer
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
@@ -21,6 +22,7 @@ ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER     = "gemini-2.5-flash"
 HEAVY_REVIEWER        = "deepseek-r1:14b"
+LOCAL_JUDGE           = os.getenv("LOCAL_JUDGE", "qwen3.6:latest")
 # ==============================================================================
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
@@ -35,6 +37,10 @@ def init_mcp():
         return _mcp_orch
     if not os.path.exists(MCP_CONFIG_PATH):
         return None
+    from core.mcp_servers import set_memory_persist_path
+    from core.cache import CACHE_DIR
+    memory_path = str(CACHE_DIR / "memories.json")
+    set_memory_persist_path(memory_path)
     from core.mcp_orchestrator import MCPOrchestrator
     orch = MCPOrchestrator(MCP_CONFIG_PATH, target_repo=TARGET_DJANGO_PROJECT)
     started = orch.start()
@@ -53,24 +59,34 @@ def build_mcp_context() -> str:
     if not orch:
         return ""
     parts = []
-    try:
-        status = orch.git_status()
-        if status and status != "(no output)":
-            parts.append(f"Working Tree:\n{status}")
-    except Exception:
-        pass
-    try:
-        recent = orch.git_log(max_count=10)
-        if recent and not recent.startswith("("):
-            parts.append(f"Recent Commits:\n{recent}")
-    except Exception:
-        pass
-    try:
-        memory = orch.recall(tags=["security", "architectural_rule"])
-        if memory and memory != "(no memories)":
-            parts.append(f"Security Context:\n{memory}")
-    except Exception:
-        pass
+    def fetch_status():
+        try:
+            s = orch.git_status()
+            if s and s != "(no output)":
+                return f"Working Tree:\n{s}"
+        except Exception:
+            pass
+        return None
+    def fetch_log():
+        try:
+            r = orch.git_log(max_count=10)
+            if r and not r.startswith("("):
+                return f"Recent Commits:\n{r}"
+        except Exception:
+            pass
+        return None
+    def fetch_memory():
+        try:
+            m = orch.recall(tags=["security", "architectural_rule"])
+            if m and m != "(no memories)":
+                return f"Security Context:\n{m}"
+        except Exception:
+            pass
+        return None
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for result in pool.map(lambda f: f(), [fetch_status, fetch_log, fetch_memory]):
+            if result:
+                parts.append(result)
     return "\n\n".join(parts)
 
 def main():
@@ -80,11 +96,14 @@ def main():
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
+    judge_model = LOCAL_JUDGE if is_local_mode else HEAVY_REVIEWER
+    if judge_model == REASONING_ARCHITECT:
+        judge_model = HEAVY_REVIEWER
     print(f"{'='*60}")
     print(f"Launching Security Evaluation Engine (Hybrid Mode)")
     print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local Judge      : {HEAVY_REVIEWER}")
+    print(f"Local Judge      : {judge_model}")
     print(f"{'='*60}\n")
 
     start_time = time.time()
@@ -119,7 +138,7 @@ def main():
         print("   [Skipped] No MCP config found\n")
 
     # 3. Build prompt context
-    project_map_json = json.dumps(project_map, indent=2, default=str)
+    project_map_json = json.dumps(project_map, default=str)
 
     PARSER_LIMITATIONS = """### Parser Capabilities & Limitations
 
@@ -133,7 +152,7 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 - View base classes (e.g., `RetrieveAPIView`, `APIView`, `ModelViewSet`)
 - View HTTP methods (derived from non-stub method names: get/post/put/patch/delete)
 - View read-only status (`is_read_only: true` if only GET is supported)
-- ALL methods including DRF hooks: `perform_create`, `perform_destroy`, `perform_update`, `get_queryset`, `get_serializer_class` — each with stub detection and inline auth call scanning
+- ALL methods including DRF hooks: `perform_create`, `perform_destroy`, `perform_update`, `get_queryset`, `get_serializer_class`, `get_object` — each with stub detection and inline auth call scanning
 - Inline authorization calls: methods list `inline_auth_calls` with function names found in method bodies (e.g., `["authorize_superuser"]`)
 
 **CANNOT resolve:**
@@ -147,6 +166,8 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 1. **NEVER attribute a class_attributes field to a view unless it explicitly appears in that view's `class_attributes` dict**. Each view entry has its own isolated dict. If `queryset` is not listed in a view's `class_attributes`, that view does NOT have a class-level queryset — do NOT invent one.
 2. **`get_queryset` method ≠ `queryset` attribute**: A view may define `get_queryset()` in its methods list but have no `queryset` in its class_attributes. These are different DRF patterns — `get_queryset()` at runtime takes precedence over the class-level `queryset` attribute. Never claim a view has `queryset = Model.objects.all` just because it has a `get_queryset` method.
 3. **Each view is independent**: Every view in the topography is a separate entry with its own `class_attributes`, `methods`, and `base_classes`. Do not mix data between views, even if they share a file.
+4. **Empty `inline_auth_calls` ≠ no authorization**: The scanner finds authorization calls in method bodies by name matching. If `get_queryset()` or a handler method delegates to a service/helper function (e.g., `get_accessible_courses_queryset(profile)`), the scanner cannot trace into that call. Empty `inline_auth_calls` means no directly visible auth calls were found — it does NOT mean authorization is absent. Do NOT assume a `get_queryset()` with empty `inline_auth_calls` is unscoped; the scoping may be encapsulated in a delegated service function.
+5. **`queryset = .none()` + custom `get_object()` is a standard DRF pattern**: A view may set `class_attributes.queryset = "Model.objects.none()"` while overriding `get_object()` with custom ownership filtering. The `.none()` queryset intentionally prevents DRF's inherited `get_object()` from running — the custom `get_object()` does its own query with user filtering. Check whether `get_object` appears in the `methods` list. If it does and has `inline_auth_calls` (e.g., user=user filtering), the class-level `queryset` is irrelevant for authorization. Do NOT flag this as an unscoped queryset.
 
 ### First, Do No Harm — Severity Calibration Rules
 
@@ -155,6 +176,7 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 2. **Inline auth in methods**: Check `inline_auth_calls` on each method. A method with `["authorize_superuser"]` has method-level authorization — do NOT flag.
 3. **DRF delegation ordering**: DRF calls `destroy()` → `get_object()` (read-only lookup, no side effects) → `perform_destroy()` (where mutation + auth happen). `get_object()` itself cannot modify data. Auth in `perform_destroy()` gates the MUTATION, so the endpoint is protected. Do NOT treat an unscoped `get_object()` as a vulnerability if `perform_destroy()` has auth — downgrade to LOW/INFO.
 4. **APIView subclasses**: Views inheriting from `APIView` (not `GenericAPIView`/`ModelViewSet`) don't use `get_queryset()` or `serializer_class` by default. Check `base_classes` before assuming DRF generic view patterns.
+5. **`.none()` queryset with overridden `get_object()`**: If a view has `queryset = Model.objects.none()` AND overrides `get_object()` in its methods list, the queryset is a safety guard, not the authorization mechanism. DRF's normal `get_object()` → `get_queryset()` chain is broken by the override. Check the overridden `get_object()` for ownership filtering instead. Do NOT flag as BOLA.
 
 **Mass Assignment:**
 5. **Field must exist in Meta.fields**: Before flagging a field as writable, confirm it appears in the serializer's `Meta.fields` list. If NOT in the list, it cannot be mass-assigned — retract entirely.
@@ -165,7 +187,7 @@ The topography is built by static AST parsing. Here's what it CAN and CANNOT res
 8. **Read-only views**: Check `is_read_only: true` on the view. A serializer used in a read-only view is never written to by DRF — writable field declarations are harmless. Do NOT flag.
 9. **Read serializer ≠ write serializer**: A view may use DIFFERENT serializers for reads vs writes. For mass assignment analysis, you MUST check the WRITE view's `serializer_class` (the view with POST/PUT/PATCH methods). A GET-only view's serializer (e.g., `CourseFullListSerializer` on `CourseRetrieveView`) may include representation-only fields like `content_creator` that do NOT exist in the write serializer's `Meta.fields`. If a field exists in a read serializer but NOT in the write serializer's `Meta.fields`, it is NOT mass-assignable — do NOT flag it.
 10. **Method stubs**: Methods with `is_stub: true` contain no real logic. If a finding relies on a stubbed method, retract it.
-11. **`get_queryset` with auth**: If a view has `get_queryset` with `inline_auth_calls` (e.g., `["authorize_creator"]`), the view enforces object-level authorization at the query level — serializer-level mass assignment is less risky.
+11. **`get_queryset` with auth**: If a view has `get_queryset` with `inline_auth_calls` (e.g., `["authorize_creator"]`), the view enforces object-level authorization at the query level — serializer-level mass assignment is less risky. If `get_queryset` exists with EMPTY `inline_auth_calls`, do NOT assume it is unscoped — the method may delegate to a service function (e.g., `get_accessible_courses_queryset(profile)`) that the parser cannot trace. Flag at MEDIUM max, as UNCERTAIN.
 
 **Classification:**
 12. **Hardcoded vs user-supplied data**: Static analysis cannot trace data flows from request → API calls. If the only evidence for an "unvalidated input" finding is the endpoint existing (no visible user-controlled data flow from request parameters to API calls), flag at INFO not LOW. An endpoint using hardcoded values with no request data consumption is a code quality concern, not a vulnerability.
@@ -346,12 +368,12 @@ If all findings are low-confidence or parser-limited, state "All potential findi
     print(f"   [Done] Security analysis via {model_used} in {time.time() - pass_start:.2f}s")
 
     # 5. Evaluate analysis quality
-    print(f"Step 4: Evaluating analysis quality via Local Judge [{HEAVY_REVIEWER}]...")
+    print(f"Step 4: Evaluating analysis quality via Local Judge [{judge_model}]...")
     judge_start = time.time()
 
     # Provide the project map as ground truth so the judge can detect fabrication
     judge_context = f"Project Map:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=HEAVY_REVIEWER)
+    evaluator = AutomatedEvaluator(judge_model=judge_model)
     scores = evaluator.grade_run(final_analysis, "rubrics/security_rubric.json", context=judge_context)
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
