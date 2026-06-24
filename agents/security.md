@@ -85,6 +85,6 @@ For every distinct vulnerability or risk identified, structure your report using
   2. Where data is fetched:
   3. Checks between input and data:
   4. Verdict:
-- **Evidence:** 
+- **Evidence:**
 ```python
   # Copy the exact offending code snippet here

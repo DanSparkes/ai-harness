@@ -1,12 +1,11 @@
 import json
 import os
-import sys
+from contextlib import suppress
 from typing import Any
 
+from core.cache import CACHE_DIR
 from core.mcp_client import MCPClient, MCPError
 from core.mcp_servers import set_memory_persist_path
-from core.cache import CACHE_DIR
-
 
 MCP_CONFIG_SCHEMA = {
     "mcp_servers": {
@@ -27,9 +26,9 @@ MCP_CONFIG_SCHEMA = {
                     "description": {"type": "string"},
                 },
                 "required": ["type"],
-            },
+            }
         },
-    },
+    }
 }
 
 
@@ -76,7 +75,7 @@ class MCPOrchestrator:
         if not os.path.exists(config_path):
             print(f"  MCP config not found: {config_path}")
             return
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             raw = json.load(f)
         servers = raw.get("mcp_servers", {})
         for name, cfg in servers.items():
@@ -93,7 +92,9 @@ class MCPOrchestrator:
                 cfg = self._resolve_template_vars(cfg)
                 client = MCPClient(name, cfg)
                 info = client.connect(init_timeout=120.0)
-                print(f"  MCP [{name}] connected: {info.get('name', 'unknown')} v{info.get('version', '?')}")
+                print(
+                    f"  MCP [{name}] connected: {info.get('name', 'unknown')} v{info.get('version', '?')}"
+                )
                 self._clients[name] = client
                 started.append(name)
             except MCPError as e:
@@ -107,12 +108,19 @@ class MCPOrchestrator:
         """Replace {{REPO_PATH}} in config values with the target repo path."""
         if not self._target_repo:
             return cfg
-        resolved = {}
+        resolved: dict[str, Any] = {}
         for key, val in cfg.items():
             if isinstance(val, str):
                 resolved[key] = val.replace("{{REPO_PATH}}", self._target_repo)
             elif isinstance(val, list):
-                resolved[key] = [item.replace("{{REPO_PATH}}", self._target_repo) if isinstance(item, str) else item for item in val]
+                resolved[key] = [
+                    (
+                        item.replace("{{REPO_PATH}}", self._target_repo)
+                        if isinstance(item, str)
+                        else item
+                    )
+                    for item in val
+                ]
             elif isinstance(val, dict):
                 resolved[key] = self._resolve_template_vars(val)
             else:
@@ -179,13 +187,21 @@ class MCPOrchestrator:
             return "  (no MCP tools available)"
         return "\n\n".join(sections)
 
-    def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any] | None = None, timeout: float = 60.0) -> Any:
+    def call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        timeout: float = 60.0,
+    ) -> Any:
         client = self._clients.get(server_name)
         if not client:
             raise MCPError(f"MCP server '{server_name}' is not connected")
         return client.call_tool(tool_name, arguments, timeout=timeout)
 
-    def search_codebase(self, pattern: str, server_name: str = "filesystem") -> list[dict]:
+    def search_codebase(
+        self, pattern: str, server_name: str = "filesystem"
+    ) -> list[str]:
         try:
             content = self.call_tool(server_name, "search_files", {"pattern": pattern})
             return _parse_text_content(content)
@@ -207,8 +223,10 @@ class MCPOrchestrator:
         except MCPError:
             return []
 
-    def git_log(self, path: str | None = None, max_count: int = 10, server_name: str = "git") -> str:
-        args = {"max_count": max_count}
+    def git_log(
+        self, path: str | None = None, max_count: int = 10, server_name: str = "git"
+    ) -> str:
+        args: dict[str, Any] = {"max_count": max_count}
         if path:
             args["path"] = path
         try:
@@ -237,18 +255,29 @@ class MCPOrchestrator:
         except MCPError as e:
             return f"(git_status error: {e})"
 
-    def remember(self, key: str, fact: str, tags: list[str] | None = None, server_name: str = "memory") -> str:
+    def remember(
+        self,
+        key: str,
+        fact: str,
+        tags: list[str] | None = None,
+        server_name: str = "memory",
+    ) -> str:
         try:
-            content = self.call_tool(server_name, "remember", {
-                "key": key, "fact": fact, "tags": tags or [],
-            })
+            content = self.call_tool(
+                server_name, "remember", {"key": key, "fact": fact, "tags": tags or []}
+            )
             texts = _parse_text_content(content)
             return "\n".join(texts) if texts else "(stored)"
         except MCPError as e:
             return f"(remember error: {e})"
 
-    def recall(self, query: str = "", tags: list[str] | None = None, server_name: str = "memory") -> str:
-        args = {}
+    def recall(
+        self,
+        query: str = "",
+        tags: list[str] | None = None,
+        server_name: str = "memory",
+    ) -> str:
+        args: dict[str, Any] = {}
         if query:
             args["query"] = query
         if tags:
@@ -262,7 +291,9 @@ class MCPOrchestrator:
 
     def think(self, thought: str, server_name: str = "thinking") -> str:
         try:
-            content = self.call_tool(server_name, "sequential_thinking", {"thought": thought})
+            content = self.call_tool(
+                server_name, "sequential_thinking", {"thought": thought}
+            )
             texts = _parse_text_content(content)
             return "\n".join(texts) if texts else "(thinking complete)"
         except MCPError:
@@ -330,7 +361,9 @@ class MCPOrchestrator:
             app_info = self.call_tool("django", "application_info", timeout=30)
             if app_info:
                 combined = "\n".join(
-                    c["text"] for c in app_info if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in app_info
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["application_info"] = combined
                 sections.append(f"=== Live Django App Info ===\n{combined}")
@@ -341,7 +374,9 @@ class MCPOrchestrator:
             urls = self.call_tool("django", "list_urls", timeout=30)
             if urls:
                 combined = "\n".join(
-                    c["text"] for c in urls if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in urls
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["urls"] = combined
                 sections.append(f"=== Live Django URL Patterns ===\n{combined}")
@@ -349,13 +384,19 @@ class MCPOrchestrator:
             pass
 
         try:
-            models = self.call_tool("django", "list_models", {"app_labels": ["memores"]}, timeout=30)
+            models = self.call_tool(
+                "django", "list_models", {"app_labels": ["memores"]}, timeout=30
+            )
             if models:
                 combined = "\n".join(
-                    c["text"] for c in models if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in models
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["models"] = combined
-                sections.append(f"=== Live Django Models (from django-ai-boost) ===\n{combined}")
+                sections.append(
+                    f"=== Live Django Models (from django-ai-boost) ===\n{combined}"
+                )
         except Exception:
             pass
 
@@ -363,7 +404,9 @@ class MCPOrchestrator:
             schema = self.call_tool("django", "database_schema", timeout=30)
             if schema:
                 combined = "\n".join(
-                    c["text"] for c in schema if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in schema
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["database_schema"] = combined
                 sections.append(f"=== Live Database Schema ===\n{combined}")
@@ -372,7 +415,9 @@ class MCPOrchestrator:
 
         return "\n\n".join(sections), raw
 
-    def build_codebase_memory_context(self, timeout_index: float = 120.0) -> tuple[str, dict]:
+    def build_codebase_memory_context(
+        self, timeout_index: float = 120.0
+    ) -> tuple[str, dict]:
         if not self.is_running:
             return "", {}
         server = self.get_client("codebase-memory")
@@ -387,11 +432,17 @@ class MCPOrchestrator:
 
         # 1. Index (idempotent — content-hash based, only re-parses changed files)
         try:
-            result = self.call_tool("codebase-memory", "index_repository",
-                                    {"repo_path": self._target_repo}, timeout=timeout_index)
+            result = self.call_tool(
+                "codebase-memory",
+                "index_repository",
+                {"repo_path": self._target_repo},
+                timeout=timeout_index,
+            )
             if result:
                 combined = "\n".join(
-                    c["text"] for c in result if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in result
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["index_result"] = combined
         except Exception:
@@ -400,24 +451,38 @@ class MCPOrchestrator:
         # 2. Architecture overview (languages, packages, entry points, routes,
         #    hotspots, boundaries, layers, clusters, file tree)
         try:
-            arch = self.call_tool("codebase-memory", "get_architecture",
-                                  {"aspects": ["all"], "project": project_name}, timeout=30)
+            arch = self.call_tool(
+                "codebase-memory",
+                "get_architecture",
+                {"aspects": ["all"], "project": project_name},
+                timeout=30,
+            )
             if arch:
                 combined = "\n".join(
-                    c["text"] for c in arch if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in arch
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["architecture"] = combined
-                sections.append(f"=== Codebase Architecture (from codebase-memory-mcp) ===\n{combined}")
+                sections.append(
+                    f"=== Codebase Architecture (from codebase-memory-mcp) ===\n{combined}"
+                )
         except Exception:
             pass
 
         # 3. Graph schema (node/edge counts for reference)
         try:
-            schema = self.call_tool("codebase-memory", "get_graph_schema",
-                                    {"project": project_name}, timeout=15)
+            schema = self.call_tool(
+                "codebase-memory",
+                "get_graph_schema",
+                {"project": project_name},
+                timeout=15,
+            )
             if schema:
                 combined = "\n".join(
-                    c["text"] for c in schema if isinstance(c, dict) and c.get("type") == "text"
+                    c["text"]
+                    for c in schema
+                    if isinstance(c, dict) and c.get("type") == "text"
                 )
                 raw["graph_schema"] = combined
                 sections.append(f"=== Codebase Memory Graph Schema ===\n{combined}")
@@ -474,10 +539,8 @@ def init_orchestrator(config_path: str, target_repo: str) -> MCPOrchestrator | N
     orch = MCPOrchestrator(config_path, target_repo=target_repo)
     started = orch.start()
     if started:
-        try:
+        with suppress(Exception):
             orch.call_tool("git", "git_set_repo", {"path": target_repo})
-        except Exception:
-            pass
         return orch
     return None
 

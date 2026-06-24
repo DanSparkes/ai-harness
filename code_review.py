@@ -1,16 +1,14 @@
-import os
-import sys
-import json
 import argparse
+import json
+import os
 import time
-from core.parser import DjangoTopographer
-from core.git_provider import GitDiffProvider
-from core.runner import StatefulHarnessRunner
-from core.judge import AutomatedEvaluator
-from core.warehouse import HarnessWarehouse
-from core.mcp_orchestrator import init_orchestrator
 
-os.environ.setdefault("OLLAMA_MLX", "1")
+from core.git_provider import GitDiffProvider
+from core.judge import AutomatedEvaluator
+from core.mcp_orchestrator import init_orchestrator
+from core.parser import DjangoTopographer
+from core.runner import StatefulHarnessRunner
+from core.warehouse import HarnessWarehouse
 
 # ==============================================================================
 # MODEL & API CONFIGURATION
@@ -18,21 +16,27 @@ os.environ.setdefault("OLLAMA_MLX", "1")
 # Default is local Ollama. Set USE_GEMINI=true to use Gemini cloud API.
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-CLOUD_MODEL           = "gemini-2.5-flash"
-LOCAL_MODEL           = "qwen3.6:latest"
+CLOUD_MODEL = "gemini-2.5-flash"
+LOCAL_MODEL = "qwen3.6:latest"
 
-REASONING_ARCHITECT   = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if USE_GEMINI else "http://localhost:11434"
-ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
+ARCHITECT_API_BASE = (
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+    if USE_GEMINI
+    else "http://localhost:11434"
+)
+ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 # Local Fallback: Used when cloud API is unavailable
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
+FALLBACK_REVIEWER = "gemini-2.5-flash"
 # Local Judge: Scores the review against a rubric
-HEAVY_REVIEWER        = "deepseek-r1:14b"
-LOCAL_JUDGE           = "qwen2.5-coder:14b"
+HEAVY_REVIEWER = "deepseek-r1:14b"
+LOCAL_JUDGE = "qwen2.5-coder:14b"
 # ==============================================================================
 
-TARGET_DJANGO_PROJECT = os.environ.get("TARGET_REPO", "/Users/dansparkes/memores/memores-api")
+TARGET_DJANGO_PROJECT = os.environ.get(
+    "TARGET_REPO", "/Users/dansparkes/memores/memores-api"
+)
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.python.json")
 
 _mcp_orch = None
@@ -63,34 +67,43 @@ def build_mcp_context() -> str:
         parts.append(f"Review Context:\n{memory}")
     return "\n\n".join(parts)
 
+
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Local-Cloud Hybrid Code Review Engine")
-    parser.add_argument(
-        "--target", "-t", 
-        default="main", 
-        help="Target branch to merge into (default: main)"
+    parser = argparse.ArgumentParser(
+        description="Local-Cloud Hybrid Code Review Engine"
     )
     parser.add_argument(
-        "--source", "-s", 
-        default="develop", 
-        help="Source branch containing new changes (default: develop)"
+        "--target",
+        "-t",
+        default="main",
+        help="Target branch to merge into (default: main)",
     )
     parser.add_argument(
-        "--project-context", "-c",
+        "--source",
+        "-s",
+        default="develop",
+        help="Source branch containing new changes (default: develop)",
+    )
+    parser.add_argument(
+        "--project-context",
+        "-c",
         default=None,
-        help="Path to a project-specific context file (markdown) with domain knowledge to inject into the review"
+        help="Path to a project-specific context file (markdown) with domain knowledge to inject into the review",
     )
     parser.add_argument(
-        "--repo", "-r",
+        "--repo",
+        "-r",
         default=None,
-        help="Path to the target repository (overrides TARGET_REPO env var and defaults)"
+        help="Path to the target repository (overrides TARGET_REPO env var and defaults)",
     )
     parser.add_argument(
-        "--mcp-config", "-m",
+        "--mcp-config",
+        "-m",
         default=None,
-        help="Path to MCP server config file (overrides MCP_CONFIG env var and default)"
+        help="Path to MCP server config file (overrides MCP_CONFIG env var and default)",
     )
     return parser.parse_args()
+
 
 def main():
     args = parse_arguments()
@@ -106,13 +119,13 @@ def main():
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
-    print(f"{'='*60}")
-    print(f"🚀 Launching Local Code Review Engine (Hybrid Mode)")
+    print(f"{'=' * 60}")
+    print("Launching Local Code Review Engine (Hybrid Mode)")
     print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local JSON Judge : {LOCAL_JUDGE}")
     print(f"Review Delta     : {target_branch} <--- {source_branch}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     start_time = time.time()
 
@@ -140,8 +153,8 @@ def main():
     if not os.path.exists(persona_path):
         print(f"❌ Error: System prompt missing at {persona_path}")
         return
-        
-    with open(persona_path, "r", encoding="utf-8") as f:
+
+    with open(persona_path, encoding="utf-8") as f:
         system_agent_prompt = f.read()
 
     # 4b. Initialize MCP workbench for richer context
@@ -158,7 +171,7 @@ def main():
     if args.project_context:
         ctx_path = args.project_context
         if os.path.exists(ctx_path):
-            with open(ctx_path, "r", encoding="utf-8") as f:
+            with open(ctx_path, encoding="utf-8") as f:
                 project_context_block = f.read()
             print(f"   [Loaded] Project context from {ctx_path}\n")
         else:
@@ -167,17 +180,27 @@ def main():
         print("   [Skipped] No project context file specified (-c to add)\n")
 
     # 5. Build prompt context
-    project_map_json = json.dumps(project_map, indent=2, default=str)
-    changed_files_json = json.dumps(changed_files, indent=2)
+    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
+    changed_files_json = json.dumps(changed_files, separators=(",", ":"))
 
     # 6. Build prompts for either cloud or local mode
-    mcp_prompt_section = f"\n\n### MCP-Augmented Context (Live Project State)\n{mcp_block}" if mcp_block else ""
-    project_context_section = f"\n\n### Project-Specific Context ({os.path.basename(args.project_context)})\n{project_context_block}" if project_context_block else ""
+    mcp_prompt_section = (
+        f"\n\n### MCP-Augmented Context (Live Project State)\n{mcp_block}"
+        if mcp_block
+        else ""
+    )
+    project_context_section = (
+        f"\n\n### Project-Specific Context ({os.path.basename(args.project_context)})\n{project_context_block}"
+        if project_context_block
+        else ""
+    )
 
     # Single-pass fallback: used for local-only mode and cloud API failures
     # Keep project map clipped (it's reference context, not what we review).
     # The diff is kept in full — clipping it would skip reviewing real changes.
-    clipped_map = project_map_json[:8000] + ("\n... [map truncated]" if len(project_map_json) > 8000 else "")
+    clipped_map = project_map_json[:8000] + (
+        "\n... [map truncated]" if len(project_map_json) > 8000 else ""
+    )
 
     fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}{project_context_section}
 
@@ -233,7 +256,7 @@ Follow the markdown schema and headers defined in your system prompt."""
     # 7. Execute Reasoning Pass
     print(f"🤖 Step 2: Processing Review via [{REASONING_ARCHITECT}]...")
     pass_start = time.time()
-    
+
     runner = StatefulHarnessRunner(
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
@@ -244,22 +267,26 @@ Follow the markdown schema and headers defined in your system prompt."""
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
         passes=passes,
-        fallback_prompt=fallback_prompt
+        fallback_prompt=fallback_prompt,
     )
     final_review = history[-1]["output"]
     model_used = runner.model_name
-    
-    print(f"   [Done] Review generated via {model_used} in {time.time() - pass_start:.2f}s")
+
+    print(
+        f"   [Done] Review generated via {model_used} in {time.time() - pass_start:.2f}s"
+    )
 
     # 8. Evaluate review quality
     print(f"⚖️ Step 3: Checking review quality via Local Judge [{LOCAL_JUDGE}]...")
     judge_start = time.time()
-    
+
     # Provide the diff + project map as ground truth so the judge can detect fabrication
     judge_context = f"Diff:\n```diff\n{raw_diff[:10000]}\n```\n\nProject Map:\n{project_map_json[:5000]}"
     evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
-    scores = evaluator.grade_run(final_review, "rubrics/code_review_rubric.json", context=judge_context)
-    
+    scores = evaluator.grade_run(
+        final_review, "rubrics/code_review_rubric.json", context=judge_context
+    )
+
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
     print(f"📊 Review Reliability Scores: {scores}")
 
@@ -270,14 +297,14 @@ Follow the markdown schema and headers defined in your system prompt."""
         model_name=model_used,
         agent_role=f"Staff Code Review ({source_branch})",
         raw_output=final_review,
-        scores=scores
+        scores=scores,
     )
 
     report_filename = "reports/automated_code_review.md"
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_review)
-        
+
     if _mcp_orch:
         _mcp_orch.remember(
             f"review:{source_branch}:complete",
@@ -289,6 +316,7 @@ Follow the markdown schema and headers defined in your system prompt."""
     total_duration = time.time() - start_time
     print(f"\n✅ Report saved to: {report_filename}")
     print(f"⏱️ Total Time: {total_duration:.2f}s  Model: {model_used}")
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -32,89 +31,124 @@ class GitServer(MCPBuiltinServer):
         }
 
     def _list_tools(self, params: dict) -> dict:
-        return {"tools": [
-            {
-                "name": "git_log",
-                "description": "Show commit logs for a file or the repository. Returns commit hashes, authors, dates, and messages.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Optional relative file path to filter history for"},
-                        "max_count": {"type": "integer", "description": "Maximum number of commits to return (default 20)"},
-                        "branch": {"type": "string", "description": "Branch name (default current branch)"},
+        return {
+            "tools": [
+                {
+                    "name": "git_log",
+                    "description": "Show commit logs for a file or the repository. Returns commit hashes, authors, dates, and messages.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Optional relative file path to filter history for",
+                            },
+                            "max_count": {
+                                "type": "integer",
+                                "description": "Maximum number of commits to return (default 20)",
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Branch name (default current branch)",
+                            },
+                        },
+                        "required": [],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "git_diff",
-                "description": "Show uncommitted changes or diff between commits for a specific file.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Relative file path to get diff for"},
-                        "commit": {"type": "string", "description": "Optional commit hash to diff against (default: working tree vs HEAD)"},
-                        "staged": {"type": "boolean", "description": "If true, show staged changes only"},
+                {
+                    "name": "git_diff",
+                    "description": "Show uncommitted changes or diff between commits for a specific file.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative file path to get diff for",
+                            },
+                            "commit": {
+                                "type": "string",
+                                "description": "Optional commit hash to diff against (default: working tree vs HEAD)",
+                            },
+                            "staged": {
+                                "type": "boolean",
+                                "description": "If true, show staged changes only",
+                            },
+                        },
+                        "required": [],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "git_blame",
-                "description": "Show blame annotation for a file (who last modified each line).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Relative file path to blame"},
+                {
+                    "name": "git_blame",
+                    "description": "Show blame annotation for a file (who last modified each line).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative file path to blame",
+                            }
+                        },
+                        "required": ["path"],
                     },
-                    "required": ["path"],
                 },
-            },
-            {
-                "name": "git_status",
-                "description": "Show the working tree status (modified, staged, untracked files).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "short": {"type": "boolean", "description": "Use short format (default false)"},
+                {
+                    "name": "git_status",
+                    "description": "Show the working tree status (modified, staged, untracked files).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "short": {
+                                "type": "boolean",
+                                "description": "Use short format (default false)",
+                            }
+                        },
+                        "required": [],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "git_branch",
-                "description": "List branches or show current branch.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "all": {"type": "boolean", "description": "Include remote branches (default false)"},
+                {
+                    "name": "git_branch",
+                    "description": "List branches or show current branch.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "all": {
+                                "type": "boolean",
+                                "description": "Include remote branches (default false)",
+                            }
+                        },
+                        "required": [],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "git_show",
-                "description": "Show the details of a specific commit.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "commit": {"type": "string", "description": "Commit hash to show"},
+                {
+                    "name": "git_show",
+                    "description": "Show the details of a specific commit.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "commit": {
+                                "type": "string",
+                                "description": "Commit hash to show",
+                            }
+                        },
+                        "required": ["commit"],
                     },
-                    "required": ["commit"],
                 },
-            },
-            {
-                "name": "git_set_repo",
-                "description": "Set the repository path for subsequent git operations.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Absolute path to the git repository"},
+                {
+                    "name": "git_set_repo",
+                    "description": "Set the repository path for subsequent git operations.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute path to the git repository",
+                            }
+                        },
+                        "required": ["path"],
                     },
-                    "required": ["path"],
                 },
-            },
-        ]}
+            ]
+        }
 
     def _call_tool(self, params: dict) -> dict:
         name = params.get("name", "")
@@ -140,11 +174,7 @@ class GitServer(MCPBuiltinServer):
             return "Error: No repository path set. Call git_set_repo first."
         try:
             result = subprocess.run(
-                ["git"] + cmd,
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                ["git", *cmd], cwd=repo, capture_output=True, text=True, timeout=30
             )
             if result.returncode != 0:
                 return f"Git error: {result.stderr.strip()}"
@@ -239,6 +269,8 @@ class MemoryServer(MCPBuiltinServer):
             self._load_from_disk()
 
     def _load_from_disk(self):
+        if self._persist_path is None:
+            return
         try:
             path = Path(self._persist_path)
             if path.exists():
@@ -280,87 +312,100 @@ class MemoryServer(MCPBuiltinServer):
         }
 
     def _list_tools(self, params: dict) -> dict:
-        return {"tools": [
-            {
-                "name": "remember",
-                "description": "Store a fact or architectural rule in persistent memory. The fact will be recallable across sessions.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Unique identifier for this fact (e.g., 'auth:snake_case_json')"},
-                        "fact": {"type": "string", "description": "The fact or rule to remember"},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional tags for categorisation (e.g., ['django', 'api'])",
+        return {
+            "tools": [
+                {
+                    "name": "remember",
+                    "description": "Store a fact or architectural rule in persistent memory. The fact will be recallable across sessions.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "key": {
+                                "type": "string",
+                                "description": "Unique identifier for this fact (e.g., 'auth:snake_case_json')",
+                            },
+                            "fact": {
+                                "type": "string",
+                                "description": "The fact or rule to remember",
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional tags for categorisation (e.g., ['django', 'api'])",
+                            },
                         },
+                        "required": ["key", "fact"],
                     },
-                    "required": ["key", "fact"],
                 },
-            },
-            {
-                "name": "recall",
-                "description": "Search stored facts by text or tags. Returns all matching memories.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Text to search for in stored facts"},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Filter by tags",
+                {
+                    "name": "recall",
+                    "description": "Search stored facts by text or tags. Returns all matching memories.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Text to search for in stored facts",
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Filter by tags",
+                            },
                         },
+                        "required": [],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "forget",
-                "description": "Remove a stored fact by its key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Key of the fact to remove"},
-                    },
-                    "required": ["key"],
-                },
-            },
-            {
-                "name": "list_all",
-                "description": "List all stored facts with their keys, tags, and timestamps.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tag_filter": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional tag filter",
+                {
+                    "name": "forget",
+                    "description": "Remove a stored fact by its key.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "key": {
+                                "type": "string",
+                                "description": "Key of the fact to remove",
+                            }
                         },
+                        "required": ["key"],
                     },
-                    "required": [],
                 },
-            },
-            {
-                "name": "export_memories",
-                "description": "Export all memories as a JSON string (for persistence across sessions).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                },
-            },
-            {
-                "name": "import_memories",
-                "description": "Import memories from a previously exported JSON string.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data": {"type": "string", "description": "JSON string from export_memories"},
+                {
+                    "name": "list_all",
+                    "description": "List all stored facts with their keys, tags, and timestamps.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tag_filter": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional tag filter",
+                            }
+                        },
+                        "required": [],
                     },
-                    "required": ["data"],
                 },
-            },
-        ]}
+                {
+                    "name": "export_memories",
+                    "description": "Export all memories as a JSON string (for persistence across sessions).",
+                    "inputSchema": {"type": "object", "properties": {}, "required": []},
+                },
+                {
+                    "name": "import_memories",
+                    "description": "Import memories from a previously exported JSON string.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "type": "string",
+                                "description": "JSON string from export_memories",
+                            }
+                        },
+                        "required": ["data"],
+                    },
+                },
+            ]
+        }
 
     def _call_tool(self, params: dict) -> dict:
         name = params.get("name", "")
@@ -385,11 +430,7 @@ class MemoryServer(MCPBuiltinServer):
         tags = args.get("tags", [])
         if key in self._facts:
             return f"Key '{key}' already exists. Use forget first to update it."
-        self._facts[key] = [{
-            "fact": fact,
-            "tags": tags,
-            "timestamp": time.time(),
-        }]
+        self._facts[key] = [{"fact": fact, "tags": tags, "timestamp": time.time()}]
         for tag in tags:
             self._tags.setdefault(tag, []).append(key)
         self._dirty = True
@@ -402,16 +443,19 @@ class MemoryServer(MCPBuiltinServer):
         results = []
         for key, entries in self._facts.items():
             for entry in entries:
-                if tag_filter:
-                    if not any(t in entry.get("tags", []) for t in tag_filter):
-                        continue
-                if query and query not in key.lower() and query not in entry["fact"].lower():
+                if tag_filter and not any(
+                    t in entry.get("tags", []) for t in tag_filter
+                ):
                     continue
-                results.append({
-                    "key": key,
-                    "fact": entry["fact"],
-                    "tags": entry.get("tags", []),
-                })
+                if (
+                    query
+                    and query not in key.lower()
+                    and query not in entry["fact"].lower()
+                ):
+                    continue
+                results.append(
+                    {"key": key, "fact": entry["fact"], "tags": entry.get("tags", [])}
+                )
         if not results:
             return "(no matching memories)"
         lines = []
@@ -424,7 +468,7 @@ class MemoryServer(MCPBuiltinServer):
         key = args.get("key", "")
         if key in self._facts:
             del self._facts[key]
-            for tag, keys in self._tags.items():
+            for _tag, keys in self._tags.items():
                 if key in keys:
                     keys.remove(key)
             self._dirty = True
@@ -439,9 +483,15 @@ class MemoryServer(MCPBuiltinServer):
         lines = []
         for key, entries in self._facts.items():
             for entry in entries:
-                if tag_filter and not any(t in entry.get("tags", []) for t in tag_filter):
+                if tag_filter and not any(
+                    t in entry.get("tags", []) for t in tag_filter
+                ):
                     continue
-                tags_str = f" [{', '.join(entry.get('tags', []))}]" if entry.get("tags") else ""
+                tags_str = (
+                    f" [{', '.join(entry.get('tags', []))}]"
+                    if entry.get("tags")
+                    else ""
+                )
                 lines.append(f"  {key}: {entry['fact']}{tags_str}")
         return "\n".join(lines) if lines else "(no matching memories)"
 

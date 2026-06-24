@@ -18,20 +18,16 @@ Usage:
   python3 generate_feature_plan.py --update reports/throttle_onboarding.md
 """
 
+import argparse
+import json
 import os
 import re
 import sys
-import json
-import time
-import argparse
-import requests
 from typing import Any
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 from core.agent import Agent
 from core.mcp_orchestrator import init_orchestrator
-
-os.environ.setdefault("OLLAMA_MLX", "1")
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
@@ -113,6 +109,7 @@ Output ONLY the report with the pipeline JSON embedded in a code block at the en
 
 # ── MCP Integration ───────────────────────────────────────────────────────────
 
+
 def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
     global _mcp_orchestrator
     if _mcp_orchestrator is not None:
@@ -148,12 +145,16 @@ def get_mcp_context(args: argparse.Namespace) -> str:
 
 # ── Codebase Scanner ──────────────────────────────────────────────────────────
 
+
 def build_codebase_context(args: argparse.Namespace) -> str:
     """Build a codebase context block for the LLM prompt from the target repo."""
     from core.parser import (
-        scan_file_tree, scan_celery_tasks,
-        scan_files_by_keyword, scan_files_by_pattern, format_scan_results,
         DjangoTopographer,
+        format_scan_results,
+        scan_celery_tasks,
+        scan_file_tree,
+        scan_files_by_keyword,
+        scan_files_by_pattern,
     )
 
     file_tree = scan_file_tree(args.target_repo)
@@ -161,7 +162,7 @@ def build_codebase_context(args: argparse.Namespace) -> str:
 
     # Extract meaningful keywords from the prompt
     keywords = re.findall(r"[\w_]+", args.prompt)
-    keywords = sorted(set(k for k in keywords if len(k) > 3), key=lambda k: -len(k))[:5]
+    keywords = sorted({k for k in keywords if len(k) > 3}, key=lambda k: -len(k))[:5]
     keyword_matches = []
     for kw in keywords:
         keyword_matches.extend(scan_files_by_keyword(args.target_repo, kw))
@@ -170,17 +171,21 @@ def build_codebase_context(args: argparse.Namespace) -> str:
     pattern_matches = scan_files_by_pattern(args.target_repo, keywords)
 
     # Always include content for Celery task files (so the LLM can see error handlers)
-    task_files = sorted(set(t["file"] for t in celery_tasks))
+    task_files = sorted({t["file"] for t in celery_tasks})
     for tf in task_files:
         if not any(tf in m["file"] for m in keyword_matches + pattern_matches):
-            task_content = scan_files_by_keyword(args.target_repo, tf.replace(".py", "").split("/")[-1])
+            task_content = scan_files_by_keyword(
+                args.target_repo, tf.replace(".py", "").split("/")[-1]
+            )
             pattern_matches.extend(task_content)
 
     # Add structured Django topology for views/serializers
     topographer = DjangoTopographer(args.target_repo)
     topology = topographer.scan_project()
 
-    base = format_scan_results(file_tree, celery_tasks, keyword_matches, pattern_matches)
+    base = format_scan_results(
+        file_tree, celery_tasks, keyword_matches, pattern_matches
+    )
 
     if topology.get("views") or topology.get("serializers"):
         base += "\n\n=== DJANGO VIEWS & SERIALIZERS ==="
@@ -200,10 +205,16 @@ def get_gemini_api_key() -> str:
     return os.environ.get("GEMINI_API_KEY", "")
 
 
-def build_agent(engine: str, model: str, system_prompt: str, num_ctx: int = 65536) -> Agent:
+def build_agent(
+    engine: str, model: str, system_prompt: str, num_ctx: int = 65536
+) -> Agent:
     is_gemini = engine == "gemini"
     api_key = get_gemini_api_key() if is_gemini else None
-    base_url = "https://generativelanguage.googleapis.com/v1beta/openai" if is_gemini else "http://localhost:11434"
+    base_url = (
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+        if is_gemini
+        else "http://localhost:11434"
+    )
     return Agent(
         name="Architect",
         system_prompt=system_prompt,
@@ -220,9 +231,13 @@ def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
     and parse it. Returns the parsed dict or None.
     """
     # Split on the pipeline section header
-    sections = re.split(r"^##\s+4\.?\s*Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE)
+    sections = re.split(
+        r"^##\s+4\.?\s*Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE
+    )
     if len(sections) < 2:
-        sections = re.split(r"^##\s+Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE)
+        sections = re.split(
+            r"^##\s+Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE
+        )
     if len(sections) < 2:
         print("Warning: Could not find '## Implementation Pipeline' section in report.")
         return None
@@ -241,11 +256,15 @@ def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
 
-    print("Warning: Found JSON block(s) in pipeline section but none parsed successfully.")
+    print(
+        "Warning: Found JSON block(s) in pipeline section but none parsed successfully."
+    )
     return None
 
 
-def build_feature_prompt(feature_prompt: str, codebase_context: str, target_repo: str, mcp_context: str = "") -> str:
+def build_feature_prompt(
+    feature_prompt: str, codebase_context: str, target_repo: str, mcp_context: str = ""
+) -> str:
     extra = f"\n{mcp_context}\n" if mcp_context else ""
     return f"""\
 Design an implementation plan for the following feature request:
@@ -278,7 +297,23 @@ def save_pipeline(pipeline: dict[str, Any], pipeline_path: str) -> None:
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
-    name = args.name or args.prompt.split(":")[0].strip().lower().replace(" ", "_")[:40]
+    # Resolve prompt from --prompt or --prompt-file
+    if args.prompt_file:
+        if not os.path.exists(args.prompt_file):
+            print(f"Error: prompt file not found: {args.prompt_file}")
+            sys.exit(1)
+        with open(args.prompt_file, encoding="utf-8") as f:
+            args.prompt = f.read().strip()
+    elif not args.prompt:
+        print("Error: either --prompt or --prompt-file is required.")
+        sys.exit(1)
+
+    name = args.name
+    if not name:
+        if args.prompt_file:
+            name = os.path.splitext(os.path.basename(args.prompt_file))[0]
+        else:
+            name = args.prompt.split(":")[0].strip().lower().replace(" ", "_")[:40]
     report_filename = f"{name}.md"
     pipeline_filename = f"{name}.json"
     report_path = os.path.join(args.reports_dir, report_filename)
@@ -289,7 +324,9 @@ def cmd_generate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print(f"Generating feature plan for: {name}")
-    print(f"  Architect: [{'OLLAMA' if args.engine == 'ollama' else 'GEMINI'}] via {args.model}")
+    print(
+        f"  Architect: [{'OLLAMA' if args.engine == 'ollama' else 'GEMINI'}] via {args.model}"
+    )
     print(f"  Scanning codebase: {args.target_repo}")
     if args.mcp_config:
         print(f"  MCP Config: {args.mcp_config}")
@@ -297,9 +334,16 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     codebase_context = build_codebase_context(args)
     mcp_context = get_mcp_context(args)
-    user_prompt = build_feature_prompt(args.prompt, codebase_context, args.target_repo, mcp_context)
+    user_prompt = build_feature_prompt(
+        args.prompt, codebase_context, args.target_repo, mcp_context
+    )
 
-    architect = build_agent(args.engine, args.model, ARCHITECT_SYSTEM_PROMPT, getattr(args, 'num_ctx', 65536))
+    architect = build_agent(
+        args.engine,
+        args.model,
+        ARCHITECT_SYSTEM_PROMPT,
+        getattr(args, "num_ctx", 65536),
+    )
     raw_output = architect.execute(user_prompt)
 
     pipeline = extract_pipeline_json(raw_output)
@@ -328,7 +372,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         print(f"Report file not found: {md_path}")
         sys.exit(1)
 
-    with open(md_path, "r", encoding="utf-8") as f:
+    with open(md_path, encoding="utf-8") as f:
         report_text = f.read()
 
     pipeline = extract_pipeline_json(report_text)
@@ -344,22 +388,54 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate a feature plan (.md) and pipeline (.json)")
+    parser = argparse.ArgumentParser(
+        description="Generate a feature plan (.md) and pipeline (.json)"
+    )
     sub = parser.add_subparsers(dest="mode", required=True)
 
     gen = sub.add_parser("generate", help="Generate a new feature plan from a prompt")
-    gen.add_argument("--prompt", required=True, help="Brief feature prompt (e.g. 'Throttle Public Onboarding Endpoints...')")
-    gen.add_argument("--name", help="Feature name (used for filenames). Derived from prompt if omitted.")
-    gen.add_argument("--target-repo", default=os.environ.get("TARGET_REPO", ""), help="Absolute path to the target repository")
-    gen.add_argument("--reports-dir", default=REPORTS_DIR, help="Directory for output files (default: reports/)")
-    gen.add_argument("--agents-dir", default=AGENTS_DIR, help="Directory for agent persona files (default: agents/)")
-    gen.add_argument("--engine", default="ollama", choices=["ollama", "gemini"], help="LLM backend")
-    gen.add_argument("--model", default=ARCHITECT_MODEL, help="Model name (e.g. qwen3.6:latest)")
-    gen.add_argument("--num-ctx", type=int, default=65536, help="Context window size for Ollama")
+    gen.add_argument(
+        "--prompt",
+        help="Brief feature prompt (e.g. 'Throttle Public Onboarding Endpoints...')",
+    )
+    gen.add_argument(
+        "--prompt-file",
+        help="Path to a .md file containing the feature prompt (alternative to --prompt)",
+    )
+    gen.add_argument(
+        "--name",
+        help="Feature name (used for filenames). Derived from prompt or filename if omitted.",
+    )
+    gen.add_argument(
+        "--target-repo",
+        default=os.environ.get("TARGET_REPO", ""),
+        help="Absolute path to the target repository",
+    )
+    gen.add_argument(
+        "--reports-dir",
+        default=REPORTS_DIR,
+        help="Directory for output files (default: reports/)",
+    )
+    gen.add_argument(
+        "--agents-dir",
+        default=AGENTS_DIR,
+        help="Directory for agent persona files (default: agents/)",
+    )
+    gen.add_argument(
+        "--engine", default="ollama", choices=["ollama", "gemini"], help="LLM backend"
+    )
+    gen.add_argument(
+        "--model", default=ARCHITECT_MODEL, help="Model name (e.g. qwen3.6:latest)"
+    )
+    gen.add_argument(
+        "--num-ctx", type=int, default=65536, help="Context window size for Ollama"
+    )
     gen.add_argument("--mcp-config", help="Path to MCP server configuration JSON")
     gen.add_argument("--force", action="store_true", help="Overwrite existing report")
 
-    upd = sub.add_parser("update", help="Re-extract pipeline JSON from an edited .md report")
+    upd = sub.add_parser(
+        "update", help="Re-extract pipeline JSON from an edited .md report"
+    )
     upd.add_argument("update", help="Path to the .md report file")
 
     args = parser.parse_args()

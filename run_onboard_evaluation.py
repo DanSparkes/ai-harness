@@ -1,27 +1,30 @@
+import json
 import os
 import re
-import json
 import time
-from core.parser import DjangoTopographer
+
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
-from core.warehouse import HarnessWarehouse
 from core.mcp_orchestrator import init_orchestrator
-
-os.environ.setdefault("OLLAMA_MLX", "1")
+from core.parser import DjangoTopographer
+from core.warehouse import HarnessWarehouse
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-CLOUD_MODEL           = "gemini-2.5-flash"
-LOCAL_MODEL           = "qwen3.6:latest"
+CLOUD_MODEL = "gemini-2.5-flash"
+LOCAL_MODEL = "qwen3.6:latest"
 
-REASONING_ARCHITECT   = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if USE_GEMINI else "http://localhost:11434"
-ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
+ARCHITECT_API_BASE = (
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+    if USE_GEMINI
+    else "http://localhost:11434"
+)
+ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
-HEAVY_REVIEWER        = "deepseek-r1:14b"
-LOCAL_JUDGE           = "qwen2.5-coder:14b"
+FALLBACK_REVIEWER = "gemini-2.5-flash"
+HEAVY_REVIEWER = "deepseek-r1:14b"
+LOCAL_JUDGE = "qwen2.5-coder:14b"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -66,6 +69,7 @@ def build_codebase_memory_context() -> tuple[str, dict]:
         return "", {}
     return orch.build_codebase_memory_context()
 
+
 def main():
     is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
@@ -73,12 +77,12 @@ def main():
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
-    print(f"{'='*60}")
-    print(f"Launching Staff Onboarding Engine (Hybrid Mode)")
+    print(f"{'=' * 60}")
+    print("Launching Staff Onboarding Engine (Hybrid Mode)")
     print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local Judge      : {LOCAL_JUDGE}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     start_time = time.time()
 
@@ -98,16 +102,16 @@ def main():
     if not os.path.exists(persona_path):
         print(f"Error: System prompt missing at {persona_path}")
         return
-    with open(persona_path, "r", encoding="utf-8") as f:
+    with open(persona_path, encoding="utf-8") as f:
         system_agent_prompt = f.read()
-    print(f"   [Done] Persona loaded")
+    print("   [Done] Persona loaded")
 
     # 2b. Initialize MCP workbench for richer context
     print("Step 2b: Initializing MCP workbench...")
     orch = init_mcp()
     mcp_block = build_mcp_context() if orch else ""
-    django_block, django_data = build_django_live_context() if orch else ("", {})
-    cm_block, cm_data = build_codebase_memory_context() if orch else ("", {})
+    django_block, _django_data = build_django_live_context() if orch else ("", {})
+    cm_block, _cm_data = build_codebase_memory_context() if orch else ("", {})
     live_context = "\n\n".join(filter(None, [mcp_block, django_block, cm_block]))
     if orch:
         statuses = []
@@ -122,9 +126,9 @@ def main():
         print("   [Skipped] No MCP config found\n")
 
     # 3. Build prompt context
-    project_map_json = json.dumps(project_map, indent=2, default=str)
+    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
 
-    PARSER_LIMITATIONS = """### Parser Capabilities & Limitations
+    parser_limitations = """### Parser Capabilities & Limitations
 
 The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
 
@@ -178,56 +182,29 @@ The following facts have been manually verified against the codebase. Your repor
 
 **Note:** The sections below tagged "Live Django" come from `django-ai-boost` runtime introspection and are fully accurate (actual DB schema, URL configs, settings). Cross-reference these against the static parser data above — when they disagree, the Live Django data is authoritative. Use the URL patterns to understand actual route structure, which the parser cannot resolve statically."""
 
-    models_list = project_map.get('models', [])
-    views_list = project_map.get('views', [])
-    concrete_model_count = sum(1 for m in models_list if not m.get('is_abstract'))
-    abstract_model_count = sum(1 for m in models_list if m.get('is_abstract'))
-    class_based_view_count = sum(1 for v in views_list if not v.get('is_function_view'))
-    function_based_view_count = sum(1 for v in views_list if v.get('is_function_view'))
+    models_list = project_map.get("models", [])
+    views_list = project_map.get("views", [])
+    concrete_model_count = sum(1 for m in models_list if not m.get("is_abstract"))
+    abstract_model_count = sum(1 for m in models_list if m.get("is_abstract"))
+    class_based_view_count = sum(1 for v in views_list if not v.get("is_function_view"))
+    function_based_view_count = sum(1 for v in views_list if v.get("is_function_view"))
 
-    PARSER_LIMITATIONS_FILLED = PARSER_LIMITATIONS.format(
+    parser_limitations_filled = parser_limitations.format(
         model_count=len(models_list),
         concrete_model_count=concrete_model_count,
         abstract_model_count=abstract_model_count,
-        serializer_count=len(project_map.get('serializers', [])),
+        serializer_count=len(project_map.get("serializers", [])),
         view_count=len(views_list),
         class_based_view_count=class_based_view_count,
         function_based_view_count=function_based_view_count,
-        live_context=live_context
+        live_context=live_context,
     )
-
-    # Single-pass fallback: used for local-only mode and cloud API failures
-    fallback_prompt = f"""Below is the full project topography map including models with their fields, serializers, views, and task definitions.
-
-{PARSER_LIMITATIONS_FILLED}
-
-## Project Topography
-```json
-{project_map_json}
-```
-
-## Instructions
-Construct a rigorous, realistic, and highly contextual 90-day onboarding strategy based strictly on the project topography above.
-
-### Mandatory Rules
-1. **CITE FILE PATHS** — Every recommendation must reference exact files and classes from the topography.
-2. **NO FABRICATED EXAMPLES** — Never reference components, patterns, or dependencies not present in the topography.
-3. **CONTEXTUAL ANCHORING** — Avoid generic engineering advice. Recommendations must explicitly target actual files, serializer patterns, views, database structures, or architectural decisions visible in the parsed map.
-4. **PRAGMATIC PRIORITIZATION** — Categorize findings by impact vs. effort. Identify immediate quick wins alongside foundational investments.
-
-### Required Report Structure
-1. Executive Summary & Core Codebase Impressions
-2. Major Technical & Structural Risks
-3. Immediate Quick Wins (Weeks 1-3)
-4. Strategic Architecture & Database Investments (Months 2-3)
-5. Observability, Telemetry, & Testing Enhancements
-6. Organizational & Workflow Improvement Recommendations"""
 
     # Two-pass reasoning: split analysis + verification for faster per-pass generation
     pass1 = f"""[Pass 1: Architecture Synthesis & Risk Discovery]
 Review this parsed structural layout of your new codebase:
 
-{PARSER_LIMITATIONS_FILLED}
+{parser_limitations_filled}
 
 ## Project Topography
 ```json
@@ -246,7 +223,7 @@ Do not structure the 90-day roadmap or write final sections yet. Just map what y
     pass2 = f"""[Pass 2: Timeline Filtering & Production Strategy]
 Review your synthesis from Pass 1.
 
-{PARSER_LIMITATIONS_FILLED}
+{parser_limitations_filled}
 
 Group, trim, and refine those insights into a concrete, realistic 90-day onboarding strategy.
 
@@ -281,18 +258,22 @@ Generate the final report matching the schema defined in your system prompt. Inc
         num_ctx=65536,
     )
 
-    context = ""
+    context_parts: list[str] = []
     for i, pass_prompt in enumerate(passes):
-        combined = f"{context}\n\n{pass_prompt}" if context else pass_prompt
+        combined = (
+            "\n\n".join([*context_parts, pass_prompt]) if context_parts else pass_prompt
+        )
         t0 = time.time()
         output = analyst.execute(combined)
-        print(f"   [Done] Pass {i+1}/{len(passes)} in {time.time() - t0:.1f}s")
-        context += f"\n\n[Pass {i+1} Output]:\n{output}"
+        print(f"   [Done] Pass {i + 1} / {len(passes)} in {time.time() - t0:.1f}s")
+        context_parts.append(f"[Pass {i + 1} Output]:\n{output}")
 
     final_analysis = output
     model_used = analyst.model_name
 
-    print(f"   [Done] Strategy analysis via {model_used} in {time.time() - pass_start:.2f}s")
+    print(
+        f"   [Done] Strategy analysis via {model_used} in {time.time() - pass_start:.2f}s"
+    )
 
     # 5. Evaluate analysis quality
     print(f"Step 4: Evaluating strategy viability via Local Judge [{LOCAL_JUDGE}]...")
@@ -300,54 +281,76 @@ Generate the final report matching the schema defined in your system prompt. Inc
 
     judge_context = f"Project Topography:\n{project_map_json[:5000]}"
     evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
-    scores = evaluator.grade_run(final_analysis, "rubrics/strategy_rubric.json", context=judge_context)
+    scores = evaluator.grade_run(
+        final_analysis, "rubrics/strategy_rubric.json", context=judge_context
+    )
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
     print(f"Strategy Reliability Scores: {scores}")
 
     # 5b. Fact-check report against known ground truth
-    print(f"Step 4b: Fact-checking report fidelity...")
+    print("Step 4b: Fact-checking report fidelity...")
 
-    BAD_PATTERNS = [
-        (r'\bCOMPLETED\b', '"COMPLETED" (should be FINISHED for JobStatuses)'),
-        (r'\bFAILED\b', '"FAILED" (should be ERROR for JobStatuses)'),
-        (r'AdminBenefactorRetrieveUpdateView', 'view name (should be AdminBenefactorRetrieveView)'),
+    bad_patterns = [
+        (r"\bCOMPLETED\b", '"COMPLETED" (should be FINISHED for JobStatuses)'),
+        (r"\bFAILED\b", '"FAILED" (should be ERROR for JobStatuses)'),
+        (
+            r"AdminBenefactorRetrieveUpdateView",
+            "view name (should be AdminBenefactorRetrieveView)",
+        ),
     ]
     fidelity_notes = []
     fidelity_penalties = 0
-    for pattern, desc in BAD_PATTERNS:
+    for pattern, desc in bad_patterns:
         matches = list(re.finditer(pattern, final_analysis))
         if matches:
             for m in matches:
-                line_num = final_analysis[:m.start()].count('\n') + 1
+                line_num = final_analysis[: m.start()].count("\n") + 1
                 fidelity_notes.append(f"  ✗ Line {line_num}: {desc}")
                 fidelity_penalties += 1
 
     # Check model count claims in the report
     model_count_patterns = [
-        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+models?\b', 'model count'),
-        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+serializers?\b', 'serializer count'),
-        (r'(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+views?\b', 'view count'),
+        (
+            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+models?\b",
+            "model count",
+        ),
+        (
+            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+serializers?\b",
+            "serializer count",
+        ),
+        (
+            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+views?\b",
+            "view count",
+        ),
     ]
-    parser_model_count = len(project_map.get('models', []))
-    parser_serializer_count = len(project_map.get('serializers', []))
-    parser_view_count = len(project_map.get('views', []))
+    parser_model_count = len(project_map.get("models", []))
+    parser_serializer_count = len(project_map.get("serializers", []))
+    parser_view_count = len(project_map.get("views", []))
     tolerance = 3
     for pattern, label in model_count_patterns:
         for m in re.finditer(pattern, final_analysis, re.IGNORECASE):
             claimed = int(m.group(1))
-            actual = {'model': parser_model_count, 'serializer': parser_serializer_count, 'view': parser_view_count}[label.split()[0]]
+            actual = {
+                "model": parser_model_count,
+                "serializer": parser_serializer_count,
+                "view": parser_view_count,
+            }[label.split()[0]]
             if abs(claimed - actual) > tolerance:
-                line_num = final_analysis[:m.start()].count('\n') + 1
-                fidelity_notes.append(f"  ⚠ Line {line_num}: Claims {claimed} {label} (parser found {actual})")
+                line_num = final_analysis[: m.start()].count("\n") + 1
+                fidelity_notes.append(
+                    f"  ⚠ Line {line_num}: Claims {claimed} {label} (parser found {actual})"
+                )
                 fidelity_penalties += 1
 
     # Check for "concrete" / "abstract" model distinction in the report
-    has_concrete_abstract = bool(re.search(r'(concrete|abstract)\s*model', final_analysis, re.IGNORECASE))
+    has_concrete_abstract = bool(
+        re.search(r"(concrete|abstract)\s*model", final_analysis, re.IGNORECASE)
+    )
     if has_concrete_abstract:
-        fidelity_notes.append(f"  ✓ Correctly distinguishes concrete vs abstract models")
+        fidelity_notes.append("  ✓ Correctly distinguishes concrete vs abstract models")
     else:
-        fidelity_notes.append(f"  ⚠ Does not distinguish concrete vs abstract models")
+        fidelity_notes.append("  ⚠ Does not distinguish concrete vs abstract models")
 
     fidelity_score = max(0, 10 - fidelity_penalties)
     if fidelity_penalties == 0:
@@ -360,36 +363,43 @@ Generate the final report matching the schema defined in your system prompt. Inc
         fidelity_rating = "Poor"
 
     fidelity_report = [
-        f"\n{'='*50}",
+        f"\n{'=' * 50}",
         f"  Report Fidelity Score: {fidelity_score}/10 — {fidelity_rating}",
         f"  Penalties: {fidelity_penalties}",
     ]
     if fidelity_notes:
         fidelity_report.append("  Details:")
         fidelity_report.extend(fidelity_notes)
-    fidelity_report.append(f"{'='*50}\n")
+    fidelity_report.append(f"{'=' * 50}\n")
     fidelity_report_str = "\n".join(fidelity_report)
     print(fidelity_report_str)
 
     # 6. Log and Export Artifacts
     print("Step 5: Archiving run data...")
-    full_scores = {**scores, "fidelity": fidelity_score, "fidelity_max": 10, "fidelity_notes": fidelity_notes}
+    full_scores = {
+        **scores,
+        "fidelity": fidelity_score,
+        "fidelity_max": 10,
+        "fidelity_notes": fidelity_notes,
+    }
     warehouse = HarnessWarehouse()
     warehouse.log_run(
         model_name=model_used,
         agent_role="Incoming Staff Engineer (90-Day Strategy)",
         raw_output=final_analysis,
-        scores=full_scores
+        scores=full_scores,
     )
 
     report_filename = "reports/staff_90_day_onboarding_roadmap.md"
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_analysis)
-        f.write(f"\n\n---\n{'-'*50}\n")
-        f.write(f"## Fidelity Check\n\n")
+        f.write(f"\n\n---\n{'-' * 50}\n")
+        f.write("## Fidelity Check\n\n")
         f.write(f"**Score:** {fidelity_score}/10 — {fidelity_rating}\n\n")
-        f.write(f"**Parser Ground Truth:** {concrete_model_count} concrete models, {abstract_model_count} abstract, {parser_serializer_count} serializers, {parser_view_count} views ({class_based_view_count} class-based, {function_based_view_count} function-based)\n\n")
+        f.write(
+            f"**Parser Ground Truth:** {concrete_model_count} concrete models, {abstract_model_count} abstract, {parser_serializer_count} serializers, {parser_view_count} views ({class_based_view_count} class-based, {function_based_view_count} function-based)\n\n"
+        )
         if fidelity_notes:
             f.write("**Issues Found:**\n\n")
             for note in fidelity_notes:
@@ -407,6 +417,7 @@ Generate the final report matching the schema defined in your system prompt. Inc
     print(f"\nReport saved to: {report_filename}")
     print(f"Fidelity Score: {fidelity_score}/10 ({fidelity_rating})")
     print(f"Total Time: {total_duration:.2f}s  Model: {model_used}")
+
 
 if __name__ == "__main__":
     main()

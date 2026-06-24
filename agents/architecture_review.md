@@ -154,4 +154,3 @@ Recommendations should:
 * favor incremental rollout strategies,
 * identify testing requirements,
 * identify rollback considerations.
-

@@ -1,116 +1,86 @@
 ## Vulnerability Findings
 
-### [HIGH] - Unauthenticated Endpoint with Empty Permission Classes
-- **Target File:** `memores/views/registration_code_handler.py`
-- **Vulnerability Type:** Authorization Gap / Unauthenticated Access
+### [HIGH] - Broken Object-Level Authorization on Sharing Code Update
+- **Target File:** `/Users/dansparkes/memores/memores-api/memores/views/app/sharing_code.py`
+- **Vulnerability Type:** BOLA / IDOR
 - **Confidence:** HIGH
-- **Evidence:** 
+- **Investigation Trace:**
+  1. Where the ID enters the system: URL path via `lookup_field: "code"` on a `RetrieveUpdateDestroyAPIView`.
+  2. Where data is fetched: Class-level `queryset: "SharingCode.objects.all"`. `get_queryset` is NOT overridden in the methods list.
+  3. Checks between input and data: The `update` (PUT) method entry shows empty `inline_auth_calls` and no `delegated_auth_calls`. `queryset_auth_chain` is `"unknown"`. DRF's default `get_object()` will query the unscoped class-level queryset, returning any `SharingCode` matching the provided `code`. No ownership or tenant filter exists.
+  4. Verdict: Any authenticated user can PUT to `/sharing_codes/{code}/` and modify another user's sharing code (e.g., change `role`, `is_active`, or `label`).
+- **Evidence:**
 ```python
-  "class_attributes": {"permission_classes": [], "authentication_classes": []}
-```
-- **Calibration Note:** Per DRF behavior, an empty `permission_classes` list defaults to `AllowAny`. No class-level or inline auth is present. This creates a direct unauthenticated entry point. If this endpoint processes external payloads (e.g., Stripe webhooks), the absence of signature verification or IP allowlisting is critical.
+# View class_attributes
+"queryset": "SharingCode.objects.all",
+"lookup_field": "code",
 
-### [MEDIUM] - Mass Assignment via `fields = '__all__'` on Sensitive Model
-- **Target File:** `memores/serializers/analysis_result_serializers.py`
-- **Vulnerability Type:** Mass Assignment / Broken Object Property Level Authorization
-- **Confidence:** MEDIUM
-- **Evidence:** 
-```python
-  "meta": {"class": "Meta", "model": "AnalysisResult", "fields": "__all__"}
+# Method entry for update
+{"n":"update","h":"PUT"}  # No inline_auth_calls, no delegated_auth_calls
+"q": "unknown"
 ```
-- **Calibration Note:** `__all__` exposes all model fields to the request body. Without explicit `read_only_fields` or view-level serializer restrictions, authenticated users can overwrite sensitive JSON payloads (`result`) during create/update operations. Risk is contingent on this serializer being used in a write-enabled view (Rule 15).
 
-### [MEDIUM] - Mass Assignment via `fields = '__all__'` on Tenant/Billing Model
-- **Target File:** `memores/serializers/benefactor_serializers.py`
-- **Vulnerability Type:** Mass Assignment / Broken Object Property Level Authorization
-- **Confidence:** MEDIUM
-- **Evidence:** 
+### [MEDIUM/UNCERTAIN] - Unscoped Admin List Querysets (Analysis Output & Journal)
+- **Target File:** `/Users/dansparkes/memores/memores-api/memores/views/admin/analysis_output.py` & `/Users/dansparkes/memores/memores-api/memores/views/admin/journal.py`
+- **Vulnerability Type:** Unscoped Data Retrieval / Potential Information Disclosure
+- **Confidence:** MEDIUM (UNCERTAIN per calibration rule 17)
+- **Investigation Trace:**
+  1. Where the ID enters the system: N/A (List endpoints).
+  2. Where data is fetched: `get_queryset` method exists but has empty `inline_auth_calls`. Class-level `queryset` is not explicitly set, defaulting to DRF's model manager or inherited state.
+  3. Checks between input and data: The `list` handler has `authorize_staff_or_superuser`, but the underlying queryset scoping is invisible to static analysis. If unscoped, these endpoints return all admin records regardless of staff role boundaries.
+  4. Verdict: Cannot confirm scoping. Flagged as UNCERTAIN per rule 17. Requires manual verification of delegated service functions or middleware context.
+- **Evidence:**
 ```python
-  "meta": {"class": "Meta", "model": "Benefactor", "fields": "__all__"}
-```
-- **Calibration Note:** Exposes `theme_data`, `billing_status`, and `stripe_customer_id` to mass assignment. Allows unauthorized modification of tenant branding, billing states, or payment gateway associations if used in a writable view context.
+# admin/analysis_output.py
+{"n":"get_queryset"}  # Empty inline_auth_calls
+"q": "unknown" (implied)
 
-### [MEDIUM] - Writable Primary Key Allowing ID Manipulation
-- **Target File:** `memores/serializers/user_course_completion_serializers.py`
-- **Vulnerability Type:** Mass Assignment / IDOR
-- **Confidence:** MEDIUM
-- **Evidence:** 
-```python
-  "fields": [{"name": "id", "type": "UUIDField", "required": false}], "meta": {"class": "Meta", "model": "UserCourseCompletion", "fields": ["id", ...]}
+# admin/journal.py
+{"n":"get_queryset"}  # Empty inline_auth_calls
+"q": "unknown" (implied)
 ```
-- **Calibration Note:** Per Rule 13, writable PKs without `read_only: true` or `required: false` are structurally unsafe. Attackers can supply arbitrary UUIDs during creation/update to hijack records or bypass ownership checks if the view relies on serializer-provided IDs rather than server-side scoping.
-
-### [MEDIUM] - Writable Foreign Key Associations Without Validation Constraints
-- **Target File:** `memores/serializers/course_serializers.py`
-- **Vulnerability Type:** Mass Assignment / Broken Object Property Level Authorization
-- **Confidence:** MEDIUM
-- **Evidence:** 
-```python
-  "fields": [
-    {"name": "course_group_ids", "type": "PrimaryKeyRelatedField", "required": false, "allow_null": true},
-    {"name": "course_provider_ids", "type": "PrimaryKeyRelatedField", "required": false, "allow_null": true},
-    {"name": "explanation_prompt_template_id", "type": "PrimaryKeyRelatedField", "required": false, "allow_null": true}
-  ]
-```
-- **Calibration Note:** Per Rule 17, writable `PrimaryKeyRelatedField` without explicit `queryset=` scoping allows arbitrary association. Requires serializer-level or view-level queryset filtering to prevent cross-tenant/group resource hijacking.
-
-### [MEDIUM] - Admin Data Endpoints Missing Staff/Superuser Enforcement
-- **Target File:** `memores/views/admin/data.py`
-- **Vulnerability Type:** Privilege Escalation / Insufficient Role-Based Access Control
-- **Confidence:** MEDIUM
-- **Evidence:** 
-```python
-  "class_attributes": {"permission_classes": ["IsAuthenticated"], "authentication_classes": ["TokenAuthentication"]},
-  "methods": [{"name": "get_unstructured_interactions", ..., "inline_auth_calls": [], ...}]
-```
-- **Calibration Note:** While `IsAuthenticated` satisfies baseline auth (Rule 1), it lacks privilege escalation controls. Any authenticated user can trigger heavy database queries or access aggregated analytics data intended for admin/staff use.
-
-### [MEDIUM] - Destructive Operations Lacking Visible Audit Trail Configuration
-- **Target File:** `memores/views/admin/content.py`, `memores/views/management/content.py`, `memores/views/app/sharing_code.py`
-- **Vulnerability Type:** Audit Compliance Gap (SOC 2)
-- **Confidence:** MEDIUM
-- **Evidence:** 
-```python
-  // Example from AdminUserCompletedCourseDestroyView
-  "methods": [{"name": "destroy", ..., "inline_auth_calls": ["authorize_superuser"], ...}]
-  // No perform_destroy override or logging calls visible in topography
-```
-- **Calibration Note:** Authorization exists (`authorize_superuser`), but DRF does not log deletions by default. Absence of `perform_destroy` overrides, signal receivers, or audit middleware fails SOC 2 CC6.1/CC7.2 requirements for tracking destructive actions.
 
 ## Protected Areas (Verified — Not Vulnerabilities)
-No protected areas identified.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/analysis_output.py` (`RetrieveAPIView`):** `queryset_auth_chain: "scoped"`. `get_queryset` contains `authorize_app_user`. Authorization cascades to all single-object operations via DRF's inherited `get_object()`.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/coach.py` (`ListCreateAPIView`):** `queryset_auth_chain: "scoped"`. `get_queryset` and `create` both contain `authorize_app_user`. Strict app-user scoping enforced.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/journal.py` (`ListCreateAPIView`):** `queryset_auth_chain: "scoped"`. `get_queryset` and `create` both contain `authorize_app_user`. Strict app-user scoping enforced.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/sharing_code.py` (`RetrieveUpdateDestroyAPIView` DELETE path):** `destroy` method contains `inline_auth_calls: ["authorize_app_user"]`. Object-level ownership verified before mutation.
+- **`/Users/dansparkes/memores/memores-api/memores/views/admin/benefactor.py` (`RetrieveUpdateAPIView`):** `get` and `update` methods contain `authorize_benefactor_scope` and `authorize_benefactor` respectively. Benefactor-scoped queries enforced.
+- **`/Users/dansparkes/memores/memores-api/memores/views/management/content.py` (`RetrieveUpdateDestroyAPIView` for Question):** `queryset_auth_chain: "scoped"`. `get_queryset` contains `authorize_creator`. Ownership filtering cascades to `update` and `destroy`.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/email_report_request.py` (`CreateAPIView`):** Class-level `queryset: "EmailReportRequest.objects.none"` intentionally breaks DRF's default lookup chain. `create` method contains `authorize_app_user`. Safe pattern.
+- **`/Users/dansparkes/memores/memores-api/memores/views/admin/admin.py` (`delete_user_data`):** Explicit `permission_classes: ["IsAuthenticated", "IsStaffOrSuperUser"]`. Staff-only destructive operation.
 
 ## Attack Path Analysis
+**Path 1: Privilege Escalation via Sharing Code Manipulation**
+- **Prerequisites:** Valid authentication token (any registered user). No special privileges required.
+- **Exploitation Steps:**
+  1. Attacker enumerates or guesses a valid `code` value for another user's sharing code (or obtains it via logs/headers).
+  2. Attacker sends `PUT /sharing_codes/{victim_code}/` with payload `{"role": "admin", "is_active": true}`.
+  3. Due to missing object-level authorization on the `update` handler, the request succeeds without verifying the authenticated user owns the code.
+  4. Attacker now controls a sharing code linked to another user's account, potentially bypassing access gates or triggering unauthorized data exports/reports.
+- **Affected Endpoints:** `/Users/dansparkes/memores/memores-api/memores/views/app/sharing_code.py` (`RetrieveUpdateDestroyAPIView` PUT method)
+- **Business Impact:** Integrity & Confidentiality compromised. Enables cross-tenant/user privilege escalation and unauthorized data sharing without audit trails or ownership validation.
+- **Mitigations:** Override `get_object()` to filter by `request.user`, or add `has_object_permission` enforcement. Example:
+```python
+def get_object(self):
+    obj = super().get_object()
+    if obj.user != self.request.user:
+        raise PermissionDenied("Cannot update another user's sharing code.")
+    return obj
+```
 
-### Path 1: Unauthenticated Webhook Abuse + Mass Assignment to Generate Active Codes
-- **Prerequisites:** Unauthenticated network access; knowledge of the registration code endpoint URL.
-- **Exploitation Steps:** 
-  1. Attacker sends crafted POST requests to `memores/views/registration_code_handler.py` (empty `permission_classes`).
-  2. If the handler maps request body directly to `RegistrationCodeCreateUpdateSerializer`, attacker exploits `fields = '__all__'` or writable fields to set arbitrary expiration dates, usage limits, or activation status.
-  3. Generates valid registration codes without rate limiting or signature verification.
-- **Affected Endpoints:** `memores/views/registration_code_handler.py`, `memores/serializers/analysis_result_serializers.py` (if serializer is shared/reused).
-- **Business Impact:** Unauthorized account creation, privilege escalation via code redemption, potential billing abuse if codes trigger paid tiers.
-- **Mitigations:** 
-  - Set `permission_classes = [permissions.AllowAny]` explicitly only if webhook signature verification is implemented in the view body.
-  - Add `read_only_fields = ['expiration_date', 'is_active', 'usage_limit']` to the serializer Meta.
-  - Implement IP allowlisting and HMAC signature validation for external payloads.
-
-### Path 2: Privilege Escalation via Writable PK + Admin Analytics Access
-- **Prerequisites:** Valid authenticated token; knowledge of `UserCourseCompletion` model structure.
-- **Exploitation Steps:** 
-  1. Attacker uses a view that accepts `UserCourseCompletionCreateUpdateSerializer` to create/update records with an arbitrary UUID in the `id` field (exploiting writable PK).
-  2. If the view lacks object-level scoping, attacker can overwrite another user's completion data or inject malicious payloads into related JSON fields.
-  3. Attacker then accesses `memores/views/admin/data.py` endpoints (`get_unstructured_interactions`, etc.) using standard `IsAuthenticated` auth to exfiltrate aggregated analytics or trigger resource-intensive queries.
-- **Affected Endpoints:** `memores/serializers/user_course_completion_serializers.py`, `memores/views/admin/data.py`
-- **Business Impact:** Data integrity corruption, privacy violation via cross-user data access, potential DoS via heavy admin analytics queries.
-- **Mitigations:** 
-  - Add `read_only: true` to the `id` field in `UserCourseCompletionCreateUpdateSerializer`.
-  - Replace `IsAuthenticated` on admin endpoints with `permissions.IsAdminUser` or a custom staff-check permission class.
-  - Enforce object-level scoping via `get_queryset()` overrides that filter by `request.user` or tenant context.
+**No Evidence-Based Attack Paths Found:**
+- Public endpoints (`payment/stripe.py`, `public/registration.py`, `public/user.py`) correctly use `AllowAny` for their intended public-facing flows. No evidence of sensitive data leakage or unvalidated webhook signature requirements in the provided topography.
+- All admin destructive operations (`destroy` on `UserCourseCompletion`, `CourseProgress`, `Question`, `AnalysisOutput`) explicitly require `authorize_superuser` or `authorize_staff_or_superuser`.
+- Serializer mass assignment is mitigated by explicit `fields` lists and `read_only_fields` on all write-capable serializers. `__all__` usage is confined to read-only or staff-gated detail views.
 
 ## Secure Areas
-- **Baseline Authentication:** Views in `memores/views/admin/data.py` and others explicitly configure `authentication_classes = ["TokenAuthentication"]`, providing token-based identity verification.
-- **Admin Authorization Gating:** Destructive operations in `memores/views/admin/content.py` utilize `authorize_superuser` inline calls, indicating role-based mutation protection is structurally present.
-- **DRF Default Safety:** Serializer patterns using `PrimaryKeyRelatedField` with `allow_null: true` and `required: false` prevent mandatory foreign key injection during creation, reducing immediate mass assignment surface (though scoping remains a concern).
-
-*Note: All findings are constrained by static topography analysis. Manual review is recommended for high-signal areas involving dynamic queryset scoping, webhook payload validation logic, and actual write-view serializer mappings.*
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/analysis_output.py`:** Scoped queryset + app user auth.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/coach.py`:** Scoped queryset + app user auth on list/create.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/journal.py`:** Scoped queryset + app user auth on list/create.
+- **`/Users/dansparkes/memores/memores-api/memores/views/admin/benefactor.py`:** Benefactor-scoped queries + staff/creator authorization helpers on retrieve/update/list.
+- **`/Users/dansparkes/memores/memores-api/memores/views/management/content.py`:** Creator/staff authorization helpers (`authorize_creator`, `authorize_content_owner_or_staff`, `authorize_staff_or_superuser`) explicitly applied to create, update, and destroy handlers. Queryset scoping enforced where applicable.
+- **`/Users/dansparkes/memores/memores-api/memores/views/admin/prompt_template.py`:** Staff-only authorization (`authorize_staff_or_superuser`) on create/update handlers. Explicit field lists prevent mass assignment.
+- **`/Users/dansparkes/memores/memores-api/memores/views/admin/user.py`:** Staff/superuser authorization (`authorize_staff_or_superuser`) on profile update and retrieval. Explicit `read_only_fields` applied to serializers.
+- **`/Users/dansparkes/memores/memores-api/memores/serializers/`:** All write-capable serializers use explicit `fields` lists rather than `__all__`. `read_only_fields` correctly applied to prevent mass assignment of sensitive identifiers (`id`, `user_id`, `timestamp`). No writable nested serializers detected that could bypass field-level controls.
+- **`/Users/dansparkes/memores/memores-api/memores/views/app/email_report_request.py`:** Intentional `.none()` queryset pattern combined with explicit `authorize_app_user` on create prevents unauthorized data access or injection via default DRF lookup chains.

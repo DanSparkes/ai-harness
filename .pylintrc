@@ -1,0 +1,83 @@
+[MAIN]
+persistent=no
+jobs=4
+
+[MESSAGES CONTROL]
+disable=all
+enable=trailing-comma-tuple,
+       # [func_that_updates(obj) for obj in iter]
+       expression-not-assigned,
+       # mutable parameters: def a(x={}): pass
+       dangerous-default-value,
+       # `except:`
+       bare-except,
+       # Returning a value in a generator, works only on 3.3+
+       return-arg-in-generator,
+       # Don't return values from __init__
+       return-in-init,
+       # __slots__ is something else than an iterable
+       invalid-slots-object,
+       # Setting a value that's not in __slots__
+       assigning-non-slot,
+       # Some value in __slots__ is not a string
+       invalid-slots,
+       # Defining a value in __all__ that is just not there!
+       undefined-all-variable,
+       # Not handling more specific to less specific in except handlers
+       bad-except-order,
+       # We should raise NotImplementedError, not NotImplemented
+       notimplemented-raised,
+       # Catching something that is not an exception
+       catching-non-exception,
+       # Most likely we call super() with the parent class as the first argument
+       bad-super-call,
+       # if: else: that can be just a bool(...) call
+       simplifiable-if-statement,
+       # An argument value gets redefined in a function scope
+       redefined-argument-from-local,
+       # having duplicate keys in a dictionary
+       duplicate-key,
+       confusing-with-statement,
+       # if False: can just be removed or changed to gargoyle switches
+       using-constant-test,
+       # asserts on tuple will always be true
+       assert-on-tuple,
+       # Calling super() when the method can just be removed (e.g does the same thing as the parent method)
+       useless-super-delegation,
+       duplicate-except,
+       boolean-datetime,
+       # list = [...] # overriding the list() builtin
+       redefined-builtin,
+       # what it says on the tin can
+       unused-import,
+       # When using type() == for comparing types. Should use isinstance instead.
+       unidiomatic-typecheck,
+       # What it says on the tin can
+       undefined-variable,
+       # What it says on the tin can,
+       anomalous-unicode-escape-in-string,
+       # Wrong usage of bashslash in a non-raw string.
+       anomalous-backslash-in-string,
+       syntax-error,
+       # Don't use `is` to compare objects unless you know what you do
+       literal-comparison,
+       # Finds unreachable code
+       unreachable,
+       # Attempting to use a variable before it gets assigned
+       used-before-assignment,
+       # Disallow multiple function names (useful to prevent unit test methods that get hidden)
+       function-redefined
+
+[REPORTS]
+msg-template={path}:{line}:{column}: {msg_id}: {msg} ({symbol})
+score=no
+reports=no
+
+[FORMAT]
+max-line-length=888
+
+[SIMILARITIES]
+min-similarity-lines=10
+ignore-comments=yes
+ignore-docstrings=yes
+ignore-imports=yes

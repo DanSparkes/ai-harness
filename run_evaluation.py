@@ -1,26 +1,29 @@
-import os
 import json
+import os
 import time
-from core.parser import DjangoTopographer
+
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
-from core.warehouse import HarnessWarehouse
 from core.mcp_orchestrator import init_orchestrator
-
-os.environ.setdefault("OLLAMA_MLX", "1")
+from core.parser import DjangoTopographer
+from core.warehouse import HarnessWarehouse
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-CLOUD_MODEL           = "gemini-2.5-flash"
-LOCAL_MODEL           = "qwen3.6:latest"
+CLOUD_MODEL = "gemini-2.5-flash"
+LOCAL_MODEL = "qwen3.6:latest"
 
-REASONING_ARCHITECT   = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/openai" if USE_GEMINI else "http://localhost:11434"
-ARCHITECT_API_KEY     = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
+ARCHITECT_API_BASE = (
+    "https://generativelanguage.googleapis.com/v1beta/openai"
+    if USE_GEMINI
+    else "http://localhost:11434"
+)
+ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
-FALLBACK_REVIEWER     = "gemini-2.5-flash"
-HEAVY_REVIEWER        = "deepseek-r1:14b"
-LOCAL_JUDGE           = "qwen2.5-coder:14b"
+FALLBACK_REVIEWER = "gemini-2.5-flash"
+HEAVY_REVIEWER = "deepseek-r1:14b"
+LOCAL_JUDGE = "qwen2.5-coder:14b"
 
 TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
@@ -51,6 +54,7 @@ def build_mcp_context_block() -> str:
         parts.append(f"=== Architectural Rules ===\n{memory}")
     return "\n\n".join(parts)
 
+
 def main():
     is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
@@ -58,12 +62,12 @@ def main():
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
-    print(f"{'='*60}")
-    print(f"Launching Architecture Review Engine (Hybrid Mode)")
+    print(f"{'=' * 60}")
+    print("Launching Architecture Review Engine (Hybrid Mode)")
     print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local Judge      : {LOCAL_JUDGE}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     start_time = time.time()
 
@@ -83,9 +87,9 @@ def main():
     if not os.path.exists(persona_path):
         print(f"Error: System prompt missing at {persona_path}")
         return
-    with open(persona_path, "r", encoding="utf-8") as f:
+    with open(persona_path, encoding="utf-8") as f:
         system_agent_prompt = f.read()
-    print(f"   [Done] Persona loaded")
+    print("   [Done] Persona loaded")
 
     # 2b. Initialize MCP workbench for richer context
     print("Step 2b: Initializing MCP workbench...")
@@ -94,12 +98,14 @@ def main():
     if orch:
         print("   [Done] MCP workbench active (git context + memory recall)\n")
     else:
-        print("   [Skipped] No MCP config found. Use MCP_CONFIG env var or mcp_config.json\n")
+        print(
+            "   [Skipped] No MCP config found. Use MCP_CONFIG env var or mcp_config.json\n"
+        )
 
     # 3. Build prompt context
-    project_map_json = json.dumps(project_map, indent=2, default=str)
+    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
 
-    PARSER_LIMITATIONS = f"""### Parser Capabilities & Limitations
+    parser_limitations = f"""### Parser Capabilities & Limitations
 
 The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
 
@@ -139,38 +145,12 @@ Based on parsing, this project contains:
 ### MCP-Augmented Context (Live Project State)
 {mcp_block}"""
 
-    # Single-pass fallback: used for local-only mode and cloud API failures
-    fallback_prompt = f"""Below is the full project topography map.
-
-{PARSER_LIMITATIONS}
-
-## Project Topography
-```json
-{project_map_json}
-```
-
-## Instructions
-Conduct a Staff-level architecture review. Follow the system prompt's core focus areas and operational rules.
-
-### Mandatory Rules
-1. **CITE FILE PATHS** — Every observation must reference exact files and classes from the topography.
-2. **NO FABRICATED EXAMPLES** — Never reference components not present in the topography.
-3. **CONFIDENCE LEVELS** — Tag every finding as Confirmed / Plausible / Speculative. Only Confirmed findings may appear in final recommendations.
-4. **PRAGMATIC DJANGO** — Favor incremental, Django-native solutions. Avoid introducing service layers, DTOs, or app decomposition unless evidence shows current approach is failing.
-5. **EVIDENCE VS INTERPRETATION** — Separate what the code says from what you infer.
-
-### Required Report Structure
-1. Executive Summary
-2. Top 5 Prioritized Improvements
-3. Deferred Opportunities
-4. Concrete Implementation Suggestions"""
-
     # Build passes
     pass_templates = [
         f"""[Pass 1: Repository Observation]
 Analyze this Django repository topography:
 
-{PARSER_LIMITATIONS}
+{parser_limitations}
 
 ## Project Topography
 ```json
@@ -197,11 +177,10 @@ Observation:
 Evidence:
 Operational Significance:
 Confidence:""",
-
         f"""[Pass 2: Evidence Validation]
 Review all observations from Pass 1.
 
-{PARSER_LIMITATIONS}
+{parser_limitations}
 
 Categorize each observation as:
 - Confirmed
@@ -231,7 +210,6 @@ Category:
 Evidence:
 Reasoning Chain:
 Likely Impact:""",
-
         """[Pass 3: Staff Prioritization]
 Assume you are the Staff Engineer responsible for this system.
 
@@ -253,7 +231,6 @@ For each initiative provide:
 - Why it was selected,
 - Why alternatives were deferred,
 - Estimated implementation effort.""",
-
         """[Pass 4: Executive Reporting]
 Generate the final report.
 
@@ -289,17 +266,21 @@ Focus on pragmatic Django evolution.""",
         num_ctx=65536,
     )
 
-    context = ""
+    context_parts: list[str] = []
     for i, pass_prompt in enumerate(passes):
-        combined = f"{context}\n\n{pass_prompt}" if context else pass_prompt
+        combined = (
+            "\n\n".join([*context_parts, pass_prompt]) if context_parts else pass_prompt
+        )
         t0 = time.time()
         output = architect.execute(combined)
-        print(f"   [Done] Pass {i+1}/{len(passes)} in {time.time() - t0:.1f}s")
-        context += f"\n\n[Pass {i+1} Output]:\n{output}"
+        print(f"   [Done] Pass {i + 1} / {len(passes)} in {time.time() - t0:.1f}s")
+        context_parts.append(f"[Pass {i + 1} Output]:\n{output}")
 
     draft_report = output
     model_used = architect.model_name
-    print(f"   [Done] Architecture review via {model_used} in {time.time() - pass_start:.2f}s")
+    print(
+        f"   [Done] Architecture review via {model_used} in {time.time() - pass_start:.2f}s"
+    )
 
     # 5. Adversarial review
     print(f"Step 4: Running adversarial review via [{HEAVY_REVIEWER}]...")
@@ -323,7 +304,7 @@ For each criticism provide:
 - Confidence,
 - Supporting rationale.
 
-{PARSER_LIMITATIONS}
+{parser_limitations}
 
 Report:
 
@@ -331,10 +312,7 @@ Report:
 """
 
     adversary = Agent(
-        name="Adversary",
-        system_prompt="",
-        model_name=HEAVY_REVIEWER,
-        num_ctx=32768,
+        name="Adversary", system_prompt="", model_name=HEAVY_REVIEWER, num_ctx=32768
     )
     critique = adversary.execute(adversarial_prompt)
     print(f"   [Done] Adversarial review completed in {time.time() - adv_start:.2f}s")
@@ -371,7 +349,9 @@ Original Report:
 
     judge_context = f"Project Topography:\n{project_map_json[:5000]}"
     evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
-    scores = evaluator.grade_run(final_report, "rubrics/architecture_rubric.json", context=judge_context)
+    scores = evaluator.grade_run(
+        final_report, "rubrics/architecture_rubric.json", context=judge_context
+    )
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
     print(f"Architecture Review Reliability Scores: {scores}")
@@ -383,7 +363,7 @@ Original Report:
         model_name=model_used,
         agent_role="Staff Architecture Review",
         raw_output=final_report,
-        scores=scores
+        scores=scores,
     )
 
     report_filename = "reports/staff_architecture_review.md"
@@ -402,6 +382,7 @@ Original Report:
     total_duration = time.time() - start_time
     print(f"\nReport saved to: {report_filename}")
     print(f"Total Time: {total_duration:.2f}s  Model: {model_used}")
+
 
 if __name__ == "__main__":
     main()

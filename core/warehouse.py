@@ -1,9 +1,11 @@
-import sqlite3
 import json
+import sqlite3
 from datetime import datetime
+
 
 class HarnessWarehouse:
     """Manages storage and historical analysis of model evaluation runs."""
+
     def __init__(self, db_path: str = "scorecards/evaluation_history.db"):
         self.db_path = db_path
         self._init_db()
@@ -26,6 +28,12 @@ class HarnessWarehouse:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO evaluation_runs (timestamp, model_name, agent_role, raw_output, scores) VALUES (?, ?, ?, ?, ?)",
-                (datetime.utcnow().isoformat(), model_name, agent_role, raw_output, json.dumps(scores))
+                (
+                    datetime.utcnow().isoformat(),
+                    model_name,
+                    agent_role,
+                    raw_output,
+                    json.dumps(scores),
+                ),
             )
             conn.commit()

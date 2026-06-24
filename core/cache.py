@@ -1,8 +1,8 @@
 import hashlib
 import json
-import os
-import time
 import threading
+import time
+from contextlib import suppress
 from pathlib import Path
 
 CACHE_DIR = Path.home() / ".cache" / "local-harness"
@@ -35,9 +35,13 @@ def get_git_head(repo_path: str) -> str | None:
             return cached[0]
     try:
         import subprocess
+
         r = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=repo_path, capture_output=True, text=True, timeout=10
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if r.returncode == 0:
             head = r.stdout.strip()
@@ -73,18 +77,15 @@ def get(key: str, max_age: float | None = 86400) -> object | None:
         return None
 
 
-def set(key: str, data: object) -> None:
+def set(key: str, data: object) -> None:  # pylint: disable=redefined-builtin
     entry = {"_ts": time.time(), "_data": data, "_key": key}
     with _local_lock:
         _local_cache[key] = entry
     _ensure_cache_dir()
     path = _cache_path(key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(path, "w") as f:
-            f.write(json.dumps(entry, default=str, ensure_ascii=False))
-    except Exception:
-        pass
+    with suppress(Exception), open(path, "w") as f:
+        f.write(json.dumps(entry, default=str, ensure_ascii=False))
 
 
 def invalidate(key_prefix: str | None = None) -> None:
@@ -92,6 +93,7 @@ def invalidate(key_prefix: str | None = None) -> None:
         with _local_lock:
             _local_cache.clear()
         import shutil
+
         if CACHE_DIR.exists():
             shutil.rmtree(str(CACHE_DIR))
         return

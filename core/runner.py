@@ -1,10 +1,19 @@
-import requests
-import json
 import time
+
+import requests
+
 
 class StatefulHarnessRunner:
     """Manages multi-pass execution against local Ollama or cloud OpenAI-compatible models."""
-    def __init__(self, model_name: str, base_url: str = "http://localhost:11434", api_key: str = None, fallback_model_name: str = None, num_ctx: int = 65536):
+
+    def __init__(
+        self,
+        model_name: str,
+        base_url: str = "http://localhost:11434",
+        api_key: str | None = None,
+        fallback_model_name: str | None = None,
+        num_ctx: int = 65536,
+    ):
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name or model_name
         self.api_key = api_key
@@ -22,26 +31,36 @@ class StatefulHarnessRunner:
     def unload(self):
         pass
 
-    def _call_with_retry(self, url: str, payload: dict, headers: dict, max_retries: int = 5, base_delay: float = 2.0) -> requests.Response:
+    def _call_with_retry(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict,
+        max_retries: int = 5,
+        base_delay: float = 2.0,
+    ) -> requests.Response:
         retry_codes = {429, 503}
         for attempt in range(max_retries + 1):
             response = requests.post(url, json=payload, headers=headers)
             if response.status_code not in retry_codes:
                 return response
             if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
+                delay = base_delay * (2**attempt)
                 code = response.status_code
-                print(f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})...")
+                print(
+                    f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})..."
+                )
                 time.sleep(delay)
         return response
 
-    def execute_sequence(self, system_prompt: str, passes: list[str], fallback_prompt: str = None) -> list[dict]:
+    def execute_sequence(
+        self, system_prompt: str, passes: list[str], fallback_prompt: str | None = None
+    ) -> list[dict]:
         messages = [{"role": "system", "content": system_prompt}]
-        execution_history = []
+        execution_history: list[dict] = []
 
         for idx, pass_prompt in enumerate(passes):
-            if self.is_cloud or not execution_history:
-                messages.append({"role": "user", "content": pass_prompt})
+            messages.append({"role": "user", "content": pass_prompt})
 
             headers = {"Content-Type": "application/json"}
             if self.is_cloud and self.api_key:
@@ -55,21 +74,22 @@ class StatefulHarnessRunner:
                     "messages": messages,
                     "stream": False,
                     "temperature": temperature,
-                    "top_p": 0.9
+                    "top_p": 0.9,
                 }
             else:
                 payload = {
                     "model": self.model_name,
                     "messages": messages,
                     "stream": False,
+                    "keep_alive": "0",
                     "options": {
                         "num_ctx": self.num_ctx,
                         "temperature": temperature,
-                        "top_p": 0.9
-                    }
+                        "top_p": 0.9,
+                    },
                 }
 
-            print(f"   --- Pass {idx+1}/{len(passes)} ---")
+            print(f"   --- Pass {idx + 1} / {len(passes)} ---")
             pass_t0 = time.time()
 
             if self.is_cloud:
@@ -78,23 +98,30 @@ class StatefulHarnessRunner:
                 response = requests.post(self.api_url, json=payload, headers=headers)
 
             if self.is_cloud and response.status_code in (429, 503):
-                label = "429" if response.status_code == 429 else "503 (retries exhausted)"
-                print(f"   \u26a0\ufe0f Cloud API unavailable ({label}). Falling back to local Ollama...")
+                label = (
+                    "429" if response.status_code == 429 else "503 (retries exhausted)"
+                )
+                print(
+                    f"   \u26a0\ufe0f Cloud API unavailable ({label}). Falling back to local Ollama..."
+                )
                 self.is_cloud = False
                 self.api_url = "http://localhost:11434/api/chat"
                 self.model_name = self.fallback_model_name
 
-                fb_messages = [{"role": "system", "content": system_prompt},
-                               {"role": "user", "content": fallback_prompt or pass_prompt}]
+                fb_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": fallback_prompt or pass_prompt},
+                ]
                 payload = {
                     "model": self.model_name,
                     "messages": fb_messages,
                     "stream": False,
+                    "keep_alive": "0",
                     "options": {
                         "num_ctx": self.num_ctx,
                         "temperature": temperature,
-                        "top_p": 0.9
-                    }
+                        "top_p": 0.9,
+                    },
                 }
                 headers = {"Content-Type": "application/json"}
                 response = requests.post(self.api_url, json=payload, headers=headers)
@@ -103,13 +130,17 @@ class StatefulHarnessRunner:
                 response_data = response.json()
                 assistant_response = response_data.get("message", {}).get("content", "")
                 if not assistant_response:
-                    assistant_response = "# Basic Diff Scan\n\nUnable to generate review.\n"
+                    assistant_response = (
+                        "# Basic Diff Scan\n\nUnable to generate review.\n"
+                    )
 
-                execution_history.append({
-                    "pass_index": idx + 1,
-                    "prompt": "(fallback)",
-                    "output": assistant_response
-                })
+                execution_history.append(
+                    {
+                        "pass_index": idx + 1,
+                        "prompt": "(fallback)",
+                        "output": assistant_response,
+                    }
+                )
                 break
 
             response.raise_for_status()
@@ -120,16 +151,22 @@ class StatefulHarnessRunner:
             else:
                 assistant_response = response_data.get("message", {}).get("content", "")
                 if not assistant_response:
-                    print(f"   \u26a0\ufe0f LLM returned empty or unexpected response")
-                    assistant_response = "# Basic Diff Scan\n\nUnable to generate review.\n"
+                    print("   \u26a0\ufe0f LLM returned empty or unexpected response")
+                    assistant_response = (
+                        "# Basic Diff Scan\n\nUnable to generate review.\n"
+                    )
 
             elapsed = time.time() - pass_t0
-            print(f"   [Done] Pass {idx+1} in {elapsed:.1f}s  ({len(assistant_response)} chars)")
+            print(
+                f"   [Done] Pass {idx + 1} in {elapsed:.1f}s  ({len(assistant_response)} chars)"
+            )
 
-            execution_history.append({
-                "pass_index": idx + 1,
-                "prompt": pass_prompt,
-                "output": assistant_response
-            })
+            execution_history.append(
+                {
+                    "pass_index": idx + 1,
+                    "prompt": pass_prompt,
+                    "output": assistant_response,
+                }
+            )
 
         return execution_history

@@ -2,10 +2,14 @@
 import subprocess
 from pathlib import Path
 
-from core.cache import get as cache_get, set as cache_set, make_key, get_git_head
+from core.cache import get as cache_get
+from core.cache import get_git_head, make_key
+from core.cache import set as cache_set
+
 
 class GitDiffProvider:
     """Extracts line-by-line diffs and modified file manifests, strictly excluding fixture noise."""
+
     def __init__(self, repo_dir: str):
         self.repo_dir = Path(repo_dir).resolve()
 
@@ -14,7 +18,10 @@ class GitDiffProvider:
         try:
             subprocess.run(
                 ["git", "rev-parse", "--verify", ref],
-                cwd=self.repo_dir, capture_output=True, text=True, check=True
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             return ref
         except subprocess.CalledProcessError:
@@ -23,7 +30,10 @@ class GitDiffProvider:
         try:
             subprocess.run(
                 ["git", "rev-parse", "--verify", origin_ref],
-                cwd=self.repo_dir, capture_output=True, text=True, check=True
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             print(f"   [Git] '{ref}' not found locally, using '{origin_ref}'")
             return origin_ref
@@ -33,16 +43,18 @@ class GitDiffProvider:
     def _run_git(self, args: list[str]) -> str:
         try:
             result = subprocess.run(
-                ["git"] + args,
+                ["git", *args],
                 cwd=self.repo_dir,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
             )
             return result.stdout
         except subprocess.CalledProcessError as e:
             print(f"Git execution error: {e.stderr}")
-            raise RuntimeError(f"Failed to execute git command: {' '.join(args)}")
+            raise RuntimeError(
+                f"Failed to execute git command: {' '.join(args)}"
+            ) from e
 
     def get_diff(self, target_branch: str, source_branch: str) -> str:
         """Returns the raw patch diff, explicitly skipping any fixtures folders and uv.lock."""
@@ -53,17 +65,19 @@ class GitDiffProvider:
             key = make_key("git:get_diff", str(self.repo_dir), head, target, source)
             cached = cache_get(key, max_age=86400)
             if cached is not None:
-                return cached
-        result = self._run_git([
-            "diff",
-            f"{target}...{source}",
-            "--",
-            ".",
-            ":(exclude)**/fixtures/**",
-            ":(exclude)fixtures/**",
-            ":(exclude)uv.lock",
-            ":(exclude)*.md"
-        ])
+                return cached  # type: ignore[return-value]
+        result = self._run_git(
+            [
+                "diff",
+                f"{target}...{source}",
+                "--",
+                ".",
+                ":(exclude)**/fixtures/**",
+                ":(exclude)fixtures/**",
+                ":(exclude)uv.lock",
+                ":(exclude)*.md",
+            ]
+        )
         if head:
             cache_set(key, result)
         return result
@@ -74,21 +88,25 @@ class GitDiffProvider:
         source = self._resolve_ref(source_branch)
         head = get_git_head(str(self.repo_dir))
         if head:
-            key = make_key("git:get_changed_files", str(self.repo_dir), head, target, source)
+            key = make_key(
+                "git:get_changed_files", str(self.repo_dir), head, target, source
+            )
             cached = cache_get(key, max_age=86400)
             if cached is not None:
-                return cached
-        output = self._run_git([
-            "diff",
-            "--name-only",
-            f"{target}...{source}",
-            "--",
-            ".",
-            ":(exclude)**/fixtures/**",
-            ":(exclude)fixtures/**",
-            ":(exclude)uv.lock",
-            ":(exclude)*.md"
-        ])
+                return cached  # type: ignore[return-value]
+        output = self._run_git(
+            [
+                "diff",
+                "--name-only",
+                f"{target}...{source}",
+                "--",
+                ".",
+                ":(exclude)**/fixtures/**",
+                ":(exclude)fixtures/**",
+                ":(exclude)uv.lock",
+                ":(exclude)*.md",
+            ]
+        )
         result = [line.strip() for line in output.splitlines() if line.strip()]
         if head:
             cache_set(key, result)
