@@ -282,7 +282,7 @@ class MCPClient:
         self._capabilities: dict[str, Any] = {}
         self._tools_cache: list[dict[str, Any]] | None = None
 
-    def connect(self, init_timeout: float = 120.0):
+    def connect(self, init_timeout: float = 15.0):
         transport_type = self.config.get("type", "stdio")
         if transport_type == "stdio":
             command = self.config["command"]

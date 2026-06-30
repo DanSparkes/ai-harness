@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -12,7 +13,7 @@ from core.warehouse import HarnessWarehouse
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
 CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "qwen3.6:latest"
+LOCAL_MODEL = "ornith:35b"
 
 REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
 ARCHITECT_API_BASE = (
@@ -24,19 +25,43 @@ ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER = "gemini-2.5-flash"
 HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "qwen2.5-coder:14b"
+LOCAL_JUDGE = "qwen3-coder:latest"
 
-TARGET_DJANGO_PROJECT = "/Users/dansparkes/memores/memores-api"
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
 
 _mcp_orch = None
 
 
-def init_mcp():
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Staff Onboarding Evaluation Engine")
+    parser.add_argument(
+        "--repo",
+        "-r",
+        default=None,
+        help="Path to the target repository (overrides TARGET_REPO env var)",
+    )
+    parser.add_argument(
+        "--project-context",
+        "-c",
+        default=None,
+        help="Path to a project-specific context file (markdown) with domain knowledge",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        "-m",
+        default=None,
+        help="Path to MCP server config file (overrides MCP_CONFIG env var)",
+    )
+    return parser.parse_args()
+
+
+def init_mcp(repo_path: str | None = None, config_path: str | None = None):
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
-    orch = init_orchestrator(MCP_CONFIG_PATH, TARGET_DJANGO_PROJECT)
+    cfg_path: str = config_path or MCP_CONFIG_PATH
+    path: str = repo_path or os.environ.get("TARGET_REPO") or os.getcwd()
+    orch = init_orchestrator(cfg_path, path)
     if orch:
         _mcp_orch = orch
     return orch
@@ -46,14 +71,7 @@ def build_mcp_context() -> str:
     orch = _mcp_orch
     if not orch:
         return ""
-    parts = []
-    git_block = orch.build_git_context(max_count=10)
-    if git_block:
-        parts.append(git_block)
-    memory = orch.recall_tagged(tags=["architectural_rule"])
-    if memory:
-        parts.append(f"Architectural Rules:\n{memory}")
-    return "\n\n".join(parts)
+    return orch.build_mcp_context_block(tags=["architectural_rule"])
 
 
 def build_django_live_context() -> tuple[str, dict]:
@@ -71,15 +89,25 @@ def build_codebase_memory_context() -> tuple[str, dict]:
 
 
 def main():
+    args = parse_arguments()
+
+    target_repo = args.repo or os.environ.get("TARGET_REPO")
+    mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
+
     is_local_mode = not ARCHITECT_API_KEY
     if not is_local_mode and not ARCHITECT_API_KEY:
         print("Error: USE_GEMINI=true requires GEMINI_API_KEY to be set.")
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
+    if not target_repo:
+        print("Error: No target repository specified.")
+        print("Set TARGET_REPO env var or pass --repo /path/to/project")
+        return
+
     print(f"{'=' * 60}")
     print("Launching Staff Onboarding Engine (Hybrid Mode)")
-    print(f"Target Project   : {TARGET_DJANGO_PROJECT}")
+    print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local Judge      : {LOCAL_JUDGE}")
     print(f"{'=' * 60}\n")
@@ -89,7 +117,7 @@ def main():
     # 1. Parse Project Topography
     print("Step 1: Parsing project topography...")
     step_start = time.time()
-    topographer = DjangoTopographer(TARGET_DJANGO_PROJECT)
+    topographer = DjangoTopographer(target_repo)
     project_map = topographer.scan_project()
     print(f"   [Done] Topography scan in {time.time() - step_start:.2f}s")
 
@@ -108,7 +136,7 @@ def main():
 
     # 2b. Initialize MCP workbench for richer context
     print("Step 2b: Initializing MCP workbench...")
-    orch = init_mcp()
+    orch = init_mcp(repo_path=target_repo, config_path=mcp_config_path)
     mcp_block = build_mcp_context() if orch else ""
     django_block, _django_data = build_django_live_context() if orch else ("", {})
     cm_block, _cm_data = build_codebase_memory_context() if orch else ("", {})
@@ -116,7 +144,7 @@ def main():
     if orch:
         statuses = []
         if mcp_block:
-            statuses.append("git + memory")
+            statuses.append("tools + git + memory")
         if django_block:
             statuses.append("django-ai-boost")
         if cm_block:

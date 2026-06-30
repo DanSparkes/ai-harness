@@ -6,7 +6,7 @@ import time
 from core.git_provider import GitDiffProvider
 from core.judge import AutomatedEvaluator
 from core.mcp_orchestrator import init_orchestrator
-from core.parser import DjangoTopographer
+from core.parser import DjangoTopographer, minify_markdown
 from core.runner import StatefulHarnessRunner
 from core.warehouse import HarnessWarehouse
 
@@ -17,7 +17,7 @@ from core.warehouse import HarnessWarehouse
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
 CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "qwen3.6:latest"
+LOCAL_MODEL = "ornith:35b"
 
 REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
 ARCHITECT_API_BASE = (
@@ -31,23 +31,21 @@ ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 FALLBACK_REVIEWER = "gemini-2.5-flash"
 # Local Judge: Scores the review against a rubric
 HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "qwen2.5-coder:14b"
+LOCAL_JUDGE = "qwen3-coder:latest"
 # ==============================================================================
 
-TARGET_DJANGO_PROJECT = os.environ.get(
-    "TARGET_REPO", "/Users/dansparkes/memores/memores-api"
-)
+TARGET_REPO = os.environ.get("TARGET_REPO")
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.python.json")
 
 _mcp_orch = None
 
 
-def init_mcp(repo_path=None, config_path=None):
+def init_mcp(repo_path: str | None = None, config_path: str | None = None):
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
     cfg_path = config_path or MCP_CONFIG_PATH
-    path = repo_path or TARGET_DJANGO_PROJECT
+    path = repo_path or TARGET_REPO or os.getcwd()
     orch = init_orchestrator(cfg_path, path)
     if orch:
         _mcp_orch = orch
@@ -58,14 +56,7 @@ def build_mcp_context() -> str:
     orch = _mcp_orch
     if not orch:
         return ""
-    parts = []
-    git_block = orch.build_git_context(max_count=15)
-    if git_block:
-        parts.append(git_block)
-    memory = orch.recall_tagged(tags=["code_review", "architectural_rule"])
-    if memory:
-        parts.append(f"Review Context:\n{memory}")
-    return "\n\n".join(parts)
+    return orch.build_mcp_context_block(tags=["code_review", "architectural_rule"])
 
 
 def parse_arguments():
@@ -110,7 +101,7 @@ def main():
     target_branch = args.target
     source_branch = args.source
 
-    target_repo = args.repo or os.environ.get("TARGET_REPO", TARGET_DJANGO_PROJECT)
+    target_repo = args.repo or os.environ.get("TARGET_REPO", TARGET_REPO)
     mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
 
     is_local_mode = not ARCHITECT_API_KEY
@@ -119,12 +110,18 @@ def main():
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
 
+    if not target_repo:
+        print("Error: No target repository specified.")
+        print("Set TARGET_REPO env var or pass --repo /path/to/project")
+        return
+
     print(f"{'=' * 60}")
     print("Launching Local Code Review Engine (Hybrid Mode)")
     print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local JSON Judge : {LOCAL_JUDGE}")
     print(f"Review Delta     : {target_branch} <--- {source_branch}")
+    print("Review Lens      : Ponytail concision + reuse constraints active")
     print(f"{'=' * 60}\n")
 
     start_time = time.time()
@@ -162,7 +159,7 @@ def main():
     orch = init_mcp(repo_path=target_repo, config_path=mcp_config_path)
     mcp_block = build_mcp_context() if orch else ""
     if orch:
-        print("   [Done] MCP workbench active (git context + memory recall)\n")
+        print("   [Done] MCP workbench active (tools + git + memory)\n")
     else:
         print("   [Skipped] No MCP config found\n")
 
@@ -172,7 +169,7 @@ def main():
         ctx_path = args.project_context
         if os.path.exists(ctx_path):
             with open(ctx_path, encoding="utf-8") as f:
-                project_context_block = f.read()
+                project_context_block = minify_markdown(f.read())
             print(f"   [Loaded] Project context from {ctx_path}\n")
         else:
             print(f"   [Warning] Project context file not found: {ctx_path}\n")
@@ -225,6 +222,12 @@ Review the diff above. For each changed file, evaluate whether the changes are c
 5. **NO GENERIC ADVICE** — Do not give generic Django/python architecture lectures. Only comment on what the diff actually changes.
 6. **FILE-BY-FILE** — Cover each changed file in order. For each one: (a) what changed, (b) is it correct, (c) any issues found.
 7. **TEST COVERAGE & VALIDITY** — For every changed source file, check that corresponding test files exist and adequately cover the new/modified logic. Flag tests that use vague or tautological assertions (e.g., `assert response.status_code == 200` without checking response body, or `assert True`). Tests must assert meaningful outcomes — request that tests validate actual state changes, error messages, or data transformations.
+8. **CONCISION & REUSE (Ponytail lens)** — Flag over-engineering in the diff:
+   - Could existing codebase utilities or helpers have been reused instead of writing new code?
+   - Could stdlib or an already-installed package have handled this without a new dependency?
+   - Does the change add speculative abstractions or future-proofing not required by the feature?
+   - Is the diff unnecessarily large for what it accomplishes?
+   - Flag with "OVER-ENGINEERED" where applicable, noting what could be simplified.
 
 Format as markdown with file paths as headings."""
 

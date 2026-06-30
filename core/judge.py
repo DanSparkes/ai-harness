@@ -14,7 +14,7 @@ class AutomatedEvaluator:
 
     def __init__(
         self,
-        judge_model: str = "qwen2.5-coder:14b",
+        judge_model: str = "qwen3-coder:latest",
         base_url: str = "http://localhost:11434",
     ):
         self.judge_model = judge_model

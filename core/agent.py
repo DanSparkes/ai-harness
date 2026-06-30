@@ -55,7 +55,7 @@ class Skill:
 class Agent:
     name: str
     system_prompt: str
-    model_name: str = "qwen3.6:latest"
+    model_name: str = "ornith:35b"
     base_url: str = "http://localhost:11434"
     api_key: str | None = None
     num_ctx: int = 65536
@@ -75,7 +75,11 @@ class Agent:
         return f"{self.base_url}/api/chat"
 
     def execute(
-        self, task: str, skills: dict[str, Skill] | None = None, stream: bool = False
+        self,
+        task: str,
+        skills: dict[str, Skill] | None = None,
+        stream: bool = False,
+        temperature: float | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
@@ -85,7 +89,10 @@ class Agent:
         if self.is_cloud and self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        temperature = 0.0 if "qwen" in self.model_name else 0.4
+        if temperature is not None:
+            _temperature = temperature
+        else:
+            _temperature = 0.0 if "qwen" in self.model_name else 0.4
         tools = None
         skill_map = {}
         if skills:
@@ -94,7 +101,7 @@ class Agent:
 
         # Streaming mode for code generation (local Ollama only, no tool calls)
         if stream and not self.is_cloud and not skills:
-            return self._execute_stream(messages, headers, temperature)
+            return self._execute_stream(messages, headers, _temperature)
 
         max_tool_rounds = 10
 
@@ -115,7 +122,7 @@ class Agent:
                     "model": self.model_name,
                     "messages": messages,
                     "stream": False,
-                    "temperature": temperature,
+                    "temperature": _temperature,
                     "top_p": 0.9,
                 }
             else:
@@ -126,14 +133,14 @@ class Agent:
                     "keep_alive": "0",
                     "options": {
                         "num_ctx": self.num_ctx,
-                        "temperature": temperature,
+                        "temperature": _temperature,
                         "top_p": 0.9,
                     },
                 }
             if tools:
                 payload["tools"] = tools
 
-            timeout = 600 if self.is_cloud else 480
+            timeout = 600 if self.is_cloud else 1200
             response = session.post(
                 self.api_url, json=payload, headers=headers, timeout=timeout
             )
@@ -258,13 +265,13 @@ class Agent:
 
 DEFAULT_AGENT_MAP = {
     "Architect": ("architect.md", "gemini-2.5-flash", None),
-    "Engineer": ("code_implementer.md", "qwen3.6:latest", None),
-    "QA_Tester": ("integration_auditor.md", "qwen2.5-coder:14b", None),
+    "Engineer": ("code_implementer.md", "ornith:35b", None),
+    "QA_Tester": ("integration_auditor.md", "qwen3-coder:latest", None),
     "Security_Auditor": ("security.md", "gemini-2.5-flash", None),
-    "Code_Reviewer": ("code_reviewer.md", "qwen3.6:latest", None),
+    "Code_Reviewer": ("code_reviewer.md", "ornith:35b", None),
     "Exploratory_Architect": ("exploratory_architect.md", "gemini-2.5-flash", None),
-    "Staff_Onboarding": ("staff_onboarding.md", "qwen3.6:latest", None),
-    "Systems_Architect": ("architecture_review.md", "qwen3.6:latest", None),
+    "Staff_Onboarding": ("staff_onboarding.md", "ornith:35b", None),
+    "Systems_Architect": ("architecture_review.md", "ornith:35b", None),
 }
 
 
@@ -304,7 +311,7 @@ class AgentRegistry:
         agent = Agent(
             name=agent_name,
             system_prompt=persona,
-            model_name=model_name or "qwen3.6:latest",
+            model_name=model_name or "ornith:35b",
             base_url=(
                 "https://generativelanguage.googleapis.com/v1beta/openai"
                 if is_gemini

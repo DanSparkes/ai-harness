@@ -6,7 +6,7 @@ import time
 from core.agent import Agent
 from core.judge import AutomatedEvaluator
 from core.mcp_orchestrator import init_orchestrator
-from core.parser import DjangoTopographer
+from core.terragrunt_parser import TerragruntTopographer, format_topology_for_prompt
 from core.warehouse import HarnessWarehouse
 
 USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
@@ -26,20 +26,20 @@ FALLBACK_REVIEWER = "gemini-2.5-flash"
 HEAVY_REVIEWER = "deepseek-r1:14b"
 LOCAL_JUDGE = "qwen3-coder:latest"
 
-MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
+MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.iac.json")
 
 _mcp_orch = None
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Architecture Review Evaluation Engine"
+        description="IaC Architecture Review Evaluation Engine"
     )
     parser.add_argument(
         "--repo",
         "-r",
         default=None,
-        help="Path to the target repository (overrides TARGET_REPO env var)",
+        help="Path to the target IaC repository (overrides TARGET_IAC_PROJECT env var)",
     )
     parser.add_argument(
         "--project-context",
@@ -56,12 +56,12 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def init_mcp(repo_path=None, config_path=None):
+def init_mcp(repo_path: str | None = None, config_path: str | None = None):
     global _mcp_orch
     if _mcp_orch is not None:
         return _mcp_orch
-    cfg_path = config_path or MCP_CONFIG_PATH
-    path = repo_path or os.environ.get("TARGET_REPO") or os.getcwd()
+    cfg_path: str = config_path or MCP_CONFIG_PATH
+    path: str = repo_path or os.environ.get("TARGET_IAC_PROJECT") or os.getcwd()
     orch = init_orchestrator(cfg_path, path)
     if orch:
         _mcp_orch = orch
@@ -72,13 +72,13 @@ def build_mcp_context_block() -> str:
     orch = _mcp_orch
     if not orch:
         return ""
-    return orch.build_mcp_context_block(tags=["architectural_rule"])
+    return orch.build_mcp_context_block(tags=["iac_rule", "architectural_rule"])
 
 
 def main():
     args = parse_arguments()
 
-    target_repo = args.repo or os.environ.get("TARGET_REPO")
+    target_repo = args.repo or os.environ.get("TARGET_IAC_PROJECT")
     mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
 
     is_local_mode = not ARCHITECT_API_KEY
@@ -89,11 +89,11 @@ def main():
 
     if not target_repo:
         print("Error: No target repository specified.")
-        print("Set TARGET_REPO env var or pass --repo /path/to/project")
+        print("Set TARGET_IAC_PROJECT env var or pass --repo /path/to/iac/project")
         return
 
     print(f"{'=' * 60}")
-    print("Launching Architecture Review Engine (Hybrid Mode)")
+    print("Launching IaC Architecture Review Engine (Hybrid Mode)")
     print(f"Target Project   : {target_repo}")
     print(f"Cloud Architect  : {REASONING_ARCHITECT}")
     print(f"Local Judge      : {LOCAL_JUDGE}")
@@ -102,18 +102,44 @@ def main():
     start_time = time.time()
 
     # 1. Parse Project Topography
-    print("Step 1: Parsing project topography...")
+    print("Step 1: Parsing Terragrunt/OpenTofu topography...")
     step_start = time.time()
-    topographer = DjangoTopographer(target_repo)
+    topographer = TerragruntTopographer(target_repo)
     project_map = topographer.scan_project()
+    topology_text = format_topology_for_prompt(project_map)
+    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
     print(f"   [Done] Topography scan in {time.time() - step_start:.2f}s")
 
-    if not project_map.get("models"):
-        print("   Warning: No Django models detected. Topography may be incomplete.")
+    accounts = project_map.get("accounts", {})
+    modules = project_map.get("modules", {})
+    deps = project_map.get("dependencies", [])
+    total_units = sum(len(a.get("units", [])) for a in accounts.values())
+    print(
+        f"   [Summary] {len(accounts)} accounts, {len(modules)} modules, "
+        f"{len(deps)} dependencies ({total_units} units)"
+    )
+
+    # Fail fast: don't feed null topology through expensive LLM passes.
+    if not accounts and not modules:
+        print("\n   [Abort] Parser found nothing. Skipping architecture review.")
+        print(f"   Resolved target directory: {topographer.target_dir}")
+        if not topographer.target_dir.exists():
+            print(
+                "   ERROR: Directory does not exist. "
+                "Set the TARGET_IAC_PROJECT env var or pass --repo."
+            )
+
+        else:
+            print(
+                f"   NOTE: {topographer.target_dir} exists but contains no recognized "
+                f"Terragrunt/OpenTofu structure (no dev/, prod/, shared-services/ dirs). "
+                f"Fix the target path or add valid HCL files."
+            )
+        return
 
     # 2. Load Architecture Review Persona
-    print("Step 2: Loading architecture review persona...")
-    persona_path = "agents/architecture_review.md"
+    print("Step 2: Loading IaC architecture review persona...")
+    persona_path = "agents/iac_architecture_review.md"
     if not os.path.exists(persona_path):
         print(f"Error: System prompt missing at {persona_path}")
         return
@@ -129,48 +155,49 @@ def main():
         print("   [Done] MCP workbench active (tools + git + memory)\n")
     else:
         print(
-            "   [Skipped] No MCP config found. Use MCP_CONFIG env var or mcp_config.json\n"
+            "   [Skipped] No MCP config found. Use MCP_CONFIG env var or mcp_config.iac.json\n"
         )
 
     # 3. Build prompt context
-    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
-
     parser_limitations = f"""### Parser Capabilities & Limitations
 
-The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
+The topography is built by static HCL/Terraform file parsing. Here's what it CAN and CANNOT resolve:
 
 **CAN resolve:**
-- Model fields (name, type, null, default, unique, blank, primary_key, editable)
-- Serializer fields (name, type, required, read_only, allow_null, allow_blank)
-- Serializer Meta (model, fields, exclude, read_only_fields) — including inherited expressions like `Parent.Meta.fields + [...]`
-- View class attributes: `permission_classes`, `authentication_classes`, `serializer_class`, `queryset`, `lookup_field`
-- View base classes (e.g., `RetrieveAPIView`, `APIView`, `ModelViewSet`)
-- View HTTP methods (derived from non-stub method names)
-- View read-only status (`is_read_only: true`)
-- Custom permission class resolution with `has_permission` / `has_object_permission` analysis
-- Inline authorization calls found in method bodies
-- Celery task definitions
+- Terragrunt dependency blocks (config_path, mock_outputs, skip)
+- Module structure (variables, outputs, resources, provider aliases)
+- Account layout (dev, prod, shared-services, shared-services-ca)
+- Network topology modules (VPC, TGW, VPN, peering)
+- Security modules (IAM, WAF, KMS, ACM, Secrets)
+- CI/CD configuration (pre-commit, tflint, checkov, trivy, GitHub Actions)
+- Provider version constraints
+- Remote state backend configuration
 
 **CANNOT resolve:**
-- Method bodies beyond stub detection and auth call scanning (no control flow, validation logic, or query filter details)
-- URL patterns or route configurations
-- ViewSet action-to-HTTP-method mapping beyond function names
-- Decorators — parsed as class attributes instead
-- Business logic, data flows, or runtime state
+- HCL expression evaluation or variable interpolation
+- Terragrunt `run_cmd` or `get_terragrunt_dir` function outputs
+- Dynamic dependency resolution at plan time
+- Actual AWS resource state (requires live credentials)
+- Cross-account IAM trust evaluation
+- CIDR calculations or overlap detection
+- WAF rule effectiveness or coverage
 
-### Codebase Inventory
+### Infrastructure Inventory
 Based on parsing, this project contains:
-- {len(project_map.get('models', []))} models
-- {len(project_map.get('serializers', []))} serializers
-- {len(project_map.get('views', []))} views
+- {len(accounts)} AWS accounts
+- {sum(len(a.get('units', [])) for a in accounts.values())} Terragrunt units
+- {len(modules)} reusable modules
+- {len(deps)} cross-unit dependencies
+- {len(project_map.get('network_topology', {}))} network modules
+- {len(project_map.get('security', {}).get('security_modules', []))} security modules
 
 ### Anti-Hallucination Rules
-1. **NEVER attribute a field to a model unless it appears in that model's `fields` list**.
-2. **`get_queryset` method != `queryset` attribute**: A view may define `get_queryset()` in its methods but have no `queryset` in its `class_attributes`.
-3. **Each view/serializer/model is independent**: Every entry has its own isolated attributes. Do not mix data between entries.
-4. **Only reference files and classes that appear in the topography map**. Do not invent imports, dependencies, or third-party integrations not visible in the parsed structure.
-5. **Large files alone are insufficient evidence** for maintainability concerns — check the actual module structure.
-6. **Do not infer database indexes, missing constraints, or workflow complexity** from model field definitions alone.
+1. **NEVER attribute a resource to a module unless it appears in that module's resource list.**
+2. **`dependency` block != actual deploy order**: A dependency declares ordering but Terragrunt enforces it at runtime. Static analysis cannot confirm execution order.
+3. **Each account is independent**: Every account has its own state backend. Do not mix state references between accounts.
+4. **Only reference files and modules that appear in the topography map.** Do not invent configurations not visible in the parsed structure.
+5. **Large files alone are insufficient evidence** for complexity concerns — check the actual module boundaries.
+6. **Do not infer security posture from module names alone** — verify the actual resources and configurations.
 
 ### MCP-Augmented Context (Live Project State)
 {mcp_block}"""
@@ -178,11 +205,16 @@ Based on parsing, this project contains:
     # Build passes
     pass_templates = [
         f"""[Pass 1: Repository Observation]
-Analyze this Django repository topography:
+Analyze this Terragrunt/OpenTofu repository topography:
 
 {parser_limitations}
 
-## Project Topography
+## Project Topography (formatted)
+```
+{topology_text}
+```
+
+## Project Topography (raw JSON)
 ```json
 {project_map_json}
 ```
@@ -191,7 +223,7 @@ Your task is ONLY to identify observations.
 
 For each observation:
 - describe what exists,
-- identify the relevant files,
+- identify the relevant files/modules,
 - explain why it may matter operationally,
 - assign a confidence score (High / Medium / Low).
 
@@ -199,7 +231,7 @@ Rules:
 - Do NOT propose solutions.
 - Do NOT infer missing structures.
 - Do NOT speculate.
-- Do NOT introduce architectural patterns.
+- Do NOT introduce architectural patterns not already present.
 
 Output format:
 
@@ -218,10 +250,10 @@ Categorize each observation as:
 - Speculative
 
 Cross-check each observation against the actual topography:
-- **Model field exists?** Confirm every referenced field appears in the specific model's `fields` list.
-- **View exists?** Confirm every referenced class appears in the `views` list with its `absolute_path`.
-- **Serializer exists?** Confirm every referenced serializer appears in the `serializers` list.
-- **Task exists?** Only reference Celery tasks listed in the `celery_tasks` section.
+- **Module exists?** Confirm every referenced module appears in the `modules` section.
+- **Dependency exists?** Confirm every referenced dependency appears in the `dependencies` section.
+- **Account exists?** Confirm every referenced account appears in the `accounts` section.
+- **Resource exists?** Only reference resources listed in module `resources`.
 
 Definitions:
 Confirmed: supported directly by repository evidence.
@@ -241,7 +273,7 @@ Evidence:
 Reasoning Chain:
 Likely Impact:""",
         """[Pass 3: Staff Prioritization]
-Assume you are the Staff Engineer responsible for this system.
+Assume you are the Staff Infrastructure Engineer responsible for this system.
 
 Constraints:
 - Two engineers.
@@ -252,10 +284,10 @@ Using ONLY confirmed findings:
 Select EXACTLY five initiatives.
 
 Rank them by:
-1. Operational impact,
-2. Engineering effort,
-3. Developer productivity impact,
-4. Incident prevention potential.
+1. Operational impact (blast radius, failure modes),
+2. Security risk reduction,
+3. Cost optimization potential,
+4. Developer/ops productivity impact.
 
 For each initiative provide:
 - Why it was selected,
@@ -271,14 +303,12 @@ Requirements:
 - Explicitly identify assumptions.
 
 Avoid recommending:
-- service layers,
-- DTO layers,
-- command buses,
-- app decomposition,
+- replacing Terragrunt with custom tooling,
+- adding unnecessary abstraction layers,
+- introducing new IaC tools without evidence of failure,
+- large-scale module restructuring unless evidence demands it.
 
-unless repository evidence demonstrates that the current approach is failing.
-
-Focus on pragmatic Django evolution.""",
+Focus on pragmatic infrastructure evolution.""",
     ]
 
     passes = pass_templates
@@ -317,7 +347,7 @@ Focus on pragmatic Django evolution.""",
     adv_start = time.time()
 
     adversarial_prompt = f"""
-Act as a skeptical Staff Django Engineer.
+Act as a skeptical Staff Infrastructure Engineer.
 
 Review this report.
 
@@ -327,7 +357,7 @@ Your job is to identify:
 - unsupported claims,
 - over-engineering,
 - recommendations lacking evidence,
-- Django anti-patterns introduced by the reviewer.
+- IaC anti-patterns introduced by the reviewer.
 
 For each criticism provide:
 - Severity,
@@ -380,32 +410,32 @@ Original Report:
     judge_context = f"Project Topography:\n{project_map_json[:5000]}"
     evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
     scores = evaluator.grade_run(
-        final_report, "rubrics/architecture_rubric.json", context=judge_context
+        final_report, "rubrics/iac_architecture_rubric.json", context=judge_context
     )
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
-    print(f"Architecture Review Reliability Scores: {scores}")
+    print(f"IaC Architecture Review Reliability Scores: {scores}")
 
     # 8. Log and Export Artifacts
     print("Step 7: Archiving run data...")
     warehouse = HarnessWarehouse()
     warehouse.log_run(
         model_name=model_used,
-        agent_role="Staff Architecture Review",
+        agent_role="Staff IaC Architecture Review",
         raw_output=final_report,
         scores=scores,
     )
 
-    report_filename = "reports/staff_architecture_review.md"
+    report_filename = "reports/staff_iac_architecture_review.md"
     os.makedirs("reports", exist_ok=True)
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(final_report)
 
     if _mcp_orch:
         _mcp_orch.remember(
-            "eval:architecture_review:complete",
-            f"Architecture review completed. Report: {report_filename}",
-            tags=["evaluation", "architecture", "complete"],
+            "eval:iac_architecture_review:complete",
+            f"IaC architecture review completed. Report: {report_filename}",
+            tags=["evaluation", "iac", "architecture", "complete"],
         )
         _mcp_orch.stop()
 

@@ -27,84 +27,49 @@ from typing import Any
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 from core.agent import Agent
+from core.headroom import CompressionManager
 from core.mcp_orchestrator import init_orchestrator
+from core.parser import minify_markdown
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
-ARCHITECT_MODEL = "qwen3.6:latest"
+ARCHITECT_MODEL = "ornith:35b"
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # MCP integration
 _mcp_orchestrator = None
 
 
-ARCHITECT_SYSTEM_PROMPT = """\
-You are a Staff Backend Architect designing an implementation plan for a Django REST Framework feature. You have access to an MCP tool workbench with servers for filesystem exploration, git history, persistent memory, documentation lookup, web search, and structured reasoning.
-
-When the prompt includes an "=== MCP-AUGMENTED CONTEXT ===" section, use the git history and memory context to understand the project's evolution and existing architectural rules before proposing changes. Cross-reference all file paths against the provided codebase scan — do not invent paths.
-
-Given a brief feature prompt and a codebase context scan, produce a detailed implementation report in markdown with the following sections:
-
-## 1. Codebase Target Map
-List the exact files, classes, and URL routes that need to be created or modified. All file paths MUST come from the provided codebase scan — do not invent paths. When the prompt asks to update "all" tasks of a category, include EVERY matching file from the scan, not a subset.
-
-## 2. Architecture & Design
-Describe the approach in detail. Include code snippets for key patterns (e.g. a custom permission class, throttle configuration, serializer change). Explain how the pieces fit together.
-
-CRITICAL: Code snippets must be syntactically correct Python.
-
-## 3. Risk Assessment & Mitigations
-Identify potential issues (backwards compatibility, migration risk, performance, security) and how to mitigate them.
-
-## 4. Implementation Pipeline
-Provide a step-by-step execution plan as a JSON code block. Each step represents one file to create or modify. The JSON must be an object with this structure:
-
-{
-  "feature_name": "short feature name",
-  "target_workspace": "/path/to/repo",
-  "pipeline": [
-    {
-      "step": 1,
-      "name": "short step name",
-      "target_file": "relative/path/to/file.py",
-      "task": "detailed implementation instruction — class names, methods, imports, exactly what to change.",
-      "assigned_agent": "Engineer",
-      "auditor_agent": "QA_Tester",
-      "allowed_skills": ["write_file", "run_formatter", "validate_syntax", "run_mypy"],
-      "max_attempts": 4
-    }
-  ]
-}
-
-Rules for the pipeline:
-- Every target_file, function name, class name, and decorator in instructions MUST exactly match what appears in the codebase scan. Do not invent or rename them.
-- For Celery task steps: the function name with @shared_task is the one to modify, not a plain helper function in the same file. Check the CELERY TASK DECORATORS section to verify.
-- Steps must be ordered so earlier steps create dependencies that later steps rely on.
-- Instructions must be precise and correct. Do not say "import it at the top" for a settings constant. Each instruction must be a single coherent paragraph about exactly what to add/change.
-- Include both new files and modifications to existing files.
-- Instructions must match existing codebase patterns (decorators, class hierarchies, import styles).
-- When the prompt says to update "all" tasks of a kind, include EVERY matching file from the CELERY TASK DECORATORS section, not just the ones explicitly listed in the prompt.
-- Use "target_workspace" as a placeholder — it will be replaced at runtime.
-
-### Retry Safety Check — OVERRIDES ALL OTHER RULES
-If the plan involves adding autoretry_for to a Celery task, you MUST check that task's code (shown in the file matches section) for error handlers that modify state before re-raising.
-
-AUTORETRY_FOR IS NOT SAFE if the task's except block does this pattern:
-1. Sets status = ERROR (or similar state field) on a model
-2. Calls .save() on that model
-3. Then re-raises the exception
-
-When Celery retries this task, it re-executes from the top. The first thing the task does is check `if status != PENDING: raise ValueError` — which immediately fails because status is still ERROR from the previous attempt. Every retry hits this guard and permanently fails.
-
-ACTION REQUIRED: For any task with this pattern, you MUST either:
-- Option A: Remove the state-modifying code from the error handler entirely. Let the task fail cleanly before setting status=ERROR. Only set status=ERROR on the final failure (after all retries exhausted).
-- Option B: Use tenacity retry on just the API call inside the task body instead of Celery-level autoretry_for. This keeps the existing error handler intact.
-
-Whichever option you choose, explain the decision clearly in the instructions and risk section.
-
-Output ONLY the report with the pipeline JSON embedded in a code block at the end of section 4.
-"""
+ARCHITECT_SYSTEM_PROMPT = (
+    "You are a Staff Backend Architect designing a DRF feature implementation plan. "
+    "When the prompt includes '=== MCP-AUGMENTED CONTEXT ===', use git history and memory to understand project evolution. "
+    "Cross-reference all file paths against the provided codebase scan — never invent paths.\n"
+    "Produce a markdown report with these sections:\n"
+    "## 1. Codebase Target Map\n"
+    "List exact files, classes, URL routes to create/modify. All paths from the scan only. When asked to update 'all' of a category, include EVERY matching file from the scan.\n"
+    "## 2. Architecture & Design\n"
+    "Describe approach with syntactically correct Python code snippets for key patterns.\n"
+    "## 3. Risk Assessment & Mitigations\n"
+    "Identify backwards compat, migration, performance, security risks and mitigations.\n"
+    "## 4. Implementation Pipeline\n"
+    "Provide a step-by-step execution plan as a JSON code block with this structure:\n"
+    '{"feature_name": "...", "target_workspace": "/path/to/repo", "pipeline": [{"step": 1, "name": "...", "target_file": "relative/path.py", "task": "exact instruction — class names, methods, imports, what to change", "assigned_agent": "Engineer", "auditor_agent": "QA_Tester", "allowed_skills": ["write_file", "run_formatter", "validate_syntax", "run_mypy"], "max_attempts": 4}]}\n'
+    "Pipeline rules:\n"
+    "- Every target_file, function, class, decorator in instructions MUST match the codebase scan exactly.\n"
+    "- For Celery tasks: modify the @shared_task function, not a helper. Verify against the CELERY TASK DECORATORS section.\n"
+    "- Order steps so earlier steps create dependencies later steps rely on.\n"
+    "- Instructions must be a single coherent paragraph about exactly what to add/change. No vague directives.\n"
+    "- Include both new files and modifications. Match existing decorator/class/import style.\n"
+    "- When updating 'all' of a kind, include EVERY matching file from the scan.\n"
+    "- Use 'target_workspace' as placeholder (replaced at runtime).\n"
+    "- CRITICAL — Trust AST-parsed topology over raw file previews: The DJANGO TOPOLOGY section is the definitive source for views, serializers, models, and their relationships. The CROSS-REFERENCE USAGE section shows how entities are actually imported/used. RAW FILE PREVIEWS at the bottom is only a fallback for context not present in the topology or cross-references.\n"
+    "### Retry Safety — OVERRIDES ALL OTHER RULES\n"
+    "If adding autoretry_for to a Celery task, check the task's error handler. AUTORETRY_FOR IS UNSAFE if the except block: (1) sets status=ERROR on a model, (2) calls .save(), (3) re-raises. On retry the task re-executes from the top, hits `if status != PENDING: raise ValueError`, and permanently fails.\n"
+    "ACTION: Either (A) remove state-modifying code from the error handler — only set status=ERROR after all retries exhausted; or (B) use tenacity retry on just the API call in the task body instead of Celery-level autoretry_for.\n"
+    "Explain your choice in the instructions and risk section.\n"
+    "Output ONLY the report with pipeline JSON embedded in section 4."
+)
 
 
 # ── MCP Integration ───────────────────────────────────────────────────────────
@@ -129,28 +94,26 @@ def get_mcp_context(args: argparse.Namespace) -> str:
     orch = init_mcp_orchestrator(args.mcp_config, target)
     if not orch:
         return ""
-    parts = ["=== MCP-AUGMENTED CONTEXT ==="]
-    git_block = orch.build_git_context(max_count=15)
-    if git_block:
-        parts.append(git_block)
-    memory = orch.recall_tagged(tags=["architectural_rule"])
-    if memory:
-        parts.append(f"Architectural Rules:\n{memory}")
-    memory = orch.recall_tagged(tags=["active", "campaign_complete"])
-    if memory:
-        parts.append(f"Active Campaign Context:\n{memory}")
+    context = orch.build_mcp_context_block(
+        tags=["architectural_rule", "active", "campaign_complete"]
+    )
     orch.stop()
-    return "\n".join(parts)
+    return context
 
 
 # ── Codebase Scanner ──────────────────────────────────────────────────────────
 
 
 def build_codebase_context(args: argparse.Namespace) -> str:
-    """Build a codebase context block for the LLM prompt from the target repo."""
+    """Build a codebase context block for the LLM prompt from the target repo.
+
+    Order matters: structured AST data first (authoritative), raw file
+    previews last (fallback). This prevents the LLM from hallucinating
+    based on noisy raw content.
+    """
     from core.parser import (
         DjangoTopographer,
-        format_scan_results,
+        grep_context,
         scan_celery_tasks,
         scan_file_tree,
         scan_files_by_keyword,
@@ -160,17 +123,93 @@ def build_codebase_context(args: argparse.Namespace) -> str:
     file_tree = scan_file_tree(args.target_repo)
     celery_tasks = scan_celery_tasks(args.target_repo)
 
-    # Extract meaningful keywords from the prompt
+    parts = ["=== PROJECT FILE TREE ==="]
+    parts.append("\n".join(file_tree) if file_tree else "(empty)")
+
+    # ── AST-parsed topology (views, serializers, models) ────────────
+    topographer = DjangoTopographer(args.target_repo)
+    topology = topographer.scan_project()
+
+    if topology.get("views") or topology.get("serializers") or topology.get("models"):
+        parts.append("\n\n=== DJANGO TOPOLOGY (AST-parsed, authoritative) ===")
+        if topology["views"]:
+            parts.append("\nViews:")
+            for v in topology["views"]:
+                parts.append(
+                    f"  {v['relative_path']} :: {v['class']} "
+                    f"({', '.join(m['name'] for m in v['methods'])})"
+                )
+        if topology["serializers"]:
+            parts.append("\nSerializers:")
+            for s in topology["serializers"]:
+                meta_fields = s.get("meta", {})
+                if isinstance(meta_fields.get("fields"), str):
+                    fd = f'fields="{meta_fields["fields"]}"'
+                elif isinstance(meta_fields.get("fields"), list):
+                    fd = f"fields={meta_fields['fields']}"
+                else:
+                    fd = f"declared_fields={[f['name'] for f in s['fields']]}"
+                parts.append(f"  {s['relative_path']} :: {s['class']} {fd}")
+        if topology["models"]:
+            parts.append("\nModels:")
+            for m in topology["models"]:
+                fnames = [f["name"] for f in m.get("fields", []) if isinstance(f, dict)]
+                parts.append(f"  {m['relative_path']} :: {m['class']} fields={fnames}")
+
+    # ── Content grep for cross-references ──────────────────────────
+    prompt_lower = args.prompt.lower()
+    entity_names = sorted(
+        {
+            *(m["class"] for m in topology.get("models", [])),
+            *(s["class"] for s in topology.get("serializers", [])),
+            *(v["class"] for v in topology.get("views", [])),
+        }
+    )
+    relevant = [e for e in entity_names if e.lower() in prompt_lower]
+    if relevant:
+        parts.append("\n\n=== CROSS-REFERENCE USAGE (content grep) ===")
+        for entity in relevant[:6]:
+            matches = grep_context(
+                args.target_repo, rf"\b{re.escape(entity)}\b", max_matches=12
+            )
+            if matches:
+                parts.append(f"\n{entity}:")
+                for m in matches:
+                    parts.append(
+                        f"  {m['file']}:{m['line_number']}  {m['matched_line']}"
+                    )
+
+    # ── Celery tasks ────────────────────────────────────────────────
+    if celery_tasks:
+        parts.append("\n\n=== CELERY TASK DECORATORS ===")
+        for t in celery_tasks:
+            parts.append(f"  {t['file']}:")
+            parts.append(f"    {t['decorator']}")
+            parts.append(f"    def {t['function']}(")
+
+    # ── Project context file ───────────────────────────────────────
+    if getattr(args, "project_context", None):
+        ctx_path = args.project_context
+        if os.path.exists(ctx_path):
+            try:
+                with open(ctx_path, encoding="utf-8") as fh:
+                    ctx_content = minify_markdown(fh.read())
+                if ctx_content:
+                    parts.append(
+                        f"\n\n=== PROJECT CONVENTIONS ({os.path.basename(ctx_path)}) ==="
+                    )
+                    parts.append(ctx_content)
+            except Exception:
+                pass
+
+    # ── Raw file previews (fallback — only for context missing above) ──
     keywords = re.findall(r"[\w_]+", args.prompt)
     keywords = sorted({k for k in keywords if len(k) > 3}, key=lambda k: -len(k))[:5]
     keyword_matches = []
     for kw in keywords:
         keyword_matches.extend(scan_files_by_keyword(args.target_repo, kw))
-
-    # Also scan for common target patterns mentioned in the prompt
     pattern_matches = scan_files_by_pattern(args.target_repo, keywords)
 
-    # Always include content for Celery task files (so the LLM can see error handlers)
     task_files = sorted({t["file"] for t in celery_tasks})
     for tf in task_files:
         if not any(tf in m["file"] for m in keyword_matches + pattern_matches):
@@ -179,26 +218,17 @@ def build_codebase_context(args: argparse.Namespace) -> str:
             )
             pattern_matches.extend(task_content)
 
-    # Add structured Django topology for views/serializers
-    topographer = DjangoTopographer(args.target_repo)
-    topology = topographer.scan_project()
+    if keyword_matches or pattern_matches:
+        parts.append(
+            "\n\n=== RAW FILE PREVIEWS (first 80 lines — fallback for context not in topology above) ==="
+        )
+        for matches in [keyword_matches, pattern_matches]:
+            if matches:
+                for m in matches:
+                    parts.append(f"--- {m['file']} ---")
+                    parts.append(m["content"].rstrip())
 
-    base = format_scan_results(
-        file_tree, celery_tasks, keyword_matches, pattern_matches
-    )
-
-    if topology.get("views") or topology.get("serializers"):
-        base += "\n\n=== DJANGO VIEWS & SERIALIZERS ==="
-        if topology["views"]:
-            base += "\nViews:\n"
-            for v in topology["views"]:
-                base += f"  {v['relative_path']} :: {v['class']} ({', '.join(v['methods'])})\n"
-        if topology["serializers"]:
-            base += "\nSerializers:\n"
-            for s in topology["serializers"]:
-                base += f"  {s['relative_path']} :: {s['class']} fields={s['fields']}\n"
-
-    return base
+    return "\n".join(parts)
 
 
 def get_gemini_api_key() -> str:
@@ -303,7 +333,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
             print(f"Error: prompt file not found: {args.prompt_file}")
             sys.exit(1)
         with open(args.prompt_file, encoding="utf-8") as f:
-            args.prompt = f.read().strip()
+            args.prompt = minify_markdown(f.read())
     elif not args.prompt:
         print("Error: either --prompt or --prompt-file is required.")
         sys.exit(1)
@@ -319,10 +349,6 @@ def cmd_generate(args: argparse.Namespace) -> None:
     report_path = os.path.join(args.reports_dir, report_filename)
     pipeline_path = os.path.join(args.reports_dir, pipeline_filename)
 
-    if os.path.exists(report_path) and not args.force:
-        print(f"Report already exists at {report_path}. Use --force to overwrite.")
-        sys.exit(1)
-
     print(f"Generating feature plan for: {name}")
     print(
         f"  Architect: [{'OLLAMA' if args.engine == 'ollama' else 'GEMINI'}] via {args.model}"
@@ -334,6 +360,21 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     codebase_context = build_codebase_context(args)
     mcp_context = get_mcp_context(args)
+
+    headroom = CompressionManager(
+        target_ratio=0.4, compress_user_messages=True, protect_recent=0
+    )
+    if len(codebase_context) > 5000:
+        codebase_context, cr = headroom.compress_context(codebase_context)
+        print(
+            f"  Compressed codebase context: {cr.tokens_before:,} -> {cr.tokens_after:,} tok ({cr.compression_ratio:.1%} saved)"
+        )
+    if len(mcp_context) > 5000:
+        mcp_context, cr = headroom.compress_context(mcp_context)
+        print(
+            f"  Compressed MCP context: {cr.tokens_before:,} -> {cr.tokens_after:,} tok ({cr.compression_ratio:.1%} saved)"
+        )
+
     user_prompt = build_feature_prompt(
         args.prompt, codebase_context, args.target_repo, mcp_context
     )
@@ -361,9 +402,18 @@ def cmd_generate(args: argparse.Namespace) -> None:
     save_pipeline(pipeline, pipeline_path)
 
     print()
-    print(f"Done. Review the report at: {report_path}")
-    print(f"Then run: python3 new_feature_harness.py {pipeline_path}")
-    print("(Or edit the report and run --update to refresh the pipeline.)")
+    print("Done. Next steps:")
+    print()
+    print("  1. Review the architectural report:")
+    print(f"     cat {report_path}")
+    print()
+    print("  2. Execute the implementation pipeline:")
+    print(f"     python3 new_feature_harness.py {pipeline_path}")
+    print()
+    print("  3. (Optional) Edit the report and re-extract the pipeline:")
+    print(f"     vi {report_path}")
+    print(f"     python3 generate_feature_plan.py update {report_path}")
+    print(f"     python3 new_feature_harness.py {pipeline_path}")
 
 
 def cmd_update(args: argparse.Namespace) -> None:
@@ -425,13 +475,17 @@ def main() -> None:
         "--engine", default="ollama", choices=["ollama", "gemini"], help="LLM backend"
     )
     gen.add_argument(
-        "--model", default=ARCHITECT_MODEL, help="Model name (e.g. qwen3.6:latest)"
+        "--model", default=ARCHITECT_MODEL, help="Model name (e.g. ornith:35b)"
     )
     gen.add_argument(
         "--num-ctx", type=int, default=65536, help="Context window size for Ollama"
     )
     gen.add_argument("--mcp-config", help="Path to MCP server configuration JSON")
-    gen.add_argument("--force", action="store_true", help="Overwrite existing report")
+    gen.add_argument(
+        "--project-context",
+        "-c",
+        help="Path to project-specific context file (markdown) with conventions to inject",
+    )
 
     upd = sub.add_parser(
         "update", help="Re-extract pipeline JSON from an edited .md report"

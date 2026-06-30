@@ -1,0 +1,66 @@
+{
+  "feature_name": "Refactor JournalEntry Serializers with JSONApiSerializer Base Class",
+  "target_workspace": "/Users/dansparkes/memores/memores-api",
+  "pipeline": [
+    {
+      "step": 1,
+      "name": "Add JSONApiSerializer to base_serializers.py",
+      "target_file": "memores/serializers/base_serializers.py",
+      "task": "Append the JSONApiSerializer class definition to memores/serializers/base_serializers.py. The class must inherit from serializers.ModelSerializer and define a Meta class with fields = [\"id\", \"description\", \"context\", \"emotion\", \"date\", \"timestamp\"] and read_only_fields = [\"id\", \"timestamp\"]. No __init_subclass__ or metaclass logic. Do NOT set model in Meta.",
+      "assigned_agent": "Engineer",
+      "auditor_agent": "QA_Tester",
+      "allowed_skills": [
+        "write_file",
+        "run_formatter",
+        "validate_syntax",
+        "run_mypy"
+      ],
+      "max_attempts": 4
+    },
+    {
+      "step": 2,
+      "name": "Refactor JournalEntryListSerializer",
+      "target_file": "memores/serializers/journal_serializers.py",
+      "task": "Import JSONApiSerializer from memores.serializers.base_serializers. Change Meta to inherit from JSONApiSerializer.Meta (class Meta(JSONApiSerializer.Meta)). Set fields = JSONApiSerializer.Meta.fields + [\"has_analysis\", \"has_advanced_analysis\", \"status\"]. Set model = JournalEntry in Meta. Remove read_only_fields from Meta (inherited from base). Preserve all SerializerMethodField definitions and get_* methods exactly as they are.",
+      "assigned_agent": "Engineer",
+      "auditor_agent": "QA_Tester",
+      "allowed_skills": [
+        "write_file",
+        "run_formatter",
+        "validate_syntax",
+        "run_mypy"
+      ],
+      "max_attempts": 4
+    },
+    {
+      "step": 3,
+      "name": "Refactor JournalEntryCreateSerializer",
+      "target_file": "memores/serializers/journal_serializers.py",
+      "task": "Change Meta to inherit from JSONApiSerializer.Meta (class Meta(JSONApiSerializer.Meta)). Set fields = JSONApiSerializer.Meta.fields + [\"user\"]. Set model = JournalEntry in Meta. Remove read_only_fields from Meta (inherited from base). Preserve the validate_description method exactly as is.",
+      "assigned_agent": "Engineer",
+      "auditor_agent": "QA_Tester",
+      "allowed_skills": [
+        "write_file",
+        "run_formatter",
+        "validate_syntax",
+        "run_mypy"
+      ],
+      "max_attempts": 4
+    },
+    {
+      "step": 4,
+      "name": "Refactor JournalEntryDetailSerializer",
+      "target_file": "memores/serializers/journal_serializers.py",
+      "task": "Change Meta to inherit from JSONApiSerializer.Meta (class Meta(JSONApiSerializer.Meta)). Set fields = JSONApiSerializer.Meta.fields + [\"analysis\", \"advanced_analysis\", \"status\"]. Set model = JournalEntry in Meta. Remove read_only_fields from Meta (inherited from base). Preserve all SerializerMethodField definitions and get_* methods exactly as they are.",
+      "assigned_agent": "Engineer",
+      "auditor_agent": "QA_Tester",
+      "allowed_skills": [
+        "write_file",
+        "run_formatter",
+        "validate_syntax",
+        "run_mypy"
+      ],
+      "max_attempts": 4
+    }
+  ]
+}

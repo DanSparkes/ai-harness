@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from core.cache import CACHE_DIR
@@ -30,6 +31,7 @@ MCP_CONFIG_SCHEMA = {
         },
     }
 }
+MCP_DEFAULT_INIT_TIMEOUT = 15.0  # Seconds to wait per-server initialize
 
 
 def _tool_to_openai_format(tool: dict[str, Any]) -> dict[str, Any]:
@@ -91,7 +93,17 @@ class MCPOrchestrator:
             try:
                 cfg = self._resolve_template_vars(cfg)
                 client = MCPClient(name, cfg)
-                info = client.connect(init_timeout=120.0)
+                # Per-server timeout: use shorter timeouts for HTTP servers,
+                # stdio defaults to 15s (prevents single hung server from holding
+                # up the whole workbench). Config can override via init_timeout key.
+                server_timeout = self._server_config[name].get("init_timeout")
+                if not server_timeout:
+                    transport_type = cfg.get("type", "stdio")
+                    if transport_type == "http":
+                        server_timeout = 10.0
+                    else:
+                        server_timeout = MCP_DEFAULT_INIT_TIMEOUT
+                info = client.connect(init_timeout=server_timeout)
                 print(
                     f"  MCP [{name}] connected: {info.get('name', 'unknown')} v{info.get('version', '?')}"
                 )
@@ -289,6 +301,82 @@ class MCPOrchestrator:
         except MCPError as e:
             return f"(recall error: {e})"
 
+    def lsp_find_definition(
+        self, symbol: str, from_file: str | None = None, server_name: str = "lsp"
+    ) -> str:
+        args: dict[str, Any] = {"symbol": symbol}
+        if from_file:
+            args["from_file"] = from_file
+        try:
+            result = self.call_tool(server_name, "find_definition", args, timeout=30)
+            texts = _parse_text_content(result)
+            return "\n".join(texts) if texts else "(not found)"
+        except MCPError as e:
+            return f"(lsp_find_definition error: {e})"
+
+    def lsp_list_symbols(self, file: str, server_name: str = "lsp") -> str:
+        try:
+            result = self.call_tool(
+                server_name, "list_symbols", {"file": file}, timeout=30
+            )
+            texts = _parse_text_content(result)
+            return "\n".join(texts) if texts else "(no symbols)"
+        except MCPError as e:
+            return f"(lsp_list_symbols error: {e})"
+
+    def lsp_get_code_context(
+        self,
+        file: str,
+        line: int,
+        before: int = 5,
+        after: int = 10,
+        server_name: str = "lsp",
+    ) -> str:
+        try:
+            result = self.call_tool(
+                server_name,
+                "get_code_context",
+                {
+                    "file": file,
+                    "line": line,
+                    "lines_before": before,
+                    "lines_after": after,
+                },
+                timeout=15,
+            )
+            texts = _parse_text_content(result)
+            return "\n".join(texts) if texts else "(empty)"
+        except MCPError as e:
+            return f"(lsp_get_code_context error: {e})"
+
+    def headroom_compress(self, content: str, server_name: str = "headroom") -> str:
+        try:
+            result = self.call_tool(
+                server_name, "headroom_compress", {"content": content}, timeout=120
+            )
+            texts = _parse_text_content(result)
+            return "\n".join(texts) if texts else "(empty)"
+        except MCPError as e:
+            return f"(headroom_compress error: {e})"
+
+    def headroom_retrieve(self, hash_key: str, server_name: str = "headroom") -> str:
+        try:
+            content = self.call_tool(
+                server_name, "headroom_retrieve", {"hash": hash_key}, timeout=30
+            )
+            texts = _parse_text_content(content)
+            return "\n".join(texts) if texts else "(empty)"
+        except MCPError as e:
+            return f"(headroom_retrieve error: {e})"
+
+    def headroom_stats(self, server_name: str = "headroom") -> str:
+        try:
+            content = self.call_tool(server_name, "headroom_stats", timeout=30)
+            texts = _parse_text_content(content)
+            return "\n".join(texts) if texts else "(empty)"
+        except MCPError as e:
+            return f"(headroom_stats error: {e})"
+
     def think(self, thought: str, server_name: str = "thinking") -> str:
         try:
             content = self.call_tool(
@@ -347,6 +435,16 @@ class MCPOrchestrator:
             pass
         return default
 
+    def _discover_django_app_labels(self) -> list[str]:
+        labels: list[str] = []
+        if not self._target_repo:
+            return labels
+        repo = Path(self._target_repo)
+        for entry in repo.iterdir():
+            if entry.is_dir() and (entry / "models.py").exists():
+                labels.append(entry.name)
+        return labels
+
     def build_django_live_context(self) -> tuple[str, dict]:
         if not self.is_running:
             return "", {}
@@ -383,10 +481,10 @@ class MCPOrchestrator:
         except Exception:
             pass
 
+        app_labels = self._discover_django_app_labels()
         try:
-            models = self.call_tool(
-                "django", "list_models", {"app_labels": ["memores"]}, timeout=30
-            )
+            kwargs = {"app_labels": app_labels} if app_labels else {}
+            models = self.call_tool("django", "list_models", kwargs, timeout=30)
             if models:
                 combined = "\n".join(
                     c["text"]

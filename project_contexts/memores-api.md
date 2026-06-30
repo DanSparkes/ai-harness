@@ -35,9 +35,11 @@ Cover all models plus: `access_gates.py`, `base_serializers.py` (None-field excl
 
 ## Test Infrastructure (~35 test files)
 - Factories: factory_boy factories for all models (UserFactory, ProfileFactory, etc.)
+  Use factories in setUpTestData for all test data creation. NEVER use direct model creation (.objects.create, .objects.create_user, etc.).
 - Base classes: `AuthAPITestCase`, `StaffAPITestCase`, `SuperUserAPITestCase`, `BenefactorAPITestCase`
 - Coverage: Views (admin: 11 files, app: 9, management: 1, public: 3), Services (12 files)
 - Config: `test_settings.py` — eager Celery, in-memory channel layer, locmem email, MD5 password hasher
+- Run tests: `docker compose exec api sh -c "DJANGO_SETTINGS_MODULE=memores.test_settings pytest --no-migrations --numprocesses=auto"`
 
 ## External Integrations
 - **Claude API** — tenacity retry (3 attempts, exponential backoff), supports multiple Claude models
@@ -55,17 +57,32 @@ Cover all models plus: `access_gates.py`, `base_serializers.py` (None-field excl
 ## Code Quality
 16 pre-commit hooks including: black, isort, mypy, bandit, flake8 (with bugbear/comprehensions/mutable/simplify/print plugins), pip-audit, autoflake, pyupgrade, django-upgrade. Custom `check_drf_idioms.py` AST linter catches DRF anti-patterns.
 
-## Notable Observations for Reviewers
+## Load Testing (`load_testing/`)
+The `load_testing/` directory is a standalone **Locust** project, not a Django app. It has its own `requirements.txt` and `locust.conf`, and runs independently from the Django project. Tasks in `load_testing/tasks/` define Locust `HttpUser` behaviors for simulating real user traffic. Do not apply Django conventions (models, views, serializers, settings, migrations) to files under `load_testing/`.
 
-| Issue | Detail |
-|-------|--------|
-| MCP server not implemented | `AGENTS.md` describes `memores/mcp.py` with SSE — file doesn't exist |
-| Constants duplication | `UserTypes` enum in both `constants/constants.py` and `views/constants.py` |
-| Thick registration view | `RegistrationCompleteView.post()` is ~130 lines — violates thin-views pattern |
-| Mixed auth patterns | Views mix procedural `authorize_*()` calls with DRF `permission_classes` |
-| Unmanaged model | `CourseProviderMap` has `managed = False` — table must exist independently |
-| conftest.py empty | No shared fixtures, all setup in base classes or per-file setUp methods |
-| Migration gaps | Numbering jumps (0001 → 0002 → 0006 → 0008 → 0011) suggest squashes |
-| Active refactoring | Multiple `# TODO` and legacy-route comments in coach/journal views |
-| Django forms + DRF hybrid | Registration uses both `RegistrationForm` (Django) and DRF serializers |
-| No mypy config in pyproject.toml | Type checking runs via pre-commit hook only |
+## Code Reviewer Guidance — Flag If the Diff Touches These
+
+### Known Anti-Patterns
+1. **Thick views with business logic**: `RegistrationCompleteView.post()` is ~130 lines. Flag any view method exceeding ~50 lines that mixes request handling with service logic — delegate to services.
+2. **Mixed auth patterns**: Codebase mixes procedural `authorize_*()` calls with DRF `permission_classes`. Flag new views that add to this inconsistency. New code should use one pattern consistently.
+3. **Django forms + DRF hybrid**: Registration uses both Django `RegistrationForm` and DRF serializers. Flag new code introducing further form/serializer duplication.
+4. **Constants duplication**: `UserTypes` exists in both `constants/constants.py` and `views/constants.py`. Flag new duplication of enums/constants across modules.
+5. **Active refactoring TODOs**: Coach and journal views contain `# TODO` and legacy-route comments. Flag new endpoints adding more deprecated-pattern routes instead of migrating.
+6. **MCP server stub**: `AGENTS.md` references `memores/mcp.py` (SSE) — file doesn't exist. Flag new code depending on it.
+
+### Model & DB Patterns
+1. All models use `SoftDeleteModel` (soft-delete via `is_deleted`). Ensure new models/queries respect this.
+2. `CourseProviderMap` has `managed = False` — table exists independently outside migrations. Do not suggest migration changes for it.
+3. Migration numbering has gaps (0001 → 0002 → 0006, etc.) suggesting past squashes. Flag new migrations re-adding already-existing tables/fields.
+
+### Service Layer Conventions
+1. Services are the canonical home for business logic, not views. Views should delegate, not inline.
+2. Claude AI calls go through Celery tasks with tenacity retry (3 attempts, exponential backoff). Flag synchronous AI calls blocking request-response cycles.
+3. WebSocket push via Channels for job status updates. Flag long-running tasks without status notification.
+
+### Test Infrastructure Notes
+1. Base classes: `AuthAPITestCase`, `StaffAPITestCase`, `SuperUserAPITestCase`, `BenefactorAPITestCase`.
+2. `conftest.py` is empty — setup in base classes or per-file `setUp`. Flag new shared fixtures added to conftest.py without checking for conflicts.
+3. Test settings: eager Celery, in-memory channel layer, locmem email, MD5 password hasher.
+4. ~35 test files via factory_boy. Ensure new models have corresponding factories and test files.
+5. No mypy config in `pyproject.toml` — type checking runs only via pre-commit hook.

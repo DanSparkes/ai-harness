@@ -1,69 +1,23 @@
 # Staff Code Review Report
 
 ## 1. Overall Architectural Verdict
-**REQUEST CHANGES**
-This PR introduces a global pagination default change that drastically reduces payload sizes (50 → 10) and alters query parameter names (`page_size` → `pageSize`) across all ~80+ endpoints without corresponding frontend updates or explicit opt-outs. While adding server-side search to the admin user list is beneficial, the broad blast radius of these pagination defaults poses a high risk of breaking the admin dashboard's data fetching patterns and increasing network latency.
+**APPROVED**
+This PR performs a standard major version upgrade for `i18next-http-backend` (2.x → 3.x) alongside routine transitive dependency normalization. The change aligns with the project's modern Vite 7 + React 18 stack by leveraging native browser APIs over legacy polyfills. No structural regressions are introduced, but verification of translation loading in test/staging environments is recommended due to transport layer shifts.
 
 ## 2. Blast Radius & Coupling Assessment
-- **Global Pagination Shift:** Changing `DEFAULT_PAGINATION_CLASS` and `PAGE_SIZE` in `settings.py` impacts every `ListAPIView` across `app`, `admin`, and `management` domains. The reduction from 50 to 10 items per page will multiply API calls for list-heavy admin pages (e.g., Benefactors, Courses, Prompts), increasing client-side rendering load and network overhead.
-- **Query Param Naming:** Introducing `pageSize` as the query parameter deviates from DRF's standard `page_size`. If the React Admin dashboard uses TanStack Query with default DRF adapters, it will likely send `page_size`, causing pagination to silently fail or return empty pages.
-- **Admin User View:** Removing `AdminProfilePagination` and relying on the new global default is acceptable, but the search filter addition (`meta__registration_code`) relies on PostgreSQL JSONB lookups which are untested in this diff and lack database indexing.
+The `i18next-http-backend` module drives all internationalization fetch requests across the admin dashboard (`/login`, `/users`, `/administration`, etc.). Upgrading to v3 removes legacy CommonJS/polyfill fallbacks and expects a native `fetch` implementation. This impacts any environment lacking global `fetch` (e.g., older Node.js test runners or SSR contexts). The addition of `@tailwindcss/oxide-wasm32-wasi` dependencies is expected for Tailwind CSS v4's WASM compilation pipeline and does not affect runtime coupling.
 
 ## 3. Line-by-Line Code Critiques
+- **File:** `package.json` — line 28 (dependencies block)
+- **Issue Category:** Dependency Compatibility / Runtime Risk
+- **The Defect:** `"i18next-http-backend": "^3.0.5"` replaces `^2.5.2`. v3 drops the built-in `fetch` fallback and assumes a native fetch environment. While Vite 7 + React 18 targets modern browsers where this is safe, it breaks in environments without global `fetch` (e.g., Jest/Node test runners or older CI stages).
+- **Remediation:** Ensure the test runner (Jest) has `jest-environment-jsdom` configured with a fetch polyfill, or explicitly pass a `fetch` implementation to `i18next-http-backend`'s `backendOptions.fetch` if running in Node. No code change is strictly required for browser deployment.
 
-- **File:** `memores/settings.py` — Lines 113-115
-- **Issue Category:** Blast Radius / Performance
-- **The Defect:**
-  ```python
-      "DEFAULT_PAGINATION_CLASS": "memores.views.common.DefaultPagination",
-      "PAGE_SIZE": 10,
-  }
-  ```
-  Reducing the global `PAGE_SIZE` from 50 to 10 is a severe behavioral change. It forces all downstream list endpoints (courses, benefactors, analysis outputs, etc.) to paginate at a much smaller granularity without explicit justification or frontend coordination. This will likely degrade admin dashboard performance due to increased pagination requests.
-- **Remediation:** Keep the global default at `50` for backward compatibility. Apply the new pagination class and size explicitly only where needed (e.g., on `AdminProfileListView`), or document this as a coordinated breaking change requiring frontend updates. If keeping it global, ensure the admin dashboard's React Query client is updated to handle the increased page count efficiently.
-
-- **File:** `memores/views/common.py` — Lines 98-101
-- **Issue Category:** Integration Risk / API Contract
-- **The Defect:**
-  ```python
-  class DefaultPagination(PageNumberPagination):
-      page_size = 10
-      page_size_query_param = "pageSize"
-      max_page_size = 1000
-  ```
-  Renaming the query parameter to `pageSize` breaks standard DRF contract expectations. The admin dashboard (React + TanStack Query) typically expects `page_size`. If the client sends `page_size`, this custom class will ignore it, defaulting to page 1 and returning only 10 results regardless of client intent.
-- **Remediation:** Align with DRF standards or explicitly document the contract change. Support both safely by overriding `get_page_size`:
-  ```python
-  class DefaultPagination(PageNumberPagination):
-      page_size = 10
-      max_page_size = 1000
-
-      def get_page_size(self, request):
-          if request.query_params.get("pageSize"):
-              return int(request.query_params["pageSize"])
-          return super().get_page_size(request)
-  ```
-
-- **File:** `memores/views/admin/user.py` — Lines 28-36
-- **Issue Category:** Maintainability / Database Performance
-- **The Defect:**
-  ```python
-      filter_backends = [filters.SearchFilter]
-      search_fields = [
-          "=id",
-          "first_name",
-          "user__username",
-          "benefactor__name",
-          "meta__registration_code",
-      ]
-  ```
-  Searching across `meta__registration_code` (a JSONField on `Profile`) will trigger PostgreSQL `jsonb` lookups. Without a GIN index on `Profile.meta`, this search will perform sequentially on every request, causing significant latency spikes as the user base grows. Combining exact ID search (`=id`) with broad text/JSON searches in a single `SearchFilter` backend can also lead to unpredictable query planning.
-- **Remediation:** Add a database index for the JSON field lookup via migration (e.g., `models.Index(fields=['meta'])` or a functional GIN index). Alternatively, split the search logic into `filters.DjangoFilterBackend` with explicit lookups to give Django's ORM better control over query optimization.
+- **File:** `package-lock.json` — lines 2021-2225 (`libc` removal) & 2567-2594 (`oxide-wasm32-wasi` additions)
+- **Issue Category:** Lockfile Hygiene / Transitive Dependencies
+- **The Defect:** The diff shows the removal of `libc` optional fields and the addition of `@tailwindcss/oxide-wasm32-wasi` bundled dependencies. This reflects npm v9+ lockfile format normalization and Tailwind CSS v4's shift to WASM-based compilation. These are benign structural updates but increase lockfile size slightly due to inlined transitive deps (`@emnapi/core`, `tslib`, etc.).
+- **Remediation:** No remediation needed. Accept the normalized lockfile. Monitor bundle size if WASM assets impact initial load, though Tailwind v4 handles this efficiently at build time.
 
 ## 4. Test Coverage Assessment
-- **Missing Test Files:** The diff introduces a new global pagination class and modifies search behavior on `AdminProfileListView`. There are no accompanying tests verifying the new pagination defaults or search filter functionality.
-- **Weak Assertions Risk:** If tests are added, avoid asserting only `response.status_code == 200`. Tests must verify that `len(response.data['results'])` respects the new page size (10), and that search queries actually filter the queryset correctly.
-- **Untested Edge Cases:**
-  - JSON field lookup (`meta__registration_code`) should be tested against known `Profile` fixtures to ensure the ORM translates it correctly and doesn't raise `FieldError`.
-  - Pagination boundary conditions when `pageSize` is provided vs. when standard `page_size` is used.
-- **Recommendation:** Add a test case using `StaffAPITestCase` that verifies pagination boundaries, explicitly tests the JSON field search against known `Profile` fixtures, and confirms that both `pageSize` and `page_size` query params are handled gracefully if the remediation above is applied.
+- Lock file changes do not require unit tests. However, because `i18next-http-backend` v3 alters the underlying transport layer (dropping legacy polyfills), I recommend a manual smoke test or integration check in staging to verify that locale files (`/locales/**/*.json`) load correctly across all admin routes.
+- The project's existing Jest setup has zero test coverage. Given the transport shift, adding a minimal integration test for i18n initialization (e.g., verifying `t()` resolves keys post-fetch) would prevent silent translation failures in future deploys.

@@ -58,6 +58,27 @@ src/
 - Password encryption — AES-CBC client-side before POST; key+IV in env vars (security consideration)
 - i18n debug enabled — `debug: true` in i18n config (will log to console in production)
 
+## Code Reviewer Guidance — Flag If the Diff Touches These
+
+### Route & Auth Patterns
+- `protectedLoader` checks localStorage → calls `getUser()` → renders or redirects to `/login`
+- Flag routes that bypass the `protectedLoader` pattern or add new auth mechanisms
+
+### API Client Patterns
+- Custom `fetch` wrapper in `api/request.ts` — auto-injects token, handles 401 redirect
+- No Axios — pure fetch with `RequestError` class for error handling
+- Flag inconsistent error handling patterns or API calls that don't go through the central wrapper
+
+### React Query Patterns
+- 20+ domain hooks in `hooks/api/` — one file per domain (users, courses, benefactors, etc.)
+- Polling for analysis outputs (3-4s intervals) — no WebSocket fallback. Flag other polling that should use the same pattern or add WebSocket.
+- Flag hooks that duplicate query keys or don't follow the established domain-file pattern
+
+### Styling & Component Conventions
+- Primary styling via TailwindCSS v4; SASS files for Ant Design overrides
+- Shared components in `components/`: `Page` layout, `SearchTable`, form selects, custom text/icons
+- Flag new components that bypass the shared component library or introduce new styling paradigms
+
 ## CI/CD
 - GitHub Actions → push to main/dev triggers build + S3 sync + CloudFront invalidation
 - Secrets fetched from AWS Secrets Manager at deploy time

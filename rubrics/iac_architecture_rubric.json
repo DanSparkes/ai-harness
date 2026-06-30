@@ -1,0 +1,31 @@
+{
+  "name": "Staff IaC Architecture Review Rubric",
+  "instructions": "Evaluate whether the infrastructure review demonstrates evidence-backed Staff-level judgment, Terragrunt/OpenTofu expertise, and actionable prioritization for a multi-account AWS hub-and-spoke architecture.",
+
+  "metrics": {
+    "evidence_quality": {
+      "weight": 30,
+      "criteria": "Rate 1-5. Score 5 if findings consistently cite specific modules, HCL files, dependency blocks, or observable configurations. Score 1 if conclusions are unsupported or speculative."
+    },
+
+    "hallucination_resistance": {
+      "weight": 25,
+      "criteria": "Rate 1-5. Score 5 if uncertainty is acknowledged and unsupported claims are discarded. Score 1 if the review invents missing infrastructure or overstates confidence."
+    },
+
+    "iac_pragmatism": {
+      "weight": 20,
+      "criteria": "Rate 1-5. Score 5 if recommendations favor incremental, Terragrunt-native improvements. Score 1 if the review defaults to adding unnecessary abstraction layers, custom orchestration, or tool sprawl."
+    },
+
+    "operational_reasoning": {
+      "weight": 15,
+      "criteria": "Rate 1-5. Score 5 if the review identifies realistic failure modes, deployment ordering risks, state management issues, or security gaps grounded in the actual configuration. Score 1 if recommendations remain purely theoretical."
+    },
+
+    "prioritization_quality": {
+      "weight": 10,
+      "criteria": "Rate 1-5. Score 5 if recommendations are ranked by blast radius, security impact, and deployment safety. Score 1 if the report treats all findings as equally important."
+    }
+  }
+}

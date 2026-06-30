@@ -1,5 +1,5 @@
 {
-  "description": "MCP servers for JS/TS frontend projects (memores-admin). Includes Puppeteer for visual review and web fetch for API testing.",
+  "description": "MCP servers for Terragrunt/OpenTofu infrastructure-as-code projects (memores-infrastructure). Includes HCL validation, state inspection, AWS resource queries, and documentation indexing.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",
@@ -23,25 +23,6 @@
       "module": "core.mcp_servers.MemoryServer",
       "enabled": true,
       "description": "Built-in. Persistent knowledge graph: remember, recall, forget. Zero dependencies."
-    },
-    "puppeteer": {
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "@hisma/server-puppeteer"
-      ],
-      "enabled": true,
-      "description": "Headless browser automation: screenshots, DOM inspection, console checks, rendered UI verification."
-    },
-    "fetch": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "mcp-server-fetch"
-      ],
-      "enabled": true,
-      "description": "Fetch web pages and API endpoints. Test backend API responses while reviewing frontend code. Install: uvx mcp-server-fetch"
     },
     "thinking": {
       "type": "stdio",
@@ -70,6 +51,37 @@
       ],
       "enabled": true,
       "description": "Context compression via Headroom. Tools: headroom_compress, headroom_retrieve, headroom_stats. Uses running proxy at port 8787."
+    },
+    "terraform-registry": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "terraform-mcp-server"
+      ],
+      "enabled": true,
+      "description": "Interacts with the Terraform Registry API to search modules, providers, and fetch argument details."
+    },
+    "terragrunt-docs": {
+      "type": "stdio",
+      "command": "deno",
+      "args": [
+        "run",
+        "-A",
+        "jsr:@excoriate/mcp-terragrunt-docs@0.1.0"
+      ],
+      "env": {
+        "GITHUB_TOKEN": ""
+      },
+      "enabled": true,
+      "description": "Real-time Terragrunt document context provider and repository issue tracker via Deno."
+    },
+    "codebase-memory": {
+      "type": "stdio",
+      "command": "codebase-memory-mcp",
+      "args": [],
+      "enabled": true,
+      "description": "Persistent local code knowledge graph via Tree-Sitter AST parsing. Run the official curl-to-bash installation script before enabling."
     }
   }
 }

@@ -2,6 +2,8 @@
 import ast
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -107,8 +109,9 @@ class DjangoTopographer:
     def _discover_model_base_names(self) -> set:
         """Discover model base class names by finding direct models.Model subclasses."""
         model_bases = set()
-        settings_path = self.target_dir / "memores" / "settings.py"
-        if settings_path.exists():
+        for settings_path in self.target_dir.rglob("settings.py"):
+            if "migrations" in str(settings_path) or "fixtures" in str(settings_path):
+                continue
             try:
                 with open(settings_path, encoding="utf-8") as sf:
                     content = sf.read()
@@ -116,8 +119,9 @@ class DjangoTopographer:
                     r"^\s*AUTH_USER_MODEL\s*=\s*['\"](.+?)['\"]", content, re.M
                 ):
                     model_bases.add(m.group(1).split(".")[-1])
+                break
             except Exception:
-                pass
+                continue
         for app_dir in self._find_app_dirs():
             for root, _dirs, files in os.walk(app_dir):
                 for f in files:
@@ -992,6 +996,70 @@ def scan_files_by_pattern(
     return results
 
 
+def grep_context(
+    target_dir: str,
+    pattern: str,
+    include: str = "*.py",
+    context_lines: int = 2,
+    max_matches: int = 30,
+) -> list[dict]:
+    """Grep file contents for a regex, returning line-level matches.
+
+    Uses ripgrep (rg) if available for speed; pure-Python fallback.
+    Results are file:line matched lines with surrounding context.
+    """
+    rg_paths: list[str] | None = None
+    if shutil.which("rg"):
+        try:
+            # rg -n --include glob pattern target_dir
+            include_arg = f"--include={include}" if include else ""
+            result = subprocess.run(
+                ["rg", "-n", "--no-heading", include_arg, pattern, target_dir],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                rg_paths = sorted(
+                    {line.split(":")[0] for line in result.stdout.strip().splitlines()}
+                )
+            elif result.returncode == 1:
+                rg_paths = []
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            rg_paths = None
+
+    import fnmatch
+
+    results: list[dict] = []
+    py_files = list(_walk_py_files(target_dir))
+    for file_abs, rel in py_files:
+        if include and not fnmatch.fnmatch(rel, include):
+            continue
+        if rg_paths is not None and rel not in rg_paths:
+            continue
+        try:
+            with open(file_abs, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+        for i, line in enumerate(lines):
+            if re.search(pattern, line):
+                start = max(0, i - context_lines)
+                end = min(len(lines), i + context_lines + 1)
+                context = "".join(lines[start:end])
+                results.append(
+                    {
+                        "file": rel,
+                        "line_number": i + 1,
+                        "matched_line": line.rstrip(),
+                        "context": context.rstrip(),
+                    }
+                )
+                if len(results) >= max_matches:
+                    return results
+    return results
+
+
 def format_scan_results(
     file_tree: list[str],
     celery_tasks: list[dict],
@@ -1019,3 +1087,11 @@ def format_scan_results(
                 parts.append(m["content"].rstrip())
 
     return "\n".join(parts)
+
+
+def minify_markdown(text: str) -> str:
+    """Strip HTML comments, collapse excess blank lines, trim whitespace."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(lines).strip()

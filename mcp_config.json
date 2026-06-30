@@ -56,6 +56,24 @@
       ],
       "enabled": true,
       "description": "Sequential thinking for complex multi-step reasoning. Free. Requires Node.js/npx."
+    },
+    "lsp": {
+      "type": "builtin",
+      "module": "core.mcp_servers.LspServer",
+      "enabled": true,
+      "description": "Built-in. Python code intelligence: find definitions, references, list symbols, get code context. Powered by jedi static analysis."
+    },
+    "headroom": {
+      "type": "stdio",
+      "command": "headroom",
+      "args": [
+        "mcp",
+        "serve",
+        "--proxy-url",
+        "http://127.0.0.1:8787"
+      ],
+      "enabled": true,
+      "description": "Context compression via Headroom. Tools: headroom_compress, headroom_retrieve, headroom_stats. Uses the running headroom proxy at port 8787."
     }
   }
 }

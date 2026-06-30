@@ -1,4 +1,6 @@
+import ast
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -509,3 +511,359 @@ class MemoryServer(MCPBuiltinServer):
             return f"Imported {len(self._facts)} memories"
         except json.JSONDecodeError as e:
             raise MCPToolError(-32000, f"Invalid memory data: {e}") from e
+
+
+class LspServer(MCPBuiltinServer):
+    def __init__(self):
+        self._project_path: str | None = None
+
+    def handle_request(self, method: str, params: dict[str, Any]) -> Any:
+        handlers = {
+            "initialize": self._initialize,
+            "tools/list": self._list_tools,
+            "tools/call": self._call_tool,
+            "ping": lambda _: {},
+        }
+        handler = handlers.get(method)
+        if not handler:
+            raise MCPToolError(-32601, f"Method not found: {method}")
+        return handler(params)
+
+    def _initialize(self, params: dict) -> dict:
+        return {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "lsp-server", "version": "1.0.0"},
+            "capabilities": {"tools": {}},
+        }
+
+    def _list_tools(self, params: dict) -> dict:
+        return {
+            "tools": [
+                {
+                    "name": "find_definition",
+                    "description": "Find the definition of a Python symbol (class, function, variable). Resolves imports across files. Returns file path, line number, column, and surrounding code context.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Symbol name to find (e.g. 'Profile', 'get_queryset', 'views.profile_page')",
+                            },
+                            "from_file": {
+                                "type": "string",
+                                "description": "Optional relative file path to resolve the symbol from (improves import resolution)",
+                            },
+                            "project_path": {
+                                "type": "string",
+                                "description": "Absolute path to the project root (default: auto-detected)",
+                            },
+                        },
+                        "required": ["symbol"],
+                    },
+                },
+                {
+                    "name": "find_references",
+                    "description": "Find all references to a Python symbol across the project. Returns file paths, line numbers, columns, and surrounding code for each usage.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Symbol name to search for (e.g. 'Profile', 'UserResponse')",
+                            },
+                            "in_file": {
+                                "type": "string",
+                                "description": "Optional: restrict search to a single relative file path",
+                            },
+                            "project_path": {
+                                "type": "string",
+                                "description": "Absolute path to the project root (default: auto-detected)",
+                            },
+                        },
+                        "required": ["symbol"],
+                    },
+                },
+                {
+                    "name": "list_symbols",
+                    "description": "List all classes, functions, and methods defined in a Python file. Returns name, type, line range, and docstring summary.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "description": "Relative path to the Python file to analyze",
+                            },
+                            "project_path": {
+                                "type": "string",
+                                "description": "Absolute path to the project root (default: auto-detected)",
+                            },
+                        },
+                        "required": ["file"],
+                    },
+                },
+                {
+                    "name": "get_code_context",
+                    "description": "Get a block of code surrounding a specific line in a file. Useful for fetching the implementation after a definition is located.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "description": "Absolute path to the file",
+                            },
+                            "line": {
+                                "type": "integer",
+                                "description": "1-indexed line number to center the context around",
+                            },
+                            "lines_before": {
+                                "type": "integer",
+                                "description": "Number of lines to include before (default 5)",
+                            },
+                            "lines_after": {
+                                "type": "integer",
+                                "description": "Number of lines to include after (default 10)",
+                            },
+                        },
+                        "required": ["file", "line"],
+                    },
+                },
+            ]
+        }
+
+    def _call_tool(self, params: dict) -> Any:
+        name = params.get("name", "")
+        args = params.get("arguments", {})
+        handlers = {
+            "find_definition": self._find_definition,
+            "find_references": self._find_references,
+            "list_symbols": self._list_symbols,
+            "get_code_context": self._get_code_context,
+        }
+        handler = handlers.get(name)
+        if not handler:
+            raise MCPToolError(-32601, f"Tool not found: {name}")
+        return handler(args)
+
+    def _resolve_project(self, args: dict) -> str:
+        project = args.get("project_path") or self._project_path
+        if project:
+            return project
+        if self._project_path:
+            return self._project_path
+        raise MCPToolError(
+            -32000,
+            "No project path set. Call with project_path or set via set_project.",
+        )
+
+    def _get_code_block(
+        self, file_path: str, line: int, before: int = 5, after: int = 10
+    ) -> str:
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return "(file not found)"
+        start = max(0, line - 1 - before)
+        end = min(len(lines), line - 1 + after)
+        block = []
+        for i in range(start, end):
+            block.append(f"{i + 1:>6}: {lines[i].rstrip()}")
+        return "\n".join(block)
+
+    def _find_definition(self, args: dict) -> dict:
+        symbol = args["symbol"]
+        from_file = args.get("from_file")
+        project = self._resolve_project(args)
+
+        results = []
+        try:
+            import jedi
+
+            project_obj = jedi.Project(project)
+            if from_file:
+                file_path = (
+                    os.path.join(project, from_file)
+                    if not os.path.isabs(from_file)
+                    else from_file
+                )
+                if os.path.exists(file_path):
+                    with open(file_path, encoding="utf-8") as f:
+                        source = f.read()
+                    script = jedi.Script(
+                        code=source, path=file_path, project=project_obj
+                    )
+                    names = list(script.search(symbol, all_scopes=True))
+                else:
+                    names = []
+            else:
+                names = project_obj.search(symbol)
+
+            for n in names:
+                d_path = getattr(n, "module_path", None)
+                if not d_path:
+                    continue
+                rel = os.path.relpath(str(d_path), project) if project else str(d_path)
+                context = self._get_code_block(str(d_path), n.line)
+                results.append(
+                    {
+                        "file": rel,
+                        "line": n.line,
+                        "column": getattr(n, "column", 0),
+                        "name": n.name,
+                        "type": getattr(n, "type", "unknown"),
+                        "description": getattr(n, "description", ""),
+                        "full_name": getattr(n, "full_name", ""),
+                        "code_context": context,
+                    }
+                )
+        except ImportError:
+            results = self._find_definition_ast(symbol, project)
+
+        if not results:
+            results = self._find_definition_ast(symbol, project)
+
+        return {"symbol": symbol, "definitions": results, "count": len(results)}
+
+    def _find_definition_ast(self, symbol: str, project: str) -> list[dict]:
+        results = []
+        for root, _dirs, files in os.walk(project):
+            for f in files:
+                if not f.endswith(".py"):
+                    continue
+                file_path = os.path.join(root, f)
+                try:
+                    with open(file_path, encoding="utf-8") as fh:
+                        tree = ast.parse(fh.read())
+                except SyntaxError:
+                    continue
+                rel = os.path.relpath(file_path, project) if project else file_path
+                for node in ast.iter_child_nodes(tree):
+                    if (
+                        isinstance(
+                            node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                        )
+                        and node.name == symbol
+                    ):
+                        context = self._get_code_block(file_path, node.lineno)
+                        results.append(
+                            {
+                                "file": rel,
+                                "line": node.lineno,
+                                "column": node.col_offset,
+                                "name": node.name,
+                                "type": (
+                                    "class"
+                                    if isinstance(node, ast.ClassDef)
+                                    else "function"
+                                ),
+                                "code_context": context,
+                            }
+                        )
+        return results
+
+    def _find_references(self, args: dict) -> dict:
+        symbol = args["symbol"]
+        in_file = args.get("in_file")
+        project = self._resolve_project(args)
+
+        results = []
+        try:
+            import jedi
+
+            project_obj = jedi.Project(project)
+            if in_file:
+                file_path = (
+                    os.path.join(project, in_file)
+                    if not os.path.isabs(in_file)
+                    else in_file
+                )
+                if os.path.exists(file_path):
+                    with open(file_path, encoding="utf-8") as f:
+                        source = f.read()
+                    script = jedi.Script(
+                        code=source, path=file_path, project=project_obj
+                    )
+                    refs = script.get_references(symbol, all_scopes=True)
+                    for r in refs:
+                        if r.module_path:
+                            rel = os.path.relpath(str(r.module_path), project)
+                            context = self._get_code_block(
+                                str(r.module_path), r.line, before=2, after=2
+                            )
+                            results.append(
+                                {
+                                    "file": rel,
+                                    "line": r.line,
+                                    "column": r.column,
+                                    "name": r.name,
+                                    "code_context": context,
+                                }
+                            )
+        except ImportError:
+            pass
+
+        return {"symbol": symbol, "references": results, "count": len(results)}
+
+    def _list_symbols(self, args: dict) -> dict:
+        file_path = args["file"]
+        project = self._resolve_project(args)
+        abs_path = (
+            os.path.join(project, file_path)
+            if not os.path.isabs(file_path)
+            else file_path
+        )
+
+        if not os.path.exists(abs_path):
+            raise MCPToolError(-32000, f"File not found: {file_path}")
+
+        symbols = []
+        try:
+            with open(abs_path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except SyntaxError as e:
+            raise MCPToolError(-32000, f"Syntax error in {file_path}: {e}") from e
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                methods = []
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        methods.append(
+                            {"name": item.name, "line": item.lineno, "type": "method"}
+                        )
+                symbols.append(
+                    {
+                        "name": node.name,
+                        "type": "class",
+                        "line": node.lineno,
+                        "end_line": node.end_lineno,
+                        "methods": methods,
+                    }
+                )
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not any(
+                isinstance(parent, ast.ClassDef)
+                for parent in ast.walk(tree)
+                if parent is not node and isinstance(parent, ast.ClassDef)
+            ):
+                symbols.append(
+                    {
+                        "name": node.name,
+                        "type": "function",
+                        "line": node.lineno,
+                        "end_line": node.end_lineno,
+                    }
+                )
+
+        return {"file": file_path, "symbols": symbols, "count": len(symbols)}
+
+    def _get_code_context(self, args: dict) -> dict:
+        file_path = args["file"]
+        line = args["line"]
+        before = args.get("lines_before", 5)
+        after = args.get("lines_after", 10)
+
+        if not os.path.exists(file_path):
+            raise MCPToolError(-32000, f"File not found: {file_path}")
+
+        context = self._get_code_block(file_path, line, before, after)
+        return {"file": file_path, "line": line, "code_context": context}
