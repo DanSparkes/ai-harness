@@ -31,7 +31,7 @@ ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 FALLBACK_REVIEWER = "gemini-2.5-flash"
 # Local Judge: Scores the review against a rubric
 HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "qwen3-coder:latest"
+LOCAL_JUDGE = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
 # ==============================================================================
 
 TARGET_REPO = os.environ.get("TARGET_REPO")
@@ -265,6 +265,7 @@ Follow the markdown schema and headers defined in your system prompt."""
         base_url=ARCHITECT_API_BASE,
         api_key=ARCHITECT_API_KEY,
         fallback_model_name=FALLBACK_REVIEWER,
+        local_fallback_model=LOCAL_JUDGE,
         num_ctx=65536,
     )
     history = runner.execute_sequence(

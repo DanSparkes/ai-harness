@@ -1,31 +1,9 @@
-Audit the JournalEntry serializers in memores/serializers/journal_serializers.py
-(JournalEntryListSerializer, JournalEntryCreateSerializer, JournalEntryDetailSerializer)
-and the UserCourseCompletion serializers in memores/serializers/user_course_completion_serializers.py
-(UserCourseCompletionSerializer, UserCourseCompletionCreateUpdateSerializer).
+You are an expert Django developer agent. Your task is to implement the core structural code changes for ADR 0001(/Users/dansparkes/memores/memores-api/docs/adr/0001-replace-user-profile-with-abstractuser.md), transitioning from a split User/Profile model to a single custom User model.
 
-Both groups have significant field duplication: all three JournalEntry serializers share
-["id", "description", "context", "emotion", "date", "timestamp"] with read_only on
-["id", "timestamp"], and both UserCourseCompletion serializers list overlapping id/
-timestamp fields.
+Relying on the fact that `AUTH_USER_MODEL = "memores.User"` will be set, execute the following changes:
 
-Refactor as follows:
-
-1. Create a shared mixin/base serializer class called JSONApiSerializer (or similar) in
-   memores/serializers/base_serializers.py that provides common DRF-JSON:API conventions:
-   - id and timestamp read_only fields exposed automatically
-   - A Meta option like `common_fields` that any child can extend via inheritance
-
-2. Use Django ModelSerializer Meta.fields inheritance to reduce duplication:
-   - Define a private _JournalEntryCommonFields meta sub-class or use the base serializer's
-     __init_subclass__ / prepare_fields pattern so child serializers only declare their own
-     unique fields and call `super().Meta.fields + [...custom...]`
-   - Extract a common `_base_fields = ["id", "description", "context", "emotion", "date", "timestamp"]`
-     that all three JournalEntry serializers reference via inheritance instead of copy-paste.
-
-3. Ensure the refactored code:
-   - Preserves every existing field, read_only constraint, and custom SerializerMethodField
-   - Passes pre-commit (ruff, black, isort, mypy)
-   - Passes existing serializer tests
-
-4. Do NOT refactor the UserCourseCompletion serializers yet — those belong to a separate
-   audit pass. Focus only on JournalEntry.
+1. In `memores/models.py`, define the new `User(AbstractUser)` model exactly as structured in Section 1 of the ADR's Detailed Design. Ensure the table name is explicitly set to `db_table = "memores_user"`.
+2. Update `settings.py` to include `AUTH_USER_MODEL = "memores.User"`.
+3. Systematically refactor all model files: replace any `ForeignKey` or `OneToOneField` pointing to `Profile` or `User` to use `settings.AUTH_USER_MODEL` instead. Keep the field names as `user` to maintain backward compatibility.
+4. Replace all occurrences of `from django.contrib.auth.models import User` with `from django.contrib.auth import get_user_model`. Ensure runtime calls use `get_user_model()` instead of the explicit class where necessary.
+5. Fix all type hints, docstrings, and `isinstance` checks identified in the Step 1 audit to use the new User model pattern.

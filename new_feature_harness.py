@@ -31,7 +31,9 @@ from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
 
 IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", "ornith:35b")
-AUDITOR_MODEL = os.environ.get("AUDITOR_MODEL", "qwen3-coder:latest")
+AUDITOR_MODEL = os.environ.get(
+    "AUDITOR_MODEL", "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
+)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 DEFAULT_MAX_ENGINEER_ATTEMPTS = 4
@@ -47,7 +49,7 @@ PONYTAIL_ENABLED = os.environ.get("PONYTAIL_ENABLED", "true").lower() in (
     "true",
     "yes",
 )
-PONYTAIL_MAX_DIFF_LINES = int(os.environ.get("PONYTAIL_MAX_DIFF_LINES", "100"))
+PONYTAIL_MAX_DIFF_LINES = int(os.environ.get("PONYTAIL_MAX_DIFF_LINES", "500"))
 PONYTAIL_SHRINK_TARGET = float(os.environ.get("PONYTAIL_SHRINK_TARGET", "0.4"))
 
 
@@ -189,6 +191,110 @@ def validate_code_safety(
         )
 
     return True, "Passed local verification standards."
+
+
+# ── Mypy error translation & stall detection ─────────────────────
+
+
+def _parse_failing_hooks(precommit_output: str) -> set[str]:
+    """Extract names of hooks that failed from ``pre-commit run --all-files`` output."""
+    failed: set[str] = set()
+    for line in precommit_output.splitlines():
+        if "...Failed" in line:
+            name = line.split("...")[0].strip()
+            if name:
+                failed.add(name)
+    return failed
+
+
+MYPY_CODE_HINTS: dict[str, str] = {
+    "override": "Add a compatible override annotation or `# type: ignore[override]` with a justifying comment.",
+    "return-value": "Fix the return type annotation or the actual return value to match the declared type.",
+    "assignment": "Fix the variable's type annotation or the assigned expression to match.",
+    "arg-type": "Fix the argument type annotation or the passed value type.",
+    "call-overload": "Check overload signatures match the implementation.",
+    "misc": "General type issue. Read the full message for the specific line.",
+    "unused-ignore": "Remove the unused `# type: ignore` comment — the violation no longer occurs.",
+    "attr-defined": "The attribute doesn't exist on the type. Check for typos or add a type stub.",
+    "union-attr": "Attribute doesn't exist on all union members. Narrow the type before access.",
+    "type-arg": "Missing type arguments for a generic class — e.g. use `list[int]` not `list`.",
+    "valid-type": "Invalid type expression — check for missing imports or typos.",
+    "no-any-return": "Return value typed as `Any`. Add an explicit return type annotation.",
+    "no-untyped-def": "Function is missing a type annotation. Add one.",
+    "no-redef": "Name redefined in the same scope. Remove the duplicate definition.",
+    "comparison-overlap": "Comparison between types that can never overlap.",
+    "list-item": "List item type doesn't match the declared list type.",
+    "dict-item": "Dict key/value type doesn't match the declared dict type.",
+}
+
+
+def _parse_mypy_error_codes(log_msg: str) -> set[str]:
+    """Extract unique mypy error codes (e.g. ``[override]``) from validation output."""
+    codes: set[str] = set()
+    for line in log_msg.splitlines():
+        m = re.search(r"\[([a-z][a-z-]+)\]", line)
+        if m:
+            codes.add(m.group(1))
+    return codes
+
+
+def _extract_error_lines(log_msg: str) -> list[tuple[int, str]]:
+    """Return (line_number, error_message) pairs parsed from mypy output."""
+    results: list[tuple[int, str]] = []
+    for line in log_msg.splitlines():
+        m = re.search(r"^[^:]+:(\d+):\s*(?:error|warning):\s*(.*)", line)
+        if m:
+            results.append((int(m.group(1)), m.group(2).strip()))
+    return results
+
+
+def _extract_code_snippet(
+    file_content: str, line_numbers: list[int], context: int = 3
+) -> str:
+    """Extract error lines and their surrounding context from generated code."""
+    lines = file_content.splitlines()
+    if not lines:
+        return ""
+    focus = set()
+    for ln in line_numbers:
+        for offset in range(-context, context + 1):
+            idx = ln - 1 + offset
+            if 0 <= idx < len(lines):
+                focus.add(idx)
+    snippet: list[str] = []
+    for idx in sorted(focus):
+        marker = ">>>" if (idx + 1) in line_numbers else "   "
+        snippet.append(f"  {marker} L{idx + 1}: {lines[idx]}")
+    return "\n".join(snippet)
+
+
+def _translate_mypy_errors(log_msg: str, file_content: str | None = None) -> str:
+    """Enhance raw mypy output with actionable fix hints and surrounding code context."""
+    parts = [log_msg.strip()]
+
+    error_codes = _parse_mypy_error_codes(log_msg)
+    if error_codes:
+        hints = []
+        for code in sorted(error_codes):
+            hint = MYPY_CODE_HINTS.get(code)
+            if hint:
+                hints.append(f"  - [{code}]: {hint}")
+        if hints:
+            parts.append("")
+            parts.append("Fix hints:")
+            parts.extend(hints)
+
+    if file_content:
+        error_lines = _extract_error_lines(log_msg)
+        if error_lines:
+            line_numbers = [ln for ln, _ in error_lines]
+            snippet = _extract_code_snippet(file_content, line_numbers)
+            if snippet:
+                parts.append("")
+                parts.append("Relevant code context (>>> marks error lines):")
+                parts.append(snippet)
+
+    return "\n".join(parts)
 
 
 def test_path_for(source_path: str, target_repo: str) -> str | None:
@@ -460,9 +566,11 @@ def _build_retry_feedback(
 
 
 def _prune_old_feedback(
-    context_history: str, target_file: str, current_round: int
+    context_history: str, target_file: str | None, current_round: int
 ) -> str:
     """Remove stale audit critique and ponytail entries older than the current round."""
+    if not target_file:
+        return context_history
     for tag in ("Auditor Critique", "Ponytail Structural Refinement"):
         # Remove entries for rounds < current_round
         context_history = re.sub(
@@ -473,6 +581,21 @@ def _prune_old_feedback(
             flags=re.DOTALL,
         )
     return context_history
+
+
+def _extract_fix_target(error_text: str) -> str | None:
+    """Extract the source file path from a pre-commit or import error."""
+    # Match "File '/path/to/file.py', line N" or "from X import Y (/path/to/file.py)"
+    m = re.search(r"File\s+\"([^\"]+?\.py)\"", error_text)
+    if m:
+        path = m.group(1)
+        # Try to make it relative to the workspace
+        return path
+    # Match "cannot import name 'X' from 'module' (/path/to/file.py)"
+    m = re.search(r"\(([^)]+?\.py)\)", error_text)
+    if m:
+        return m.group(1)
+    return None
 
 
 def clean_model_output(raw_output: str) -> str:
@@ -534,7 +657,8 @@ def load_plan(path: str) -> tuple[dict[str, Any], str]:
 
     with open(path, encoding="utf-8") as f:
         plan_data = json.load(f)
-    return plan_data, ""
+    exploration = plan_data.pop("architectural_report", "")
+    return plan_data, exploration
 
 
 def main() -> None:
@@ -710,26 +834,30 @@ def main() -> None:
         task.setdefault("instruction", task.get("task", task.get("instruction", "")))
 
         print(f"\n[Stage {task['step']}] {task['name']}")
-        full_target_path = os.path.join(target_repo, task["target_file"])
 
+        full_target_path = None
         file_backup_contents = None
         existing_file_context = ""
         is_modifying_existing_file = False
 
-        if os.path.exists(full_target_path):
-            is_modifying_existing_file = True
-            with open(full_target_path, encoding="utf-8") as f:
-                file_backup_contents = f.read()
-            existing_file_context = (
-                f"\n\nExisting file (preserve structure, add/modify only what's requested):\n"
-                f"{markdown_fence}python\n{file_backup_contents}\n{markdown_fence}\n"
-            )
-
-            affected = skill_get_affected_files(task["target_file"], graph=dep_graph)
-            if affected and not affected.startswith("(no"):
-                existing_file_context += (
-                    f"\n\nFiles importing this module (don't break):\n{affected}\n"
+        if task.get("target_file"):
+            full_target_path = os.path.join(target_repo, task["target_file"])
+            if os.path.exists(full_target_path):
+                is_modifying_existing_file = True
+                with open(full_target_path, encoding="utf-8") as f:
+                    file_backup_contents = f.read()
+                existing_file_context = (
+                    f"\n\nExisting file (preserve structure, add/modify only what's requested):\n"
+                    f"{markdown_fence}python\n{file_backup_contents}\n{markdown_fence}\n"
                 )
+
+                affected = skill_get_affected_files(
+                    task["target_file"], graph=dep_graph
+                )
+                if affected and not affected.startswith("(no"):
+                    existing_file_context += (
+                        f"\n\nFiles importing this module (don't break):\n{affected}\n"
+                    )
 
         max_engineer_attempts = task.get(
             "max_engineer_attempts", DEFAULT_MAX_ENGINEER_ATTEMPTS
@@ -817,11 +945,52 @@ def main() -> None:
             diff_stats: dict[str, int] | None = None
 
             # ── Engineer Inner Loop (compiler loop) ───────────────────────
+            prev_error_codes: set[str] = set()
             for engineer_attempt in range(1, max_engineer_attempts + 1):
                 print(
                     f"  \U0001f527 Engineer attempt {engineer_attempt}/{max_engineer_attempts}"
                     f" (auditor round {auditor_round}/{max_auditor_rounds})..."
                 )
+
+                # ── Command-only step: skip LLM, generate + execute fast ──
+                if full_target_path is None:
+                    cmd_prompt = (
+                        f"Return ONLY the shell command to execute for this task. "
+                        f"No explanation, no markdown.\n\nTask: {task['instruction']}"
+                    )
+                    raw_cmd = implementer_agent.execute(
+                        cmd_prompt, stream=False, temperature=0.1
+                    )
+                    command_to_run = (
+                        clean_model_output(raw_cmd).strip().split("\n")[0].strip()
+                    )
+                    print(f"   Running: {command_to_run}")
+                    try:
+                        cmd_result = subprocess.run(
+                            command_to_run,
+                            cwd=target_repo,
+                            capture_output=True,
+                            text=True,
+                            shell=True,
+                            timeout=300,
+                        )
+                        code_generated = cmd_result.stdout.strip() + (
+                            "\n" + cmd_result.stderr.strip()
+                            if cmd_result.stderr
+                            else ""
+                        )
+                        if cmd_result.returncode != 0:
+                            code_generated = (
+                                f"[Exit code {cmd_result.returncode}]\n{code_generated}"
+                            )
+                    except subprocess.TimeoutExpired:
+                        code_generated = "[Command timed out after 300s]"
+                    except Exception as e:
+                        code_generated = f"[Command failed: {e}]"
+                    engineer_succeeded = True
+                    engineer_log = ""
+                    print(f"   [Command Output] {len(code_generated)} chars")
+                    break
 
                 retry_feedback = ""
                 if auditor_round > 1 and last_audit_verdict:
@@ -839,7 +1008,7 @@ Task: {task['instruction']}
 
 {retry_feedback}
 
-Generate complete production code for this file. Type-annotated. No commentary.
+{'Output the complete file with your changes applied. Preserve ALL existing code and structure.' if is_modifying_existing_file else 'Generate complete production code for this file.'} Type-annotated. No commentary.
 """
 
                 engineer_temp = 0.3 if auditor_round > 1 else None
@@ -879,13 +1048,28 @@ Generate complete production code for this file. Type-annotated. No commentary.
                         f"     --- Verification Error Output ---\n{log_msg}\n     ---------------------------------"
                     )
 
+                    translated = _translate_mypy_errors(log_msg, code_generated)
+                    current_codes = _parse_mypy_error_codes(log_msg)
+
+                    # Stall detection: bail early if errors repeat across attempts
+                    if prev_error_codes and current_codes.issuperset(prev_error_codes):
+                        print(
+                            "  \u26a0\ufe0f Same errors persist from previous attempt. "
+                            "Escaping to auditor for guidance..."
+                        )
+                        context_history += f"\n\n[Engineer Attempt {engineer_attempt} Error (repeated) on {task['target_file']}]:\n{translated}"
+                        engineer_log = log_msg
+                        break
+
+                    prev_error_codes = current_codes
+
                     if file_backup_contents is not None:
                         with open(full_target_path, "w", encoding="utf-8") as f:
                             f.write(file_backup_contents)
                     elif os.path.exists(full_target_path):
                         os.remove(full_target_path)
 
-                    context_history += f"\n\n[Engineer Attempt {engineer_attempt} Error on {task['target_file']}]:\n{log_msg}"
+                    context_history += f"\n\n[Engineer Attempt {engineer_attempt} Error on {task['target_file']}]:\n{translated}"
                     engineer_log = log_msg
                     continue
 
@@ -895,6 +1079,7 @@ Generate complete production code for this file. Type-annotated. No commentary.
 
                 # ── Ponytail: compute diff stats ─────────────────────────
                 diff_stats = None
+                content_loss_warning = ""
                 if PONYTAIL_ENABLED and file_backup_contents is not None:
                     diff_stats = _compute_diff_stats(
                         file_backup_contents, code_generated
@@ -909,6 +1094,22 @@ Generate complete production code for this file. Type-annotated. No commentary.
                         print(
                             f"  \U0001f4ad Ponytail: diff size {diff_stats['total']} lines "
                             f"(+{diff_stats['added']}/-{diff_stats['removed']}) within threshold"
+                        )
+
+                    # Safety check: flag if the modified file lost significant content
+                    orig_size = len(file_backup_contents)
+                    new_size = len(code_generated)
+                    if new_size < orig_size * 0.3:
+                        content_loss_warning = (
+                            f"\n\n### Content Loss Warning\n"
+                            f"MODIFIED file is {new_size} chars vs ORIGINAL "
+                            f"{orig_size} chars ({new_size / orig_size * 100:.0f}%). "
+                            f"This may indicate pre-existing code was accidentally removed. "
+                            f"REJECT if pre-existing code was deleted without explicit instruction."
+                        )
+                        print(
+                            f"  \u26a0\ufe0f Content loss: modified file is "
+                            f"{new_size / orig_size * 100:.0f}% of original size"
                         )
 
                 print(
@@ -959,34 +1160,40 @@ Generate complete production code for this file. Type-annotated. No commentary.
                     f"Reference which Decision Ladder rungs the implementer skipped."
                 )
 
-            if is_modifying_existing_file:
+            if full_target_path is None:
+                scope_directive = f"Review ONLY the instruction's output:\n{markdown_fence}\n{task['instruction']}\n{markdown_fence}\n\n"
+                audit_prompt = (
+                    f"Command output:\n{markdown_fence}\n{code_generated}\n{markdown_fence}\n\n"
+                    f"{scope_directive}\n"
+                    f"Conclude: VERDICT: APPROVED or VERDICT: REJECTED."
+                )
+            elif is_modifying_existing_file:
                 scope_directive = (
                     f"Review ONLY this instruction's change:\n"
                     f"{markdown_fence}\n{task['instruction']}\n{markdown_fence}\n\n"
-                    f"Ignore all pre-existing code. Judge only whether the requested change was implemented correctly. "
-                    f"If you cannot identify the change, default VERDICT: APPROVED."
+                    f"Verify the requested change was applied. "
+                    f"If the task is additive (e.g. adding a docstring, field, or import), "
+                    f"the MODIFIED file must contain EVERYTHING the ORIGINAL had plus the addition. "
+                    f"Reject if pre-existing code was removed without explicit instruction. "
+                    f"If you cannot identify any change, default VERDICT: APPROVED."
+                )
+                audit_prompt = (
+                    f"ORIGINAL:\n{markdown_fence}python\n{file_backup_contents}\n{markdown_fence}\n\n"
+                    f"MODIFIED:\n{markdown_fence}python\n{code_generated}\n{markdown_fence}\n\n"
+                    f"{ponytail_section}"
+                    f"{content_loss_warning}\n\n"
+                    f"{scope_directive}\n\n"
+                    f"Conclude: VERDICT: APPROVED or VERDICT: REJECTED."
                 )
             else:
                 scope_directive = "Check for: no cross-view imports, no N+1 queries, valid framework declarations."
-
-            audit_prompt = (
-                (
-                    f"ORIGINAL:\n{markdown_fence}python\n{file_backup_contents}\n{markdown_fence}\n\n"
-                    f"MODIFIED:\n{markdown_fence}python\n{code_generated}\n{markdown_fence}\n\n"
-                    f"{ponytail_section}\n\n"
-                    f"{scope_directive}\n\n"
-                    f"Reject only if new code introduces a runtime risk absent in the original. "
-                    f"Conclude: VERDICT: APPROVED or VERDICT: REJECTED."
-                )
-                if is_modifying_existing_file
-                else (
+                audit_prompt = (
                     f"Proposed module for '{task['target_file']}':\n"
                     f"{markdown_fence}python\n{code_generated}\n{markdown_fence}\n\n"
                     f"{ponytail_section}\n\n"
                     f"{scope_directive}\n\n"
                     f"Conclude: VERDICT: APPROVED or VERDICT: REJECTED."
                 )
-            )
 
             # Include engineer failure context if present
             if not engineer_succeeded and engineer_log:
@@ -1001,6 +1208,15 @@ Generate complete production code for this file. Type-annotated. No commentary.
             )
 
             if "VERDICT: APPROVED" in audit_verdict:
+                # Engineer loop restores original file on failure — write generated code now
+                if (
+                    not engineer_succeeded
+                    and full_target_path is not None
+                    and code_generated
+                ):
+                    os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
+                    with open(full_target_path, "w", encoding="utf-8") as f:
+                        f.write(code_generated)
                 print("  \U0001f389 Audit Approved: Saved production module.")
                 stage_completed_successfully = True
                 context_history += (
@@ -1044,11 +1260,12 @@ Generate complete production code for this file. Type-annotated. No commentary.
                         )
 
                 # Restore file to original state for next engineer attempt
-                if file_backup_contents is not None:
-                    with open(full_target_path, "w", encoding="utf-8") as f:
-                        f.write(file_backup_contents)
-                elif os.path.exists(full_target_path):
-                    os.remove(full_target_path)
+                if full_target_path is not None:
+                    if file_backup_contents is not None:
+                        with open(full_target_path, "w", encoding="utf-8") as f:
+                            f.write(file_backup_contents)
+                    elif os.path.exists(full_target_path):
+                        os.remove(full_target_path)
 
         if not stage_completed_successfully:
             print(
@@ -1065,7 +1282,7 @@ Generate complete production code for this file. Type-annotated. No commentary.
             )
 
         # Auto-generate unit tests after a successful stage
-        if not skip_tests:
+        if not skip_tests and full_target_path is not None:
             test_path = test_path_for(full_target_path, target_repo)
             if test_path and not os.path.exists(test_path):
                 conventions = detect_test_conventions(target_repo, task["target_file"])
@@ -1176,6 +1393,8 @@ Generate complete production code for this file. Type-annotated. No commentary.
     print("\n=== Running pre-commit gauntlet ===")
     precommit_ok = False
     pre_result = None
+    persistent_failures: set[str] = set()
+
     for pc_round in range(1, MAX_PRECOMMIT_ROUNDS + 1):
         print(f"   pre-commit round {pc_round}/{MAX_PRECOMMIT_ROUNDS}...")
         try:
@@ -1197,8 +1416,22 @@ Generate complete production code for this file. Type-annotated. No commentary.
                 print("   \u2713 All pre-commit hooks passed.")
                 precommit_ok = True
                 break
+
+            current_failures = _parse_failing_hooks(
+                pre_result.stdout + pre_result.stderr
+            )
+            if current_failures and current_failures == persistent_failures:
+                print(
+                    f"   \u2717 Persistent failure on hooks: {current_failures}. "
+                    "Routing to engineer..."
+                )
+                break
+
+            persistent_failures = current_failures
+
             print(
-                f"   \u2717 Hooks failed (round {pc_round}). Re-staging auto-fixes and retrying..."
+                f"   \u2717 Hooks failed (round {pc_round}). "
+                "Re-staging auto-fixes and retrying..."
             )
         except subprocess.TimeoutExpired:
             print(f"   \u26a0 pre-commit timed out on round {pc_round}.")
@@ -1211,22 +1444,100 @@ Generate complete production code for this file. Type-annotated. No commentary.
             print(f"   \u26a0 git add failed on round {pc_round}.")
             break
 
-    if not precommit_ok:
-        print("   \u2717 pre-commit did not pass after all rounds.")
-        if pre_result:
-            print(pre_result.stdout.strip()[-3000:])
+    # ── Engineer fix route for persistent pre-commit failures ──────────
+    if not precommit_ok and pre_result and persistent_failures:
+        error_text = (pre_result.stdout + pre_result.stderr)[-5000:]
+        print("   Routing pre-commit error to engineer for iterative fix...")
+        fix_target = _extract_fix_target(error_text)
+        if not fix_target:
+            for t in reversed(pipeline):
+                if t.get("target_file"):
+                    fix_target = t["target_file"]
+                    break
 
+        fix_path = (
+            (
+                os.path.join(target_repo, fix_target)
+                if fix_target and not os.path.isabs(fix_target)
+                else fix_target
+            )
+            if fix_target
+            else None
+        )
+
+        current_error = error_text
+        max_fix_attempts = 3
+
+        for fix_attempt in range(1, max_fix_attempts + 1):
+            if fix_path and os.path.isfile(fix_path):
+                with open(fix_path, encoding="utf-8") as f:
+                    file_content = f.read()
+            else:
+                file_content = ""
+
+            fix_prompt = (
+                f"Pre-commit validation failed. Fix the source code.\n\n"
+                f"Error:\n{current_error}\n\n"
+                f"Target: {fix_target}\n"
+                f"Current file content:\n```\n{file_content}\n```\n\n"
+                f"Output the COMPLETE fixed file with the issue resolved. "
+                f"Preserve all existing code — only change what's broken."
+            )
+            raw_fix = implementer_agent.execute(
+                fix_prompt, stream=True, temperature=0.3
+            )
+            fix_code = clean_model_output(raw_fix)
+
+            if fix_path:
+                os.makedirs(os.path.dirname(fix_path), exist_ok=True)
+                with open(fix_path, "w", encoding="utf-8") as f:
+                    f.write(fix_code)
+                run_formatter_toolchain(fix_path, target_repo, isolated_env)
+                success, _ = validate_code_safety(fix_path, target_repo, isolated_env)
+                if not success:
+                    print(f"   \u2717 Engineer fix {fix_attempt} failed validation.")
+                    continue
+
+            print(f"   Engineer fix {fix_attempt} applied. Re-running pre-commit...")
+            subprocess.run(
+                ["git", "add", "."], cwd=target_repo, capture_output=True, text=True
+            )
+            retry_result = subprocess.run(
+                ["pre-commit", "run", "--all-files"],
+                cwd=target_repo,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if retry_result.returncode == 0:
+                print("   \u2713 All pre-commit hooks passed after engineer fix.")
+                precommit_ok = True
+                break
+            else:
+                current_error = (retry_result.stdout + retry_result.stderr)[-5000:]
+                print(
+                    f"   \u2717 Pre-commit still failing after fix {fix_attempt}. "
+                    "Re-routing to engineer with updated error..."
+                )
+
+    # ── Honest completion message ──────────────────────────────────────
     if mcp_orch:
+        status = "completed" if precommit_ok else "completed_with_errors"
         mcp_orch.remember(
-            f"campaign:{feature_name}:complete",
-            f"Campaign '{feature_name}' completed successfully across {len(pipeline)} stages",
-            tags=["feature", feature_name, "campaign_complete"],
+            f"campaign:{feature_name}:{status}",
+            f"Campaign '{feature_name}' {status} across {len(pipeline)} stages",
+            tags=["feature", feature_name, "campaign_complete", status],
         )
         mcp_orch.stop()
 
-    print(
-        f"\n=== Universal Engine Campaign for '{feature_name}' Completed Successfully ==="
-    )
+    if precommit_ok:
+        campaign_message = f"\n=== Universal Engine Campaign for '{feature_name}' Completed Successfully ==="
+    else:
+        campaign_message = (
+            f"\n=== Universal Engine Campaign for '{feature_name}' Completed with Errors ==="
+            f"\n  Pre-commit validation failed. Review reported hooks and fix manually."
+        )
+    print(campaign_message)
 
 
 if __name__ == "__main__":

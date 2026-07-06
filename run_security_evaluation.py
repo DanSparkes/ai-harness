@@ -31,7 +31,9 @@ ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER = "gemini-2.5-flash"
 HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = os.getenv("LOCAL_JUDGE", "qwen3-coder:latest")
+LOCAL_JUDGE = os.getenv(
+    "LOCAL_JUDGE", "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
+)
 # Ensure judge is from a different model family than architect
 _MODEL_FAMILIES = {
     "qwen": {"qwen", "qwen2", "qwen3", "qwen14b", "qwen2.5"},

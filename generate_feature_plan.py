@@ -27,7 +27,6 @@ from typing import Any
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 from core.agent import Agent
-from core.headroom import CompressionManager
 from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
 
@@ -361,20 +360,6 @@ def cmd_generate(args: argparse.Namespace) -> None:
     codebase_context = build_codebase_context(args)
     mcp_context = get_mcp_context(args)
 
-    headroom = CompressionManager(
-        target_ratio=0.4, compress_user_messages=True, protect_recent=0
-    )
-    if len(codebase_context) > 5000:
-        codebase_context, cr = headroom.compress_context(codebase_context)
-        print(
-            f"  Compressed codebase context: {cr.tokens_before:,} -> {cr.tokens_after:,} tok ({cr.compression_ratio:.1%} saved)"
-        )
-    if len(mcp_context) > 5000:
-        mcp_context, cr = headroom.compress_context(mcp_context)
-        print(
-            f"  Compressed MCP context: {cr.tokens_before:,} -> {cr.tokens_after:,} tok ({cr.compression_ratio:.1%} saved)"
-        )
-
     user_prompt = build_feature_prompt(
         args.prompt, codebase_context, args.target_repo, mcp_context
     )
@@ -397,6 +382,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     pipeline["target_workspace"] = args.target_repo
     pipeline["feature_name"] = name
+    pipeline["architectural_report"] = raw_output
 
     save_report(raw_output, report_path)
     save_pipeline(pipeline, pipeline_path)
@@ -431,6 +417,8 @@ def cmd_update(args: argparse.Namespace) -> None:
         print("Ensure the report has a '## Implementation Pipeline' section")
         print("with a valid JSON code block.")
         sys.exit(1)
+
+    pipeline["architectural_report"] = report_text
 
     pipeline_path = md_path.replace(".md", ".json")
     save_pipeline(pipeline, pipeline_path)

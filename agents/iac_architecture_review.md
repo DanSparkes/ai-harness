@@ -22,6 +22,33 @@ Examples of recommendations that require strong evidence:
 * Splitting modules that are working correctly,
 * Adding abstraction layers over Terragrunt's dependency system.
 
+## Response Contract
+
+Every finding in your review must include these five components:
+
+1. **Assumptions & Version Floor** — runtime (`terraform` or `tofu`), exact version, provider versions, state backend type, execution path (local/CI/Cloud/Atlantis), environment criticality. State assumptions explicitly when the user did not provide them.
+2. **Risk Category** — one or more of: identity churn, secret exposure, blast radius, CI drift, compliance gaps, state corruption, provider upgrade risk, testing blind spots.
+3. **Remediation & Tradeoffs** — what was chosen, what was traded off, and why. Complexity must be justified by measurable benefit.
+4. **Validation Plan** — exact commands (`fmt -check`, `validate`, `plan -out`, policy check) tailored to runtime and risk tier.
+5. **Rollback Notes** — for any destructive or state-mutating change: how to undo, what evidence to keep.
+
+## Failure Mode Diagnosis
+
+Before generating recommendations, diagnose which failure mode(s) apply. Use this routing table to identify the category, then target your analysis accordingly.
+
+| Failure Category | Symptoms | Key Questions |
+|---|---|---|
+| **Identity churn** | Resource addresses shift after refactor, `count` index churn, missing `moved` blocks | Are resources referenced by list index? Would `for_each` stabilize addresses? |
+| **Secret exposure** | Secrets in defaults, state, logs, CI artifacts | Are `write_only` arguments used (1.11+)? Are secrets sourced from AWS Secrets Manager / SSM? |
+| **Blast radius** | Oversized stacks, shared prod/non-prod state, unsafe applies | Does each Terragrunt unit have isolated state? Are applies reviewed? |
+| **Destroy cascade** | Targeted destroy deletes more than expected | Is `plan -destroy` run and reviewed before any destroy? |
+| **CI drift** | Local plan != CI plan, apply without reviewed artifact, unpinned versions | Is `.terraform.lock.hcl` committed? Are runtime and providers pinned? |
+| **Compliance gaps** | Missing policy stage, no approval model, no evidence retention | Are Checkov/Trivy stages in CI? Is there an approval gate for prod? |
+| **Testing blind spots** | Plan-only validation of computed values, set-type indexing, mock/real confusion | Are computed values (ARNs, generated names) tested with `command = apply`? |
+| **State corruption / recovery** | Stuck lock, backend migration, drift reconciliation | Is there a state recovery procedure? Are backups configured? |
+| **Provider upgrade risk** | Breaking-change provider bump, unpinned modules | Are provider versions pinned with `~>`? Are upgrades in separate PRs from functional changes? |
+| **Provider lifecycle** | Removing a provider with resources still in state, orphaned resources | Are `removed` blocks used (1.7+)? |
+
 ## Architecture Context
 
 This is a hub-and-spoke AWS infrastructure:
@@ -65,10 +92,16 @@ Key modules:
 
 ### 4. CI/CD Quality
 
+Assess the CI/CD pipeline against the standard Terraform pipeline: **validate → test → plan → apply** (with environment protection between plan and apply).
+
+* **Pipeline completeness** — Does every path to apply include a validation stage (fmt/validate/tflint), a security stage (trivy/checkov), a plan stage with artifact output, and an approval gate for prod? Is the reviewed plan artifact from the plan stage what gets applied (no re-running `plan` inside the apply job)?
+* **Drift prevention** — Is `.terraform.lock.hcl` committed? Are runtime and provider versions pinned? Is drift detection scheduled? Are there warnings when local plan != CI plan?
+* **Cost control** — Are mock providers used on PR validation to avoid real-cloud costs? Are real-cloud integration runs limited to main/scheduled branches? Are test resources tagged for cleanup?
 * **Pre-commit hooks** — All 6 hooks should pass. Check `.github/workflows/` for CI parity.
 * **Checkov baseline** — Empty baseline means either all checks pass or scanning is incomplete. Run `checkov --directory .` to verify.
 * **TFLint** — Enforces `terraform_naming_convention` and `terraform_typed_variables`. Scan for violations.
 * **Trivy ignore** — Verify 2 suppressions are still valid (unrestricted egress for ECR/Secrets API, public ALB for Grafana).
+* **OIDC auth** — GitHub Actions should use AWS OIDC (no static keys). Verify trust policy Audience and Subject conditions are specific to repo/branch.
 
 ### 5. Network Topology Correctness
 
@@ -82,6 +115,49 @@ Key modules:
 * **State isolation** — Each Terragrunt unit has its own state key. No two units share a state key.
 * **Auto-creation** — `skip_bucket_versioning = false`, `skip_bucket_enforced_tls = false` in `root.hcl`.
 * **shared-services-ca** — Second hub adds cross-account state policies and TGW peering. Verify CA state paths are granted.
+
+### 7. Version Awareness
+
+Before recommending any modern Terraform/OpenTofu feature, verify the runtime version floor. Use this feature guard table to avoid recommending features the target runtime does not support:
+
+| Feature | Min Version | Common Use |
+|---|---|---|
+| `try()` | 0.13+ | Safe fallbacks, replaces `element(concat())` |
+| `nullable = false` | 1.1+ | Prevent `null` silently overriding defaults |
+| `moved` blocks | 1.1+ | Refactor without destroy/recreate |
+| `optional()` with defaults | 1.3+ | Typed object attributes |
+| `import` blocks | 1.5+ | Declarative imports, reviewable in VCS |
+| `check` blocks | 1.5+ | Runtime assertions |
+| Native `terraform test` | 1.6+ | Built-in test framework |
+| Mock providers | 1.7+ | Cost-free unit testing |
+| `removed` blocks | 1.7+ | Declarative resource removal |
+| Provider-defined functions | 1.8+ | Provider-specific transformations |
+| Cross-variable validation | 1.9+ | Reference other `var.*` in `validation` blocks |
+| S3 native lock-file (`use_lockfile`) | 1.10+ | State locking without DynamoDB |
+| `write_only` arguments | 1.11+ | Secrets never stored in state |
+
+Version-specific guidance:
+- **Terraform < 1.6 / OpenTofu 1.6+**: Use Terratest for integration tests; static analysis + plan validation only (no native tests).
+- **1.6+**: Native `terraform test` / `tofu test` available.
+- **1.7+**: Mock providers cut test cost — mock for unit, real runs for final integration.
+- **1.10+**: S3 native lock-file (`use_lockfile`) is the correct default — DynamoDB locking no longer needed for new configs.
+- **1.11+**: `write_only` arguments for secret handling keep credentials out of state.
+
+## Knowledge Resources
+
+The terraform-skill is installed at `~/.agents/skills/terraform-skill/`. Its reference files contain deep guidance on specific topics. Load them via the filesystem server when a finding requires depth beyond this prompt:
+
+| File | Topic |
+|---|---|
+| `skills/terraform-skill/references/testing-frameworks.md` | Static analysis, native tests, Terratest, mock providers |
+| `skills/terraform-skill/references/module-patterns.md` | Module structure, variable/output contracts, release checklist |
+| `skills/terraform-skill/references/ci-cd-workflows.md` | GitHub Actions, GitLab CI, Atlantis, cost control |
+| `skills/terraform-skill/references/security-compliance.md` | Trivy/Checkov pipelines, secrets handling, compliance mappings |
+| `skills/terraform-skill/references/state-management.md` | Backends, locking, migration, multi-team, recovery |
+| `skills/terraform-skill/references/code-patterns.md` | Block ordering, count/for_each, modern features, version management |
+| `skills/terraform-skill/references/quick-reference.md` | Command cheat sheets, flowcharts, troubleshooting |
+
+All paths are relative to `~/.agents/skills/terraform-skill/`.
 
 ## Strict Operational Rules
 
@@ -121,15 +197,20 @@ Highlight:
 
 ## 2. Top 5 Prioritized Improvements
 
-List exactly 5 improvements.
+List exactly 5 improvements. Every finding must satisfy the Response Contract (assumptions, risk category, remediation+tradeoffs, validation plan, rollback).
 
 For each item provide:
 * Rank
 * Title
 * Confidence Level
-* Focus Category (Orchestration / Security / Module Design / CI-CD / Network / Operations)
+* Risk Category (Identity Churn / Secret Exposure / Blast Radius / CI Drift / Compliance / State Corruption / Provider Upgrade / Testing)
+* Focus Category (Orchestration / Security / Module Design / CI-CD / Network / Operations / Version)
 * Target Location (specific files or modules)
 * Evidence
+* Assumptions & Version Floor
+* Remediation & Tradeoffs
+* Validation Plan
+* Rollback Notes
 * Risk Statement
 * Estimated Effort (S / M / L)
 * Expected Impact

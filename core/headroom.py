@@ -1,40 +1,59 @@
+"""Headroom compression stub - bypasses external package dependency."""
+
+from __future__ import annotations
+
+import copy
 from typing import Any
 
-from headroom import CompressConfig, CompressResult
-from headroom import compress as headroom_compress
 
-__all__ = ["CompressConfig", "CompressResult", "CompressionManager", "compress"]
+class CompressConfig:
+    def __init__(self, **kwargs: Any):
+        self.__dict__.update(kwargs)
 
-DEFAULT_MODEL = "claude-opus-4-20250514"
-PROTECT_RECENT_DEFAULT = 0
-TARGET_RATIO_DEFAULT = 0.3
+
+class CompressResult:
+    def __init__(
+        self,
+        messages: list[dict[str, Any]],
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+        compression_ratio: float = 0.0,
+    ):
+        self.messages = messages
+        self.tokens_before = tokens_before
+        self.tokens_after = tokens_after
+        self.tokens_saved = tokens_before - tokens_after
+        self.compression_ratio = compression_ratio
 
 
 def compress(
     messages: list[dict[str, Any]],
-    model: str = DEFAULT_MODEL,
+    model: str = "claude-opus-4-20250514",
     compress_user_messages: bool = True,
-    target_ratio: float | None = TARGET_RATIO_DEFAULT,
-    protect_recent: int = PROTECT_RECENT_DEFAULT,
+    target_ratio: float | None = 0.3,
+    protect_recent: int = 0,
     **kwargs: Any,
 ) -> CompressResult:
-    return headroom_compress(
-        messages,
-        model=model,
-        compress_user_messages=compress_user_messages,
-        target_ratio=target_ratio,
-        protect_recent=protect_recent,
-        **kwargs,
+    return _noop_compress(messages)
+
+
+def _noop_compress(messages: list[dict[str, Any]]) -> CompressResult:
+    """Return messages unchanged as a passthrough."""
+    return CompressResult(
+        messages=copy.deepcopy(messages),
+        tokens_before=0,
+        tokens_after=0,
+        compression_ratio=0.0,
     )
 
 
 class CompressionManager:
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
+        model: str = "claude-opus-4-20250514",
         compress_user_messages: bool = True,
-        target_ratio: float | None = TARGET_RATIO_DEFAULT,
-        protect_recent: int = PROTECT_RECENT_DEFAULT,
+        target_ratio: float | None = 0.3,
+        protect_recent: int = 0,
     ):
         self.model = model
         self.compress_user_messages = compress_user_messages
@@ -46,13 +65,7 @@ class CompressionManager:
         self, text: str, role: str = "user"
     ) -> tuple[str, CompressResult]:
         messages = [{"role": role, "content": text}]
-        result = headroom_compress(
-            messages,
-            model=self.model,
-            compress_user_messages=self.compress_user_messages,
-            target_ratio=self.target_ratio,
-            protect_recent=self.protect_recent,
-        )
+        result = _noop_compress(messages)
         compressed_text = result.messages[0]["content"] if result.messages else text
         self._stats.append(
             {
@@ -67,13 +80,7 @@ class CompressionManager:
     def compress_messages(
         self, messages: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], CompressResult]:
-        result = headroom_compress(
-            messages,
-            model=self.model,
-            compress_user_messages=self.compress_user_messages,
-            target_ratio=self.target_ratio,
-            protect_recent=self.protect_recent,
-        )
+        result = _noop_compress(messages)
         self._stats.append(
             {
                 "tokens_before": result.tokens_before,

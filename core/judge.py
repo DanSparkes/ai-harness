@@ -14,7 +14,7 @@ class AutomatedEvaluator:
 
     def __init__(
         self,
-        judge_model: str = "qwen3-coder:latest",
+        judge_model: str = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
         base_url: str = "http://localhost:11434",
     ):
         self.judge_model = judge_model

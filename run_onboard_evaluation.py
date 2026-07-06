@@ -25,7 +25,7 @@ ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
 
 FALLBACK_REVIEWER = "gemini-2.5-flash"
 HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "qwen3-coder:latest"
+LOCAL_JUDGE = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
 
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
 

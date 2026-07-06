@@ -12,10 +12,12 @@ class StatefulHarnessRunner:
         base_url: str = "http://localhost:11434",
         api_key: str | None = None,
         fallback_model_name: str | None = None,
+        local_fallback_model: str | None = None,
         num_ctx: int = 65536,
     ):
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name or model_name
+        self.local_fallback_model = local_fallback_model
         self.api_key = api_key
         self.num_ctx = num_ctx
 
@@ -151,10 +153,48 @@ class StatefulHarnessRunner:
             else:
                 assistant_response = response_data.get("message", {}).get("content", "")
                 if not assistant_response:
-                    print("   \u26a0\ufe0f LLM returned empty or unexpected response")
-                    assistant_response = (
-                        "# Basic Diff Scan\n\nUnable to generate review.\n"
-                    )
+                    thinking = response_data.get("message", {}).get("thinking", "")
+                    hint = f" (thinking: {len(thinking)} chars)" if thinking else ""
+                    print(f"   \u26a0\ufe0f LLM returned empty content{hint}")
+
+                    if (
+                        self.local_fallback_model
+                        and self.local_fallback_model != self.model_name
+                    ):
+                        print(
+                            f"   -> Falling back to local model [{self.local_fallback_model}]..."
+                        )
+                        fb_messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": fallback_prompt or pass_prompt},
+                        ]
+                        fb_payload = {
+                            "model": self.local_fallback_model,
+                            "messages": fb_messages,
+                            "stream": False,
+                            "keep_alive": "0",
+                            "options": {
+                                "num_ctx": self.num_ctx,
+                                "temperature": temperature,
+                                "top_p": 0.9,
+                            },
+                        }
+                        fb_response = requests.post(
+                            self.api_url, json=fb_payload, headers=headers
+                        )
+                        fb_response.raise_for_status()
+                        fb_data = fb_response.json()
+                        fallback_output = fb_data.get("message", {}).get("content", "")
+                        if fallback_output:
+                            print(
+                                f"   -> Fallback succeeded ({len(fallback_output)} chars)"
+                            )
+                            assistant_response = fallback_output
+
+                    if not assistant_response:
+                        assistant_response = (
+                            "# Basic Diff Scan\n\nUnable to generate review.\n"
+                        )
 
             elapsed = time.time() - pass_t0
             print(

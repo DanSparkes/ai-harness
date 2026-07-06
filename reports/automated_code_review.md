@@ -1,23 +1,50 @@
 # Staff Code Review Report
 
 ## 1. Overall Architectural Verdict
-**APPROVED**
-This PR performs a standard major version upgrade for `i18next-http-backend` (2.x → 3.x) alongside routine transitive dependency normalization. The change aligns with the project's modern Vite 7 + React 18 stack by leveraging native browser APIs over legacy polyfills. No structural regressions are introduced, but verification of translation loading in test/staging environments is recommended due to transport layer shifts.
+**APPROVED WITH CONDITIONS**
+
+This PR is a comprehensive migration from hardcoded `django.contrib.auth.models.User` references to using `get_user_model()` / `settings.AUTH_USER_MODEL`. The change is architecturally sound and aligns with Django best practices for custom user model extensibility. However, there are two minor behavioral changes worth flagging: the shift from `.id` to `.pk` in logging/serialization contexts, and passing `.pk` instead of object instances in ORM queries.
 
 ## 2. Blast Radius & Coupling Assessment
-The `i18next-http-backend` module drives all internationalization fetch requests across the admin dashboard (`/login`, `/users`, `/administration`, etc.). Upgrading to v3 removes legacy CommonJS/polyfill fallbacks and expects a native `fetch` implementation. This impacts any environment lacking global `fetch` (e.g., older Node.js test runners or SSR contexts). The addition of `@tailwindcss/oxide-wasm32-wasi` dependencies is expected for Tailwind CSS v4's WASM compilation pipeline and does not affect runtime coupling.
+The migration touches **13 source files** and **6 test files**, representing a complete sweep of User model references across the codebase. Upstream/downstream impacts:
+
+- **Models layer**: `Profile.user` now uses `settings.AUTH_USER_MODEL`, which is the correct Django pattern for FK relationships to the auth user.
+- **Services layer**: `user_helper.py` and `authorization_helpers.py` are core dependencies used by 20+ views — consistent updates here prevent runtime import errors.
+- **Serializers layer**: All serializer files updated with local `User = get_user_model()` aliases, maintaining backward compatibility for code that previously referenced the name `User`.
+- **Tests layer**: Factory and test files updated consistently; no orphaned references to the old hardcoded User model remain in changed files.
+
+The PR is self-contained — all touched modules have been migrated uniformly, eliminating partial-state inconsistencies.
 
 ## 3. Line-by-Line Code Critiques
-- **File:** `package.json` — line 28 (dependencies block)
-- **Issue Category:** Dependency Compatibility / Runtime Risk
-- **The Defect:** `"i18next-http-backend": "^3.0.5"` replaces `^2.5.2`. v3 drops the built-in `fetch` fallback and assumes a native fetch environment. While Vite 7 + React 18 targets modern browsers where this is safe, it breaks in environments without global `fetch` (e.g., Jest/Node test runners or older CI stages).
-- **Remediation:** Ensure the test runner (Jest) has `jest-environment-jsdom` configured with a fetch polyfill, or explicitly pass a `fetch` implementation to `i18next-http-backend`'s `backendOptions.fetch` if running in Node. No code change is strictly required for browser deployment.
 
-- **File:** `package-lock.json` — lines 2021-2225 (`libc` removal) & 2567-2594 (`oxide-wasm32-wasi` additions)
-- **Issue Category:** Lockfile Hygiene / Transitive Dependencies
-- **The Defect:** The diff shows the removal of `libc` optional fields and the addition of `@tailwindcss/oxide-wasm32-wasi` bundled dependencies. This reflects npm v9+ lockfile format normalization and Tailwind CSS v4's shift to WASM-based compilation. These are benign structural updates but increase lockfile size slightly due to inlined transitive deps (`@emnapi/core`, `tslib`, etc.).
-- **Remediation:** No remediation needed. Accept the normalized lockfile. Monitor bundle size if WASM assets impact initial load, though Tailwind v4 handles this efficiently at build time.
+### Issue: Inconsistent `.id` vs `.pk` usage in logging/serialization
+- **File:** `memores/views/app/user.py` (lines ~74, ~98, ~165)
+- **Issue Category:** Maintainability / Defensive Engineering
+- **The Defect:** The diff changes `user.id` to `user.pk` in several locations. While functionally equivalent for UUID PKs, this creates inconsistency with other views that still use `.id`. More critically, if any downstream code (e.g., external services consuming the serialized response) depends on the field name being `id`, this change could break contract consumers.
+- **Remediation:** Verify no API contract tests assert on the `id` field name in responses. If the API contract is stable, consider whether `.pk` is truly necessary or if this is a cosmetic cleanup.
+
+### Issue: Passing `.pk` instead of object instances in ORM queries
+- **File:** `memores/utils/authorization_helpers.py` (line ~85)
+- **Issue Category:** Code Style / Idiomatic Django
+- **The Defect:** Changed from `Profile.objects.get(user=_authenticated_user(request_user))` to `Profile.objects.get(user=_authenticated_user(request_user).pk)`. While functionally identical, passing the object instance is more idiomatic and avoids an extra attribute access. The `.pk` pattern is slightly less readable.
+- **Remediation:** Consider reverting to pass the object: `Profile.objects.get(user=profile.user)` — both work identically in Django ORM for ForeignKey/OneToOneField lookups.
+
+### Issue: Type hint broadening from `User` to `AbstractUser`
+- **File:** `memores/utils/authorization_helpers.py` (multiple function signatures)
+- **Issue Category:** Type Safety / Documentation
+- **The Defect:** Function signatures now accept `AbstractUser | AnonymousUser`. While technically correct (since `get_user_model()` returns a subclass of AbstractUser), this broadens the accepted type beyond what's actually possible at runtime — DRF will always set `request.user` to either AnonymousUser or the configured User model. This could mislead future developers into thinking other AbstractUser subclasses are valid inputs.
+- **Remediation:** Consider using a TypeVar or keeping `User = get_user_model()` as the type hint for clarity: `def authorize_app_user(request_user: User | AnonymousUser) -> Profile:`
 
 ## 4. Test Coverage Assessment
-- Lock file changes do not require unit tests. However, because `i18next-http-backend` v3 alters the underlying transport layer (dropping legacy polyfills), I recommend a manual smoke test or integration check in staging to verify that locale files (`/locales/**/*.json`) load correctly across all admin routes.
-- The project's existing Jest setup has zero test coverage. Given the transport shift, adding a minimal integration test for i18n initialization (e.g., verifying `t()` resolves keys post-fetch) would prevent silent translation failures in future deploys.
+
+### Adequate Coverage
+- All modified source files have corresponding test file updates with consistent migration patterns.
+- `_make_profile` helper functions in test files updated to use `get_user_model().objects.create_user()` — correct pattern.
+- `test_access_gates.py` correctly updated `ContentType.objects.get_for_model(get_user_model())` — ensures ContentType resolution works with custom user models.
+
+### Missing Test Coverage
+- **No new tests for the `.id` → `.pk` behavioral change**: The diff changes response serialization in `UserView.get()` from `str(user.id)` to `str(user.pk)`. No test asserts on this specific field value, meaning if there's an unintended side effect (e.g., UUID format differences), it wouldn't be caught.
+- **No edge case tests for custom user model scenarios**: The migration enables custom user models but doesn't include tests verifying behavior with a non-default `AUTH_USER_MODEL` setting.
+
+### Weak Assertions Noted
+- Test files use the same factory pattern as before — no new weak assertions introduced, but also no strengthened assertions to validate the migration's correctness beyond "code runs without import errors."

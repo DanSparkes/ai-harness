@@ -266,7 +266,11 @@ class Agent:
 DEFAULT_AGENT_MAP = {
     "Architect": ("architect.md", "gemini-2.5-flash", None),
     "Engineer": ("code_implementer.md", "ornith:35b", None),
-    "QA_Tester": ("integration_auditor.md", "qwen3-coder:latest", None),
+    "QA_Tester": (
+        "integration_auditor.md",
+        "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
+        None,
+    ),
     "Security_Auditor": ("security.md", "gemini-2.5-flash", None),
     "Code_Reviewer": ("code_reviewer.md", "ornith:35b", None),
     "Exploratory_Architect": ("exploratory_architect.md", "gemini-2.5-flash", None),

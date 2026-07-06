@@ -57,10 +57,10 @@
       "command": "npx",
       "args": [
         "-y",
-        "terraform-mcp-server"
+        "@hashicorp/terraform-mcp-server"
       ],
       "enabled": true,
-      "description": "Interacts with the Terraform Registry API to search modules, providers, and fetch argument details."
+      "description": "Official HashiCorp Terraform MCP server. Interacts with the Terraform Registry API to search modules, providers, and fetch argument details for accurate schema-aware code generation."
     },
     "terragrunt-docs": {
       "type": "stdio",
