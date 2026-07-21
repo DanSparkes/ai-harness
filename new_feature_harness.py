@@ -23,6 +23,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any
 
 from core.agent import Agent, build_dependency_graph, skill_get_affected_files
@@ -31,9 +33,7 @@ from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
 
 IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", "ornith:35b")
-AUDITOR_MODEL = os.environ.get(
-    "AUDITOR_MODEL", "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
-)
+AUDITOR_MODEL = os.environ.get("AUDITOR_MODEL", "gpt-oss:20b")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 DEFAULT_MAX_ENGINEER_ATTEMPTS = 4
@@ -117,12 +117,7 @@ def run_formatter_toolchain(
             env=run_env,
             capture_output=True,
         )
-        subprocess.run(
-            ["uv", "run", "ruff", "check", "--fix", rel_path],
-            cwd=target_repo,
-            env=run_env,
-            capture_output=True,
-        )
+        # ruff check removed — linting handled by pre-commit in validate_code_safety
     except Exception as e:
         print(f"   Formatter toolchain warning: {e}")
 
@@ -155,8 +150,28 @@ def validate_code_safety(
     target_repo: str,
     run_env: dict[str, str],
     baseline_mypy_errors: set[str] | None = None,
+    original_size: int | None = None,
 ) -> tuple[bool, str]:
     rel_path = os.path.relpath(file_path, target_repo)
+
+    try:
+        current_size = os.path.getsize(file_path)
+    except OSError:
+        current_size = 0
+
+    if current_size == 0:
+        return False, "Generated file is empty (0 bytes)."
+
+    if original_size is not None and original_size > 0:
+        ratio = current_size / original_size
+        if ratio < 0.10:
+            return (
+                False,
+                f"Content loss: file is {ratio:.0%} of original "
+                f"({current_size}/{original_size} bytes). "
+                f"Generated code appears to have deleted most of the file.",
+            )
+
     try:
         syntax_res = subprocess.run(
             ["uv", "run", "python", "-m", "py_compile", rel_path],
@@ -175,25 +190,74 @@ def validate_code_safety(
         combined = (out + "\n" + err).lower()
         if "no module named" in combined or "module not found" in combined:
             print(f"   \u26a0\ufe0f Mypy plugin warning (non-blocking):\n{err.strip()}")
-            return True, "Passed local verification standards."
-        if baseline_mypy_errors is not None:
+        elif baseline_mypy_errors is not None:
             current_errors = _parse_mypy_output(out, err)
             new_errors = current_errors - baseline_mypy_errors
-            if not new_errors:
-                return (
-                    True,
-                    "Passed local verification standards (no new mypy violations)",
-                )
-            return False, "Mypy New Violations:\n" + "\n".join(sorted(new_errors))
-        return (
-            False,
-            f"Mypy Type Guard Violation:\nSTDOUT:\n{out.strip()}\nSTDERR:\n{err.strip()}",
+            if new_errors:
+                return False, "Mypy New Violations:\n" + "\n".join(sorted(new_errors))
+        else:
+            return (
+                False,
+                f"Mypy Type Guard Violation:\nSTDOUT:\n{out.strip()}\nSTDERR:\n{err.strip()}",
+            )
+
+    try:
+        subprocess.run(
+            ["git", "add", rel_path],
+            cwd=target_repo,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
+        pc_result = subprocess.run(
+            ["pre-commit", "run", "--files", rel_path],
+            cwd=target_repo,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if pc_result.returncode != 0:
+            output = (pc_result.stdout + pc_result.stderr).strip()
+            has_real_errors = _has_real_lint_errors(output)
+            if has_real_errors:
+                return False, f"Pre-commit Hook Violations:\n{output}"
+            else:
+                print(
+                    "   \u2714 Pre-commit auto-fixes applied (black/isort formatting)."
+                )
+    except FileNotFoundError:
+        print("   \u26a0 pre-commit not found in PATH (non-blocking).")
+    except subprocess.TimeoutExpired:
+        print("   \u26a0 pre-commit timed out (non-blocking).")
+    except Exception as e:
+        print(f"   \u26a0 pre-commit execution error (non-blocking): {e}")
 
     return True, "Passed local verification standards."
 
 
 # ── Mypy error translation & stall detection ─────────────────────
+
+# Hooks that auto-fix files (return non-zero when they modify files, but that's expected)
+_AUTO_FIX_HOOKS = {"black", "isort", "autoflake", "pyupgrade", "django-upgrade"}
+
+
+def _has_real_lint_errors(precommit_output: str) -> bool:
+    """Check if pre-commit output contains real linting errors, not just auto-fixes.
+
+    Auto-fix hooks (black, isort, etc.) return non-zero when they modify files.
+    This is expected behavior, not an error. Only fail on actual linting violations.
+    """
+    failed_hooks = set()
+    for line in precommit_output.splitlines():
+        if "...Failed" in line:
+            name = line.split("...")[0].strip()
+            if name:
+                failed_hooks.add(name)
+
+    real_failures = failed_hooks - _AUTO_FIX_HOOKS
+    return len(real_failures) > 0
 
 
 def _parse_failing_hooks(precommit_output: str) -> set[str]:
@@ -834,6 +898,7 @@ def main() -> None:
         task.setdefault("instruction", task.get("task", task.get("instruction", "")))
 
         print(f"\n[Stage {task['step']}] {task['name']}")
+        stage_start_time = time.time()
 
         full_target_path = None
         file_backup_contents = None
@@ -943,10 +1008,18 @@ def main() -> None:
             engineer_succeeded = False
             engineer_log = ""
             diff_stats: dict[str, int] | None = None
+            content_loss_warning = ""
 
             # ── Engineer Inner Loop (compiler loop) ───────────────────────
             prev_error_codes: set[str] = set()
+            prev_log_msg = ""
             for engineer_attempt in range(1, max_engineer_attempts + 1):
+                stage_elapsed = time.time() - stage_start_time
+                if stage_elapsed > 3600:
+                    print(
+                        f"  \u26a0\ufe0f Stage has been running for {stage_elapsed / 60:.0f} minutes. "
+                        f"Consider if this stage needs manual intervention."
+                    )
                 print(
                     f"  \U0001f527 Engineer attempt {engineer_attempt}/{max_engineer_attempts}"
                     f" (auditor round {auditor_round}/{max_auditor_rounds})..."
@@ -1028,6 +1101,17 @@ Task: {task['instruction']}
 
                 code_generated = clean_model_output(raw_response)
 
+                if not code_generated or len(code_generated.strip()) == 0:
+                    print(
+                        f"   \u274c Engineer produced empty output ({len(raw_response)} raw chars). "
+                        f"Retrying..."
+                    )
+                    context_history += (
+                        f"\n\n[Attempt {engineer_attempt} Empty Output for {task['target_file']}]: "
+                        f"Model returned no code. Provide complete, valid Python code."
+                    )
+                    continue
+
                 os.makedirs(os.path.dirname(full_target_path), exist_ok=True)
                 with open(full_target_path, "w", encoding="utf-8") as f:
                     f.write(code_generated)
@@ -1037,8 +1121,17 @@ Task: {task['instruction']}
                 with open(full_target_path, encoding="utf-8") as f:
                     code_generated = f.read()
 
+                original_size = (
+                    len(file_backup_contents)
+                    if file_backup_contents is not None
+                    else None
+                )
                 success, log_msg = validate_code_safety(
-                    full_target_path, target_repo, isolated_env, baseline_mypy_errors
+                    full_target_path,
+                    target_repo,
+                    isolated_env,
+                    baseline_mypy_errors,
+                    original_size=original_size,
                 )
                 if not success:
                     print(
@@ -1052,7 +1145,13 @@ Task: {task['instruction']}
                     current_codes = _parse_mypy_error_codes(log_msg)
 
                     # Stall detection: bail early if errors repeat across attempts
-                    if prev_error_codes and current_codes.issuperset(prev_error_codes):
+                    is_repeat = False
+                    if (
+                        prev_error_codes and current_codes.issuperset(prev_error_codes)
+                    ) or (prev_log_msg and log_msg == prev_log_msg):
+                        is_repeat = True
+
+                    if is_repeat:
                         print(
                             "  \u26a0\ufe0f Same errors persist from previous attempt. "
                             "Escaping to auditor for guidance..."
@@ -1062,6 +1161,7 @@ Task: {task['instruction']}
                         break
 
                     prev_error_codes = current_codes
+                    prev_log_msg = log_msg
 
                     if file_backup_contents is not None:
                         with open(full_target_path, "w", encoding="utf-8") as f:
@@ -1078,8 +1178,6 @@ Task: {task['instruction']}
                 engineer_log = ""
 
                 # ── Ponytail: compute diff stats ─────────────────────────
-                diff_stats = None
-                content_loss_warning = ""
                 if PONYTAIL_ENABLED and file_backup_contents is not None:
                     diff_stats = _compute_diff_stats(
                         file_backup_contents, code_generated
@@ -1369,6 +1467,48 @@ Task: {task['instruction']}
                     raw_test = implementer_agent.execute(test_user_prompt, stream=True)
                     test_code = clean_model_output(raw_test)
 
+                    if not test_code or len(test_code.strip()) == 0:
+                        print(
+                            "  \u274c Test generation produced empty output (will not block)."
+                        )
+                        context_history += (
+                            f"\n\n[Tests Failed (empty output): {test_rel}]\n"
+                        )
+                        continue
+
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".py", delete=False
+                        ) as tmp:
+                            tmp.write(test_code)
+                        syntax_ok, syntax_err = False, ""
+                        r = subprocess.run(
+                            ["uv", "run", "python", "-m", "py_compile", tmp.name],
+                            cwd=target_repo,
+                            env=isolated_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        syntax_ok = r.returncode == 0
+                        if not syntax_ok:
+                            syntax_err = (r.stderr or r.stdout).strip()[:300]
+                    except Exception as e:
+                        syntax_ok, syntax_err = False, str(e)[:300]
+                    finally:
+                        with contextlib.suppress(OSError):
+                            os.unlink(tmp.name)
+
+                    if not syntax_ok:
+                        print(
+                            "  \u274c Test generation produced invalid Python (will not block):"
+                        )
+                        print(f"     {syntax_err}")
+                        context_history += (
+                            f"\n\n[Tests Failed (invalid syntax): {test_rel}]\n"
+                        )
+                        continue
+
                     os.makedirs(os.path.dirname(test_path), exist_ok=True)
                     with open(test_path, "w", encoding="utf-8") as f:
                         f.write(test_code)
@@ -1487,6 +1627,10 @@ Task: {task['instruction']}
                 fix_prompt, stream=True, temperature=0.3
             )
             fix_code = clean_model_output(raw_fix)
+
+            if not fix_code or len(fix_code.strip()) == 0:
+                print("   \u274c Engineer fix produced empty output. Retrying...")
+                continue
 
             if fix_path:
                 os.makedirs(os.path.dirname(fix_path), exist_ok=True)

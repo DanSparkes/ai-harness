@@ -236,6 +236,7 @@ class Agent:
         response.raise_for_status()
 
         full_content = ""
+        last_heartbeat = time.time()
         for raw_line in response.iter_lines():
             if not raw_line:
                 continue
@@ -243,6 +244,12 @@ class Agent:
             data = json.loads(line)
             token = data.get("message", {}).get("content", "")
             full_content += token
+            now = time.time()
+            if now - last_heartbeat >= 30:
+                print(
+                    f"   [Stream] ...{len(full_content)} chars ({now - t0:.0f}s elapsed)"
+                )
+                last_heartbeat = now
             if data.get("done", False):
                 break
 

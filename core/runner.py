@@ -14,12 +14,30 @@ class StatefulHarnessRunner:
         fallback_model_name: str | None = None,
         local_fallback_model: str | None = None,
         num_ctx: int = 65536,
+        temperature: float | None = None,
+        request_timeout: float | None = None,
     ):
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name or model_name
         self.local_fallback_model = local_fallback_model
         self.api_key = api_key
         self.num_ctx = num_ctx
+
+        # Explicit temperature override; otherwise pick a sensible default
+        # based on the model role (coder models -> deterministic, reasoning
+        # models -> slightly creative).
+        self.temperature = (
+            temperature
+            if temperature is not None
+            else (0.0 if "coder" in model_name.lower() else 0.4)
+        )
+
+        # Per-request timeout. Local models can stall on GPU/RAM pressure, so
+        # bound it to avoid 45-minute CI hangs (was 900s x 3 retries).
+        # Cloud calls use a shorter timeout since latency is predictable.
+        self.request_timeout = request_timeout or (
+            120 if "gemini" in model_name.lower() or api_key else 600
+        )
 
         self.is_cloud = "gemini" in model_name.lower() or bool(api_key)
 
@@ -40,10 +58,35 @@ class StatefulHarnessRunner:
         headers: dict,
         max_retries: int = 5,
         base_delay: float = 2.0,
+        extra_retry_codes: set[int] | None = None,
+        timeout: float | None = None,
     ) -> requests.Response:
-        retry_codes = {429, 503}
+        retry_codes = {429, 503} | (extra_retry_codes or set())
+        request_timeout = timeout if timeout is not None else self.request_timeout
+        response: requests.Response | None = None
         for attempt in range(max_retries + 1):
-            response = requests.post(url, json=payload, headers=headers)
+            try:
+                response = requests.post(
+                    url, json=payload, headers=headers, timeout=request_timeout
+                )
+            except requests.exceptions.Timeout:
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt)
+                    print(
+                        f"   ⏳ Request timed out. Retrying in {delay}s ({attempt + 1}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt)
+                    print(
+                        f"   ⏳ Request error ({type(e).__name__}). Retrying in {delay}s ({attempt + 1}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
             if response.status_code not in retry_codes:
                 return response
             if attempt < max_retries:
@@ -53,6 +96,9 @@ class StatefulHarnessRunner:
                     f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})..."
                 )
                 time.sleep(delay)
+        # response may be None if every attempt raised Timeout, but mypy
+        # with ignore_missing_imports treats requests.Response as Any and
+        # does not surface the implicit None possibility here.
         return response
 
     def execute_sequence(
@@ -68,7 +114,7 @@ class StatefulHarnessRunner:
             if self.is_cloud and self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
 
-            temperature = 0.0 if "coder" in self.model_name else 0.4
+            temperature = self.temperature
 
             if self.is_cloud:
                 payload = {
@@ -97,7 +143,14 @@ class StatefulHarnessRunner:
             if self.is_cloud:
                 response = self._call_with_retry(self.api_url, payload, headers)
             else:
-                response = requests.post(self.api_url, json=payload, headers=headers)
+                response = self._call_with_retry(
+                    self.api_url,
+                    payload,
+                    headers,
+                    max_retries=3,
+                    base_delay=5.0,
+                    extra_retry_codes={500},
+                )
 
             if self.is_cloud and response.status_code in (429, 503):
                 label = (
@@ -114,7 +167,7 @@ class StatefulHarnessRunner:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": fallback_prompt or pass_prompt},
                 ]
-                payload = {
+                fb_payload = {
                     "model": self.model_name,
                     "messages": fb_messages,
                     "stream": False,
@@ -125,15 +178,33 @@ class StatefulHarnessRunner:
                         "top_p": 0.9,
                     },
                 }
-                headers = {"Content-Type": "application/json"}
-                response = requests.post(self.api_url, json=payload, headers=headers)
+                fb_headers = {"Content-Type": "application/json"}
 
-                response.raise_for_status()
-                response_data = response.json()
-                assistant_response = response_data.get("message", {}).get("content", "")
+                assistant_response = ""
+                try:
+                    fb_response = self._call_with_retry(
+                        self.api_url,
+                        fb_payload,
+                        fb_headers,
+                        max_retries=3,
+                        base_delay=5.0,
+                        extra_retry_codes={500},
+                    )
+                    fb_response.raise_for_status()
+                    fb_data = fb_response.json()
+                    assistant_response = fb_data.get("message", {}).get(
+                        "content", ""
+                    ) or fb_data.get("message", {}).get("thinking", "")
+                except Exception as e:
+                    print(
+                        f"   \u274c Local fallback also failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
                 if not assistant_response:
                     assistant_response = (
-                        "# Basic Diff Scan\n\nUnable to generate review.\n"
+                        "# Basic Diff Scan\n\n"
+                        "Unable to generate review (cloud down and local fallback failed).\n"
                     )
 
                 execution_history.append(
@@ -152,10 +223,14 @@ class StatefulHarnessRunner:
                 assistant_response = response_data["choices"][0]["message"]["content"]
             else:
                 assistant_response = response_data.get("message", {}).get("content", "")
-                if not assistant_response:
-                    thinking = response_data.get("message", {}).get("thinking", "")
-                    hint = f" (thinking: {len(thinking)} chars)" if thinking else ""
-                    print(f"   \u26a0\ufe0f LLM returned empty content{hint}")
+                thinking = response_data.get("message", {}).get("thinking", "")
+                if not assistant_response and thinking:
+                    print(
+                        f"   [info] Content empty, using thinking output ({len(thinking)} chars)"
+                    )
+                    assistant_response = thinking
+                elif not assistant_response:
+                    print("   ⚠️  LLM returned empty content (no thinking either)")
 
                     if (
                         self.local_fallback_model
@@ -179,17 +254,30 @@ class StatefulHarnessRunner:
                                 "top_p": 0.9,
                             },
                         }
-                        fb_response = requests.post(
-                            self.api_url, json=fb_payload, headers=headers
-                        )
-                        fb_response.raise_for_status()
-                        fb_data = fb_response.json()
-                        fallback_output = fb_data.get("message", {}).get("content", "")
-                        if fallback_output:
-                            print(
-                                f"   -> Fallback succeeded ({len(fallback_output)} chars)"
+                        try:
+                            fb_response = self._call_with_retry(
+                                self.api_url,
+                                fb_payload,
+                                headers,
+                                max_retries=2,
+                                base_delay=3.0,
+                                extra_retry_codes={500},
                             )
-                            assistant_response = fallback_output
+                            fb_response.raise_for_status()
+                            fb_data = fb_response.json()
+                            fallback_output = fb_data.get("message", {}).get(
+                                "content", ""
+                            ) or fb_data.get("message", {}).get("thinking", "")
+                            if fallback_output:
+                                print(
+                                    f"   -> Fallback succeeded ({len(fallback_output)} chars)"
+                                )
+                                assistant_response = fallback_output
+                        except Exception as e:
+                            print(
+                                f"   \u274c Local fallback model also failed: "
+                                f"{type(e).__name__}: {e}"
+                            )
 
                     if not assistant_response:
                         assistant_response = (
@@ -208,5 +296,11 @@ class StatefulHarnessRunner:
                     "output": assistant_response,
                 }
             )
+
+            # Feed this pass's output back into the conversation so multi-pass
+            # reasoning actually chains. Without this, pass N+1 cannot see
+            # pass N's analysis and the "two-pass" design collapses into two
+            # independent single-pass prompts.
+            messages.append({"role": "assistant", "content": assistant_response})
 
         return execution_history

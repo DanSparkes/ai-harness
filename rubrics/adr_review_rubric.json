@@ -1,0 +1,31 @@
+{
+  "name": "ADR Review Rubric",
+  "instructions": "Evaluate the quality of an ADR review. The reviewer must demonstrate staff-level judgment by finding real gaps, validating assumptions against evidence, and producing actionable feedback.",
+
+  "metrics": {
+    "gap_detection": {
+      "weight": 30,
+      "criteria": "Rate 1-5. Score 5 if the review identifies specific, non-obvious gaps that would cause implementation failure (e.g., missing migration dependency, untested assumption, incorrect code pattern). Score 1 if only surface-level issues are flagged or the review says 'looks good' without specifics."
+    },
+
+    "assumption_interrogation": {
+      "weight": 25,
+      "criteria": "Rate 1-5. Score 5 if the review challenges assumptions with concrete counterexamples or identifies missing assumptions the author overlooked. Score 1 if assumptions are accepted at face value."
+    },
+
+    "decision_coherence_check": {
+      "weight": 20,
+      "criteria": "Rate 1-5. Score 5 if the review traces the decision back to the stated criteria and identifies any contradictions or gaps between goals and implementation. Score 1 if the review evaluates the decision in isolation without checking it against the stated criteria."
+    },
+
+    "actionability": {
+      "weight": 15,
+      "criteria": "Rate 1-5. Score 5 if every critical gap includes a specific, implementable fix (not 'consider doing X'). Score 1 if feedback is vague ('improve the migration plan') without specifying what to change."
+    },
+
+    "resistance_to_hallucination": {
+      "weight": 10,
+      "criteria": "Rate 1-5. Score 5 if the review only references structures, patterns, or risks that actually exist in the ADR text. Score 1 if the review invents problems or attributes claims to the ADR that aren't present."
+    }
+  }
+}

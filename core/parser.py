@@ -816,11 +816,26 @@ class DjangoTopographer:
                                     "blank",
                                     "primary_key",
                                     "editable",
+                                    "max_length",
                                 ):
                                     try:
                                         field_info[kw.arg] = ast.literal_eval(kw.value)
                                     except (ValueError, TypeError):
                                         field_info[kw.arg] = ast.dump(kw.value)
+                                elif kw.arg == "choices":
+                                    try:
+                                        field_info["choices"] = ast.literal_eval(
+                                            kw.value
+                                        )
+                                    except (ValueError, TypeError):
+                                        field_info["choices"] = "complex_expression"
+                                elif kw.arg == "help_text":
+                                    try:
+                                        field_info["help_text"] = ast.literal_eval(
+                                            kw.value
+                                        )
+                                    except (ValueError, TypeError):
+                                        field_info["help_text"] = "complex_expression"
                         fields.append(field_info)
         return fields
 
