@@ -1,34 +1,31 @@
 import argparse
-import json
 import os
+import sys
 import time
 
-from core.agent import Agent
-from core.judge import AutomatedEvaluator
-from core.mcp_orchestrator import init_orchestrator
+import requests
+
+from core import harness
+from core.config import get_config
+from core.forge_proxy import ForgeProxy
 from core.parser import DjangoTopographer
-from core.warehouse import HarnessWarehouse
 
-USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "ornith:35b"
+def _abort_on_conn_error(e: Exception) -> None:
+    """Surface an actionable message for LLM connection failures, then exit.
 
-REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE = (
-    "https://generativelanguage.googleapis.com/v1beta/openai"
-    if USE_GEMINI
-    else "http://localhost:11434"
-)
-ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
+    Mirrors run_security_evaluation.py: an OOM'd Ollama model or a downed
+    server would otherwise propagate a raw ConnectionError traceback.
+    """
+    print(
+        f"\n❌ LLM request failed ({type(e).__name__}). "
+        "If local, Ollama may be down or the model OOM'd during generation. "
+        "Check `ollama ps` / GPU memory and retry."
+    )
+    sys.exit(1)
 
-FALLBACK_REVIEWER = "gemini-2.5-flash"
-HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
 
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
-
-_mcp_orch = None
 
 
 def parse_arguments():
@@ -56,33 +53,14 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def init_mcp(repo_path=None, config_path=None):
-    global _mcp_orch
-    if _mcp_orch is not None:
-        return _mcp_orch
-    cfg_path = config_path or MCP_CONFIG_PATH
-    path = repo_path or os.environ.get("TARGET_REPO") or os.getcwd()
-    orch = init_orchestrator(cfg_path, path)
-    if orch:
-        _mcp_orch = orch
-    return orch
-
-
-def build_mcp_context_block() -> str:
-    orch = _mcp_orch
-    if not orch:
-        return ""
-    return orch.build_mcp_context_block(tags=["architectural_rule"])
-
-
 def main():
     args = parse_arguments()
+    cfg = get_config()
 
-    target_repo = args.repo or os.environ.get("TARGET_REPO")
+    target_repo = harness.resolve_target_repo(args.repo)
     mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
 
-    is_local_mode = not ARCHITECT_API_KEY
-    if not is_local_mode and not ARCHITECT_API_KEY:
+    if cfg.is_cloud and not cfg.api_key:
         print("Error: USE_GEMINI=true requires GEMINI_API_KEY to be set.")
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
@@ -92,12 +70,12 @@ def main():
         print("Set TARGET_REPO env var or pass --repo /path/to/project")
         return
 
-    print(f"{'=' * 60}")
-    print("Launching Architecture Review Engine (Hybrid Mode)")
-    print(f"Target Project   : {target_repo}")
-    print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local Judge      : {LOCAL_JUDGE}")
-    print(f"{'=' * 60}\n")
+    harness.banner(
+        "Launching Architecture Review Engine (Hybrid Mode)",
+        cfg,
+        target_project=target_repo,
+        local_judge=cfg.resolve_judge(),
+    )
 
     start_time = time.time()
 
@@ -121,21 +99,24 @@ def main():
         system_agent_prompt = f.read()
     print("   [Done] Persona loaded")
 
-    # 2b. Initialize MCP workbench for richer context
-    print("Step 2b: Initializing MCP workbench...")
-    orch = init_mcp(repo_path=target_repo, config_path=mcp_config_path)
-    mcp_block = build_mcp_context_block() if orch else ""
-    if orch:
-        print("   [Done] MCP workbench active (tools + git + memory)\n")
-    else:
-        print(
-            "   [Skipped] No MCP config found. Use MCP_CONFIG env var or mcp_config.json\n"
+    with harness.mcp_context(mcp_config_path, target_repo) as orch:
+        mcp_block = (
+            orch.build_mcp_context_block(tags=["architectural_rule"]) if orch else ""
         )
+        if orch:
+            print("   [Done] MCP workbench active (tools + git + memory)\n")
+        else:
+            print(
+                "   [Skipped] No MCP config found. "
+                "Use MCP_CONFIG env var or mcp_config.json\n"
+            )
 
-    # 3. Build prompt context
-    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
+        # 3. Build shared context (injected into Pass 1 only; threaded onward)
+        import json
 
-    parser_limitations = f"""### Parser Capabilities & Limitations
+        project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
+
+        parser_limitations = f"""### Parser Capabilities & Limitations
 
 The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
 
@@ -175,17 +156,15 @@ Based on parsing, this project contains:
 ### MCP-Augmented Context (Live Project State)
 {mcp_block}"""
 
-    # Build passes
-    pass_templates = [
-        f"""[Pass 1: Repository Observation]
-Analyze this Django repository topography:
+        shared_context = (
+            f"{parser_limitations}\n\n## Project Topography\n```json\n"
+            f"{project_map_json}\n```"
+        )
 
-{parser_limitations}
-
-## Project Topography
-```json
-{project_map_json}
-```
+        # Passes reference the topography provided above (in shared_context /
+        # Pass 1), which the runner threads into subsequent passes via history.
+        pass1 = """[Pass 1: Repository Observation]
+Analyze the Django repository topography provided above.
 
 Your task is ONLY to identify observations.
 
@@ -206,18 +185,17 @@ Output format:
 Observation:
 Evidence:
 Operational Significance:
-Confidence:""",
-        f"""[Pass 2: Evidence Validation]
-Review all observations from Pass 1.
+Confidence:"""
 
-{parser_limitations}
+        pass2 = """[Pass 2: Evidence Validation]
+Review all observations from Pass 1.
 
 Categorize each observation as:
 - Confirmed
 - Plausible
 - Speculative
 
-Cross-check each observation against the actual topography:
+Cross-check each observation against the actual topography provided above:
 - **Model field exists?** Confirm every referenced field appears in the specific model's `fields` list.
 - **View exists?** Confirm every referenced class appears in the `views` list with its `absolute_path`.
 - **Serializer exists?** Confirm every referenced serializer appears in the `serializers` list.
@@ -239,8 +217,9 @@ Finding:
 Category:
 Evidence:
 Reasoning Chain:
-Likely Impact:""",
-        """[Pass 3: Staff Prioritization]
+Likely Impact:"""
+
+        pass3 = """[Pass 3: Staff Prioritization]
 Assume you are the Staff Engineer responsible for this system.
 
 Constraints:
@@ -260,8 +239,9 @@ Rank them by:
 For each initiative provide:
 - Why it was selected,
 - Why alternatives were deferred,
-- Estimated implementation effort.""",
-        """[Pass 4: Executive Reporting]
+- Estimated implementation effort."""
+
+        pass4 = """[Pass 4: Executive Reporting]
 Generate the final report.
 
 Requirements:
@@ -278,45 +258,31 @@ Avoid recommending:
 
 unless repository evidence demonstrates that the current approach is failing.
 
-Focus on pragmatic Django evolution.""",
-    ]
+Focus on pragmatic Django evolution."""
 
-    passes = pass_templates
+        # 4. Execute multi-pass architecture review
+        print(f"Step 3: Processing architecture review via [{cfg.reasoning_model}]...")
+        pass_start = time.time()
 
-    # 4. Execute multi-pass architecture review via Agent
-    print(f"Step 3: Processing architecture review via [{REASONING_ARCHITECT}]...")
-    pass_start = time.time()
-
-    architect = Agent(
-        name="Systems_Architect",
-        system_prompt=system_agent_prompt,
-        model_name=REASONING_ARCHITECT,
-        base_url=ARCHITECT_API_BASE,
-        api_key=ARCHITECT_API_KEY,
-        num_ctx=65536,
-    )
-
-    context_parts: list[str] = []
-    for i, pass_prompt in enumerate(passes):
-        combined = (
-            "\n\n".join([*context_parts, pass_prompt]) if context_parts else pass_prompt
+        try:
+            draft_report, model_used, _hist = harness.run_multipass(
+                system_prompt=system_agent_prompt,
+                passes=[pass1, pass2, pass3, pass4],
+                shared_context=shared_context,
+                role="reasoning",
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _abort_on_conn_error(e)
+        print(
+            f"   [Done] Architecture review via {model_used} "
+            f"in {time.time() - pass_start:.2f}s"
         )
-        t0 = time.time()
-        output = architect.execute(combined)
-        print(f"   [Done] Pass {i + 1} / {len(passes)} in {time.time() - t0:.1f}s")
-        context_parts.append(f"[Pass {i + 1} Output]:\n{output}")
 
-    draft_report = output
-    model_used = architect.model_name
-    print(
-        f"   [Done] Architecture review via {model_used} in {time.time() - pass_start:.2f}s"
-    )
+        # 5. Adversarial review (separate model family)
+        print(f"Step 4: Running adversarial review via [{cfg.heavy_reviewer}]...")
+        adv_start = time.time()
 
-    # 5. Adversarial review
-    print(f"Step 4: Running adversarial review via [{HEAVY_REVIEWER}]...")
-    adv_start = time.time()
-
-    adversarial_prompt = f"""
+        adversarial_prompt = f"""
 Act as a skeptical Staff Django Engineer.
 
 Review this report.
@@ -340,18 +306,25 @@ Report:
 
 {draft_report}
 """
+        adversary = harness.build_agent(
+            "Adversary",
+            system_prompt="",
+            model_override=cfg.heavy_reviewer,
+            num_ctx=32768,
+        )
+        try:
+            critique = adversary.execute(adversarial_prompt)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _abort_on_conn_error(e)
+        print(
+            f"   [Done] Adversarial review completed in {time.time() - adv_start:.2f}s"
+        )
 
-    adversary = Agent(
-        name="Adversary", system_prompt="", model_name=HEAVY_REVIEWER, num_ctx=32768
-    )
-    critique = adversary.execute(adversarial_prompt)
-    print(f"   [Done] Adversarial review completed in {time.time() - adv_start:.2f}s")
+        # 6. Revision pass (architect revises)
+        print("Step 5: Final revision pass...")
+        rev_start = time.time()
 
-    # 6. Revision pass
-    print("Step 5: Final revision pass...")
-    rev_start = time.time()
-
-    revision_prompt = f"""
+        revision_prompt = f"""
 Revise the report using the critique below.
 
 Critique:
@@ -369,50 +342,41 @@ Return the revised report only.
 Original Report:
 {draft_report}
 """
+        architect = harness.build_agent("Systems_Architect", system_agent_prompt)
+        try:
+            final_report = architect.execute(revision_prompt)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _abort_on_conn_error(e)
+        print(f"   [Done] Revision completed in {time.time() - rev_start:.2f}s")
 
-    final_report = architect.execute(revision_prompt)
-    print(f"   [Done] Revision completed in {time.time() - rev_start:.2f}s")
-
-    # 7. Evaluate final report quality
-    print(f"Step 6: Evaluating final report via Local Judge [{LOCAL_JUDGE}]...")
-    judge_start = time.time()
-
-    judge_context = f"Project Topography:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
-    scores = evaluator.grade_run(
-        final_report, "rubrics/architecture_rubric.json", context=judge_context
-    )
-
-    print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
-    print(f"Architecture Review Reliability Scores: {scores}")
-
-    # 8. Log and Export Artifacts
-    print("Step 7: Archiving run data...")
-    warehouse = HarnessWarehouse()
-    warehouse.log_run(
-        model_name=model_used,
-        agent_role="Staff Architecture Review",
-        raw_output=final_report,
-        scores=scores,
-    )
-
-    report_filename = "reports/staff_architecture_review.md"
-    os.makedirs("reports", exist_ok=True)
-    with open(report_filename, "w", encoding="utf-8") as f:
-        f.write(final_report)
-
-    if _mcp_orch:
-        _mcp_orch.remember(
-            "eval:architecture_review:complete",
-            f"Architecture review completed. Report: {report_filename}",
-            tags=["evaluation", "architecture", "complete"],
+        # 7. Evaluate final report quality + archive
+        print(f"Step 6: Evaluating final report via Judge [{cfg.resolve_judge()}]...")
+        judge_start = time.time()
+        judge_context = f"Project Topography:\n{project_map_json[:8000]}"
+        scores = harness.grade_and_archive(
+            output=final_report,
+            rubric_path="rubrics/architecture_rubric.json",
+            agent_role="Staff Architecture Review",
+            model_used=model_used,
+            config=cfg,
+            judge_context=judge_context,
+            report_path="reports/staff_architecture_review.md",
         )
-        _mcp_orch.stop()
+        print(f"   [Done] Judging in {time.time() - judge_start:.2f}s")
+        print(f"Architecture Review Reliability Scores: {scores}")
+
+        if orch:
+            orch.remember(
+                "eval:architecture_review:complete",
+                "Architecture review completed. Report: reports/staff_architecture_review.md",
+                tags=["evaluation", "architecture", "complete"],
+            )
 
     total_duration = time.time() - start_time
-    print(f"\nReport saved to: {report_filename}")
+    print("\nReport saved to: reports/staff_architecture_review.md")
     print(f"Total Time: {total_duration:.2f}s  Model: {model_used}")
 
 
 if __name__ == "__main__":
-    main()
+    with ForgeProxy(get_config()):
+        main()

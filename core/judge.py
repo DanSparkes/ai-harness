@@ -9,6 +9,7 @@ import requests
 from core.cache import get as cache_get
 from core.cache import make_key
 from core.cache import set as cache_set
+from core.config import DEFAULT_LOCAL_JUDGE, OLLAMA_BASE_URL
 
 
 class AutomatedEvaluator:
@@ -16,15 +17,19 @@ class AutomatedEvaluator:
 
     def __init__(
         self,
-        judge_model: str = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
-        base_url: str = "http://localhost:11434",
+        judge_model: str = DEFAULT_LOCAL_JUDGE,
+        base_url: str = OLLAMA_BASE_URL,
         request_timeout: float | None = None,
+        use_openai_format: bool = False,
     ):
         self.judge_model = judge_model
         self.base_url = base_url
-        # Per-request timeout. Local judges can stall; bound it explicitly
-        # so a wedged judge does not hang the entire review pipeline.
-        self.request_timeout = request_timeout or 600
+        self.use_openai_format = use_openai_format
+        # Per-request timeout. Local judges (including via Forge proxy) can
+        # stall; bound them generously. Only true cloud judges get a short
+        # timeout since latency there is predictable.
+        is_cloud = "gemini" in judge_model.lower()
+        self.request_timeout = request_timeout or (120 if is_cloud else 600)
 
     def grade_run(
         self, candidate_output: str, rubric_path: str, context: str = ""
@@ -82,24 +87,41 @@ class AutomatedEvaluator:
             print("   -> Scored (cached) in 0.0s")
             return cached  # type: ignore[return-value]
 
-        payload = {
-            "model": self.judge_model,
-            "messages": messages,
-            "stream": False,
-            "keep_alive": "0",
-            "options": {"num_ctx": 32768, "temperature": 0.0},
-        }
+        if self.use_openai_format:
+            payload = {
+                "model": self.judge_model,
+                "messages": messages,
+                "stream": False,
+                "temperature": 0.0,
+            }
+            api_url = (
+                f"{self.base_url.rstrip('/')}/chat/completions"
+                if not self.base_url.endswith("/chat/completions")
+                else self.base_url
+            )
+        else:
+            payload = {
+                "model": self.judge_model,
+                "messages": messages,
+                "stream": False,
+                "keep_alive": "0",
+                "options": {"num_ctx": 32768, "temperature": 0.0},
+            }
+            api_url = f"{self.base_url}/api/chat"
 
         t0 = time.time()
         response = requests.post(
-            f"{self.base_url}/api/chat",
+            api_url,
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=self.request_timeout,
         )
         response.raise_for_status()
         result = response.json()
-        raw = result.get("message", {}).get("content", "")
+        if self.use_openai_format:
+            raw = result["choices"][0]["message"]["content"]
+        else:
+            raw = result.get("message", {}).get("content", "")
         elapsed = time.time() - t0
         print(f"   -> Scored in {elapsed:.1f}s  ({len(raw)} chars)")
 

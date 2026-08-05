@@ -2,42 +2,48 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 import time
 from pathlib import Path
 
+from core.agent import build_dependency_graph, skill_get_affected_files
 from core.claim_verifier import annotate_review, extract_claims, verify_claims
+from core.config import get_config, temperature_for
+from core.diff_audit import (
+    audit_review_against_invariants,
+    build_invariant_block,
+    parse_diff_invariants,
+)
+from core.forge_proxy import ForgeProxy
 from core.git_provider import GitDiffProvider
 from core.judge import AutomatedEvaluator
 from core.mcp_orchestrator import init_orchestrator
 from core.parser import DjangoTopographer, minify_markdown
+from core.retrieval import retrieve_relevant_code
 from core.runner import StatefulHarnessRunner
 from core.warehouse import HarnessWarehouse
 
 # ==============================================================================
-# MODEL & API CONFIGURATION
+# MODEL & API CONFIGURATION (sourced centrally from core.config)
 # ==============================================================================
-# Default is local Ollama. Set USE_GEMINI=true to use Gemini cloud API.
-USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
+# Previously this block was copy-pasted across every harness and had drifted:
+# code_review.py used ``qwen3.6:35b-mlx`` while every other harness used
+# ``ornith:35b``. All harnesses now read from core.config so runs are
+# comparable. Override any value via env vars (LOCAL_MODEL, USE_GEMINI, ...).
+_cfg = get_config()
 
-CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "ornith:35b"
-
-REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE = (
-    "https://generativelanguage.googleapis.com/v1beta/openai"
-    if USE_GEMINI
-    else "http://localhost:11434"
-)
-ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
-
+LOCAL_MODEL = _cfg.local_model
+REASONING_ARCHITECT = _cfg.reasoning_model
+ARCHITECT_API_BASE = _cfg.base_url
+ARCHITECT_API_KEY = _cfg.api_key
 # Local Fallback: Ollama-served model used when cloud API is unavailable.
 # MUST be a model name that Ollama has pulled locally. Using a cloud model
 # name here would cause the local fallback path to always fail with 404.
-FALLBACK_REVIEWER = LOCAL_MODEL
-# Local Judge: Scores the review against a rubric
-LOCAL_JUDGE = "qwen3-coder:32k"
+FALLBACK_REVIEWER = _cfg.fallback_model  # always == LOCAL_MODEL
+# Local Judge: Scores the review against a rubric (family-separated centrally)
+LOCAL_JUDGE = _cfg.resolve_judge()
 # ==============================================================================
 
 TARGET_REPO = os.environ.get("TARGET_REPO")
@@ -76,6 +82,49 @@ def _clip(text: str, limit: int, label: str = "context") -> str:
     return text[:limit] + f"\n... [{label} truncated at {limit} chars]"
 
 
+def build_retraction_banner(audit_note: str) -> str:
+    """Prominent top-of-report retraction when the audit finds contradictions.
+
+    Placed BEFORE the review so the reader sees the invalidation before the
+    verdict — previously the audit note was appended at the bottom and read as
+    an afterthought while the fabricated headline finding stood unchallenged.
+    """
+    body = audit_note.strip("\n")
+    return (
+        "# ⚠️ REVIEW INVALIDATED BY MACHINE AUDIT\n\n"
+        "The deterministic diff audit found the following review claims "
+        "CONTRADICT the machine-derived invariants. The review asserts false "
+        "schema facts — **the verdict and reliability scores below are "
+        "invalidated** until these findings are corrected.\n\n"
+        f"{body}\n\n"
+        "---\n\n"
+    )
+
+
+def build_scores_section(scores: dict, audit_note: str) -> str:
+    """Append the judge's reliability scores to the report.
+
+    Scores previously only reached the warehouse, so a reader of the report
+    never saw the factual_accuracy penalty a contradiction should trigger.
+    """
+    lines = ["\n\n---\n", "## 📊 Review Reliability Scores"]
+    if audit_note:
+        lines.append(
+            "> ⚠️ Machine audit invalidated this review: factual_accuracy and "
+            "claim_grounding were clamped to 1."
+        )
+    if scores.get("_judge_error"):
+        lines.append(f"\nJudge failed: {scores['_judge_error']}")
+    else:
+        lines.append("")
+        for key, value in sorted(scores.items()):
+            if key.startswith("_"):
+                lines.append(f"**{key}**: {value}")
+            else:
+                lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
 def _read_capped(path: Path, cap: int = 8000, label: str = "file") -> str:
     """Read up to `cap` bytes from `path` without loading the whole file.
 
@@ -110,6 +159,76 @@ def _allocate_context_budget(
         "key_files": int(remaining * 0.30),
         "mcp_project": int(remaining * 0.20),
     }
+
+
+def _diff_identifiers(raw_diff: str, limit: int = 40) -> str:
+    """Build a BM25 retrieval query from the diff's own code identifiers.
+
+    Retrieval keyed on the symbols actually in the +/- lines (class/function/
+    field names) returns the real implementations touched by the change — e.g.
+    for a soft-delete refactor it surfaces ``SoftDeleteModel`` / ``is_deleted``,
+    the precise context that prevents false migration claims. This replaces a
+    previous query built from filenames + generic English words ("usage callers
+    implementation helpers"), which retrieved mostly noise.
+    """
+    tokens: set[str] = set()
+    for line in raw_diff.splitlines():
+        if not line.startswith(("+", "-")):
+            continue
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", line):
+            tokens.add(tok)
+    # Prefer code-shaped tokens (mixed case / underscores / digits) over prose.
+    codeish = sorted(
+        t
+        for t in tokens
+        if ("_" in t)
+        or (t != t.lower() and t != t.upper())
+        or any(c.isdigit() for c in t)
+    )
+    return " ".join(codeish[:limit])
+
+
+def _blast_radius_block(
+    target_repo: str, changed_files: list[str], max_chars: int = 4000
+) -> str:
+    """List files that import each changed module, for grounded blast-radius.
+
+    The reviewer persona's #1 focus is "Blast Radius Analysis", but without a
+    caller list it can only guess at impact. This reuses the same dependency
+    graph as the feature harness (cached per git HEAD) so blast-radius claims
+    can be verified, not invented.
+    """
+    try:
+        graph = build_dependency_graph(target_repo)
+    except Exception:
+        return ""
+    header = "=== Import-Graph Blast Radius (files that import each changed module) ==="
+    parts = [header]
+    total = len(header)
+    py_files = [f for f in changed_files if f.endswith(".py")]
+    # Give each changed module a slice of the budget so a hugely-imported file
+    # (e.g. models.py) still shows a meaningful caller sample rather than being
+    # skipped wholesale when its full importer list exceeds the cap.
+    per_file = max(800, max_chars // max(1, len(py_files)))
+    for f in py_files:
+        try:
+            affected = skill_get_affected_files(f, graph=graph)
+        except Exception:
+            continue
+        if not affected or affected == "(no downstream dependents)":
+            continue
+        body = f"\n{affected}"
+        if len(body) > per_file:
+            body = body[:per_file] + f"\n  ... [{f}: importer list truncated]"
+        room = max_chars - total
+        if room <= 100:
+            parts.append("\n... [blast-radius truncated]")
+            break
+        if len(body) > room:
+            body = body[:room] + f"\n  ... [{f}: truncated]"
+        parts.append(body)
+        total += len(body)
+    return "\n".join(parts) if len(parts) > 1 else ""
 
 
 def build_mcp_context() -> str:
@@ -410,9 +529,60 @@ def _run_review(
         target_repo, changed_files, max_chars=budget["key_files"]
     )
     if key_file_context:
-        print(f"   [Done] Collected key file context ({len(key_file_context)} chars)\n")
+        print(f"   [Done] Collected key file context ({len(key_file_context)} chars)")
     else:
-        print("   [Skipped] No key files matched changed files\n")
+        print("   [Skipped] No key files matched changed files")
+
+    # 1d. BM25 retrieval of method/function bodies touched by the diff. The
+    # directory-heuristic key-file collection only finds models.py for the
+    # affected app; semantic retrieval surfaces the actual callers, service
+    # helpers, and usage sites referenced by the changed code — directly
+    # improving blast-radius and claim-verification fidelity.
+    rag_query = _diff_identifiers(raw_diff) or (
+        " ".join(
+            os.path.basename(f).split(".")[0].replace("-", "_") for f in changed_files
+        )
+    )
+    rag_block = retrieve_relevant_code(
+        rag_query, target_repo, top_k=6, max_chars=budget["key_files"]
+    )
+    if rag_block:
+        print(f"   [Done] BM25 retrieval ({len(rag_block)} chars)\n")
+        # Fold into key_file_context so it flows through every existing prompt
+        # interpolation and the judge context without editing each template.
+        key_file_context = (key_file_context + "\n\n" + rag_block).strip()
+    else:
+        print("   [Skipped] No BM25 retrieval results\n")
+
+    # 1d-bis. Import-graph blast radius: list files that import each changed
+    # module so the reviewer can VERIFY blast-radius claims instead of guessing.
+    # Capped tightly: this is a list of file PATHS (low information density vs.
+    # code), and a hugely-imported file (e.g. models.py) can otherwise produce
+    # 16k+ chars that bloats prefill — especially slow on large thinking models.
+    blast_block = _blast_radius_block(
+        target_repo, changed_files, max_chars=min(budget["key_files"], 5000)
+    )
+    if blast_block:
+        print(f"   [Done] Import-graph blast radius ({len(blast_block)} chars)\n")
+        key_file_context = (key_file_context + "\n\n" + blast_block).strip()
+    else:
+        print("   [Skipped] No downstream dependents found\n")
+
+    # 1e. Machine-derived diff invariants (deterministic schema facts). These
+    # are parsed from the raw diff, not inferred, so the model cannot
+    # hallucinate that a migration is needed to ADD a column the diff actually
+    # REMOVES (e.g. a field relocated to an abstract base). Injected into every
+    # prompt variant and used for the post-hoc audit below.
+    invariants = parse_diff_invariants(changed_files, raw_diff)
+    invariant_block = build_invariant_block(invariants, key_file_context)
+    if invariant_block:
+        print(
+            f"   [Done] Diff invariants derived "
+            f"({len(invariant_block)} chars, "
+            f"{len(invariants.field_changes)} field changes)\n"
+        )
+    else:
+        print("   [Skipped] No model-field invariants in this diff\n")
 
     # 6. Build context sections. Each section is clipped to its allocated
     # share so the combined prompt stays within the model's context window.
@@ -437,10 +607,11 @@ def _run_review(
         else ""
     )
     key_file_section = f"\n\n{key_file_context}" if key_file_context else ""
+    invariant_section = f"\n\n{invariant_block}" if invariant_block else ""
 
     # Single-pass fallback: used for local-only mode and cloud API failures.
     # Must be self-contained (no chained history), so include everything.
-    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}{project_context_section}{key_file_section}
+    fallback_prompt = f"""Below is the project model map (field names for fact-checking) and the git diff.{mcp_prompt_section}{project_context_section}{key_file_section}{invariant_section}
 
 ## Project Model Map
 ```json
@@ -470,6 +641,7 @@ Review the diff above. For each changed file, evaluate whether the changes are c
    - Is the diff unnecessarily large for what it accomplishes?
    - Flag with "OVER-ENGINEERED" where applicable, noting what could be simplified.
 9. **VERIFY CLAIMS** — When stating field attributes (max_length, null, choices), cross-reference the project topography map or key source file contents. Do not assume defaults without evidence.
+10. **GROUND TO INVARIANTS** — The Machine-Derived Diff Invariants section is deterministic ground truth parsed from the raw diff. If an invariant says a field was REMOVED or MOVED (column already exists), never claim a schema-altering migration (AddField OR RemoveField) is required for it — both would be wrong, and RemoveField would DROP the existing column. Any finding contradicting an invariant is a fabrication, not a finding.
 
 Format as markdown with file paths as headings."""
 
@@ -483,7 +655,7 @@ Here is the global system layout of the app (models with their fields, serialize
 {clipped_map}
 
 Here are the files changed in this branch:
-{changed_files_json}{mcp_prompt_section}{project_context_section}{key_file_section}
+{changed_files_json}{mcp_prompt_section}{project_context_section}{key_file_section}{invariant_section}
 
 Analyze the structural intersection. Which upstream modules, views, or serializers could break or be impacted by changes to these specific files?
 Identify potential vulnerabilities or scaling defects introduced by the patch.
@@ -495,6 +667,7 @@ Using the structural analysis from Pass 1 above (project map, key source files, 
 ```diff
 {raw_diff}
 ```
+{invariant_section}
 
 Generate your final review report. Evaluate line changes, ensure patterns are clean, verify things are getting better and not worse, and generate code corrections where needed. Do not re-fetch context — use only what Pass 1 established.
 
@@ -508,6 +681,7 @@ Generate your final review report. Evaluate line changes, ensure patterns are cl
 7. **TEST COVERAGE & VALIDITY** — Check tests exist for changed source files and flag weak/tautological assertions.
 8. **CONCISION & REUSE (Ponytail lens)** — Flag over-engineering where existing utilities, stdlib, or smaller diffs would have sufficed.
 9. **VERIFY CLAIMS** — Cross-reference field attributes against the project map / key source files from Pass 1. Do not assume defaults without evidence.
+10. **GROUND TO INVARIANTS** — The Machine-Derived Diff Invariants section is deterministic ground truth parsed from the raw diff. If an invariant says a field was REMOVED or MOVED (column already exists), never claim a schema-altering migration (AddField OR RemoveField) is required for it — both would be wrong, and RemoveField would DROP the existing column. Any finding contradicting an invariant is a fabrication, not a finding.
 
 Follow the markdown schema and headers defined in your system prompt."""
 
@@ -517,6 +691,11 @@ Follow the markdown schema and headers defined in your system prompt."""
     print(f"🤖 Step 2: Processing Review via [{REASONING_ARCHITECT}]...")
     pass_start = time.time()
 
+    # Outlive the Forge proxy's backend timeout so a slow local model doesn't
+    # surface as a proxy 502 (unless the user explicitly set --timeout).
+    if request_timeout is None and _cfg.forge_enabled:
+        request_timeout = _cfg.forge_backend_timeout + 120
+
     runner = StatefulHarnessRunner(
         model_name=REASONING_ARCHITECT,
         base_url=ARCHITECT_API_BASE,
@@ -525,6 +704,13 @@ Follow the markdown schema and headers defined in your system prompt."""
         local_fallback_model=LOCAL_JUDGE,
         num_ctx=65536,
         request_timeout=request_timeout,
+        seed=_cfg.seed,
+        use_openai_format=_cfg.use_openai_format,
+        # Code review is an audit/fact-checking task. Running hot (the runner
+        # default of 0.4) directly fuels the confabulation class of errors
+        # (e.g. demanding a migration for a column the diff removes). Match the
+        # security harness: deterministic sampling at the audit temperature.
+        temperature=temperature_for("audit"),
     )
     history = runner.execute_sequence(
         system_prompt=system_agent_prompt,
@@ -547,14 +733,36 @@ Follow the markdown schema and headers defined in your system prompt."""
 
     # Restrict claim extraction to known model names so generic prose like
     # "The.first" or "This.is" doesn't pollute the claim count.
+    # NOTE: the topographer stores models under the "class" key (not "name"),
+    # so we read "class" — the previous "name" lookup always yielded an empty
+    # set and silently dropped every field-existence claim.
     known_models = {
-        m.get("name", "") for m in project_map.get("models", []) if m.get("name")
+        m.get("class") or m.get("name") or "" for m in project_map.get("models", [])
     }
+    known_models.discard("")
     claims = extract_claims(final_review, known_models=known_models)
     verification_report = verify_claims(
         claims, project_map, key_file_context, target_repo=target_repo
     )
+
+    # 8b. Machine audit FIRST so the claim-verification summary and the report
+    # reflect contradictions instead of reporting a misleading clean pass.
+    audit_note = audit_review_against_invariants(
+        final_review, invariants, key_file_context
+    )
+    if audit_note:
+        print("   [Audit] Flagged review claims contradicting diff invariants")
+        verification_report.audit_contradictions = audit_note.count(
+            "contradict the machine-derived diff invariants"
+        )
     final_review = annotate_review(final_review, verification_report)
+
+    # 8c. When the audit invalidates findings, surface the retraction at the
+    # TOP of the report — before the verdict — so it cannot be missed. The
+    # bottom-of-report footnote that previously carried this correction read
+    # as an afterthought while the fabricated finding stayed front and center.
+    if audit_note:
+        final_review = build_retraction_banner(audit_note) + final_review
 
     print(f"   [Done] Claim verification in {time.time() - verify_start:.2f}s")
     print(f"   {verification_report.to_summary()}")
@@ -574,14 +782,33 @@ Follow the markdown schema and headers defined in your system prompt."""
         if diff_truncated
         else ""
     )
+    audit_warning = (
+        "\n\n⚠️ SCORING DIRECTIVE: The review under evaluation carries a "
+        "'REVIEW INVALIDATED BY MACHINE AUDIT' banner at its top flagging "
+        "claims that CONTRADICT the diff invariants above. Those flagged "
+        "claims assert false schema facts — score factual_accuracy and "
+        "claim_grounding at 1 regardless of other qualities.\n"
+        if audit_note
+        else ""
+    )
     judge_context = (
         f"Diff ({len(raw_diff)} chars total"
         + (", showing first 20000" if diff_truncated else "")
         + f"):\n```diff\n{diff_visible}\n```{judge_diff_note}\n\n"
         f"Project Map:\n{_clip(project_map_json, 8000, 'project map')}\n\n"
         f"{_clip(key_file_context, 4000, 'key file context')}"
+        + (
+            f"\n\n{_clip(invariant_block, 3000, 'diff invariants')}"
+            if invariant_block
+            else ""
+        )
+        + audit_warning
     )
-    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
+    evaluator = AutomatedEvaluator(
+        judge_model=LOCAL_JUDGE,
+        base_url=_cfg.base_url,
+        use_openai_format=_cfg.use_openai_format,
+    )
     try:
         scores = evaluator.grade_run(
             final_review, "rubrics/code_review_rubric.json", context=judge_context
@@ -591,6 +818,18 @@ Follow the markdown schema and headers defined in your system prompt."""
             f"   ⚠️  Judge failed ({type(e).__name__}: {e}); continuing without scores."
         )
         scores = {"_judge_error": str(e)[:200]}
+
+    # Deterministic enforcement of the scoring directive: when the audit
+    # flagged invariant contradictions, the judge may not honor the directive
+    # on its own — clamp the grounded metrics so the penalty is guaranteed.
+    if audit_note and not scores.get("_judge_error"):
+        for metric in ("factual_accuracy", "claim_grounding"):
+            if metric in scores:
+                scores[metric] = 1
+        scores["_audit_invalidated"] = (
+            "Machine audit flagged invariant contradictions; factual_accuracy "
+            "and claim_grounding clamped to 1."
+        )
 
     print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
     print(f"📊 Review Reliability Scores: {scores}")
@@ -607,8 +846,9 @@ Follow the markdown schema and headers defined in your system prompt."""
 
     report_filename = "reports/automated_code_review.md"
     os.makedirs("reports", exist_ok=True)
+    report_text = final_review + build_scores_section(scores, audit_note)
     with open(report_filename, "w", encoding="utf-8") as f:
-        f.write(final_review)
+        f.write(report_text)
 
     if _mcp_orch:
         _mcp_orch.remember(
@@ -624,4 +864,5 @@ Follow the markdown schema and headers defined in your system prompt."""
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    with ForgeProxy(get_config()):
+        sys.exit(main())

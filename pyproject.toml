@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "local-harness"
 dynamic = ["version"]
 
+[project.optional-dependencies]
+forge = ["forge-guardrails"]
+
 [tool.black]
 target-version = ["py312"]
 line-length = 88

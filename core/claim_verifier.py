@@ -28,16 +28,27 @@ class VerificationReport:
     verified: int = 0
     flagged: int = 0
     results: list[ClaimResult] = field(default_factory=list)
+    # Number of review claims the deterministic diff-audit flagged as
+    # contradicting machine-derived invariants. When non-zero, the report is
+    # not "clean" even if every extracted claim individually verified.
+    audit_contradictions: int = 0
 
     @property
     def accuracy_rate(self) -> float:
         return self.verified / self.total_claims if self.total_claims > 0 else 1.0
 
     def to_summary(self) -> str:
-        lines = [
+        summary = (
             f"Claim Verification: {self.verified}/{self.total_claims} verified "
             f"({self.accuracy_rate:.0%} accuracy)"
-        ]
+        )
+        if self.audit_contradictions:
+            summary += (
+                f" — ⚠️ {self.audit_contradictions} schema claim(s) CONTRADICTED "
+                "the machine-derived diff invariants, invalidating this report's "
+                "verdict and scores."
+            )
+        lines = [summary]
         for r in self.results:
             if not r.verified:
                 lines.append(f"  FLAGGED [{r.claim_type}]: {r.claim_text}")

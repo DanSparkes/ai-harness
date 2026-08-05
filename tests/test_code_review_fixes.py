@@ -203,7 +203,9 @@ def test_parse_judge_json_passes_through_valid_dict() -> None:
 def test_runner_defaults_for_local_reasoning_model() -> None:
     runner = StatefulHarnessRunner(model_name="ornith:35b")
     assert runner.temperature == 0.4
-    assert runner.request_timeout == 600
+    # Local default matches core.agent (1200s): thinking models (27B+) on
+    # large prompts legitimately need >10 min for a single generation.
+    assert runner.request_timeout == 1200
     assert runner.is_cloud is False
 
 

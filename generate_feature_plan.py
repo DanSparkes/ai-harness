@@ -25,16 +25,21 @@ import re
 import sys
 from typing import Any
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+import requests
+
+# ── Defaults (sourced centrally from core.config) ─────────────────────────────
 from core.agent import Agent
+from core.config import GEMINI_BASE_URL, get_config
+from core.forge_proxy import ForgeProxy
 from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
-ARCHITECT_MODEL = "ornith:35b"
-GEMINI_MODEL = "gemini-2.5-flash"
+_cfg = get_config()
+ARCHITECT_MODEL = _cfg.local_model
+GEMINI_MODEL = _cfg.cloud_model
 
 # MCP integration
 _mcp_orchestrator = None
@@ -93,11 +98,15 @@ def get_mcp_context(args: argparse.Namespace) -> str:
     orch = init_mcp_orchestrator(args.mcp_config, target)
     if not orch:
         return ""
-    context = orch.build_mcp_context_block(
-        tags=["architectural_rule", "active", "campaign_complete"]
-    )
-    orch.stop()
-    return context
+    # Build context then always release the orchestrator. Previously stop()
+    # was unconditional but not in a finally — a raise in build_mcp_context_block
+    # orphaned the MCP subprocesses.
+    try:
+        return orch.build_mcp_context_block(
+            tags=["architectural_rule", "active", "campaign_complete"]
+        )
+    finally:
+        orch.stop()
 
 
 # ── Codebase Scanner ──────────────────────────────────────────────────────────
@@ -115,9 +124,8 @@ def build_codebase_context(args: argparse.Namespace) -> str:
         grep_context,
         scan_celery_tasks,
         scan_file_tree,
-        scan_files_by_keyword,
-        scan_files_by_pattern,
     )
+    from core.retrieval import retrieve_relevant_code
 
     file_tree = scan_file_tree(args.target_repo)
     celery_tasks = scan_celery_tasks(args.target_repo)
@@ -201,49 +209,32 @@ def build_codebase_context(args: argparse.Namespace) -> str:
             except Exception:
                 pass
 
-    # ── Raw file previews (fallback — only for context missing above) ──
-    keywords = re.findall(r"[\w_]+", args.prompt)
-    keywords = sorted({k for k in keywords if len(k) > 3}, key=lambda k: -len(k))[:5]
-    keyword_matches = []
-    for kw in keywords:
-        keyword_matches.extend(scan_files_by_keyword(args.target_repo, kw))
-    pattern_matches = scan_files_by_pattern(args.target_repo, keywords)
-
-    task_files = sorted({t["file"] for t in celery_tasks})
-    for tf in task_files:
-        if not any(tf in m["file"] for m in keyword_matches + pattern_matches):
-            task_content = scan_files_by_keyword(
-                args.target_repo, tf.replace(".py", "").split("/")[-1]
-            )
-            pattern_matches.extend(task_content)
-
-    if keyword_matches or pattern_matches:
+    # ── BM25 retrieval of actual implementations (ground truth) ─────
+    # Replaces the previous bespoke keyword-grep whole-file previews, which
+    # returned first-80-line file dumps with no ranking, dedup, or char
+    # budget. The architect needs method BODIES the AST topology omits:
+    # a @shared_task's except block (for Retry Safety), existing helpers /
+    # mixins to reuse instead of reinventing, and base-class behavior.
+    rag_query = args.prompt + " " + " ".join(entity_names)
+    rag_block = retrieve_relevant_code(
+        rag_query, args.target_repo, top_k=8, max_chars=10000
+    )
+    if rag_block:
         parts.append(
-            "\n\n=== RAW FILE PREVIEWS (first 80 lines — fallback for context not in topology above) ==="
+            "\n\n=== RETRIEVED IMPLEMENTATIONS (BM25 — ground truth for method "
+            "bodies, reuse, and retry-safety checks) ==="
         )
-        for matches in [keyword_matches, pattern_matches]:
-            if matches:
-                for m in matches:
-                    parts.append(f"--- {m['file']} ---")
-                    parts.append(m["content"].rstrip())
+        parts.append(rag_block)
 
     return "\n".join(parts)
-
-
-def get_gemini_api_key() -> str:
-    return os.environ.get("GEMINI_API_KEY", "")
 
 
 def build_agent(
     engine: str, model: str, system_prompt: str, num_ctx: int = 65536
 ) -> Agent:
     is_gemini = engine == "gemini"
-    api_key = get_gemini_api_key() if is_gemini else None
-    base_url = (
-        "https://generativelanguage.googleapis.com/v1beta/openai"
-        if is_gemini
-        else "http://localhost:11434"
-    )
+    base_url = GEMINI_BASE_URL if is_gemini else _cfg.base_url
+    api_key = os.environ.get("GEMINI_API_KEY") if is_gemini else None
     return Agent(
         name="Architect",
         system_prompt=system_prompt,
@@ -251,6 +242,8 @@ def build_agent(
         base_url=base_url,
         api_key=api_key,
         num_ctx=num_ctx,
+        seed=_cfg.seed,
+        use_openai_format=_cfg.use_openai_format or is_gemini,
     )
 
 
@@ -370,7 +363,15 @@ def cmd_generate(args: argparse.Namespace) -> None:
         ARCHITECT_SYSTEM_PROMPT,
         getattr(args, "num_ctx", 65536),
     )
-    raw_output = architect.execute(user_prompt)
+    try:
+        raw_output = architect.execute(user_prompt)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        print(
+            f"\n❌ Architect request failed ({type(e).__name__}). "
+            "If local, the Ollama server may be down or the model OOM'd during "
+            "generation. Check `ollama ps` / GPU memory and retry."
+        )
+        sys.exit(1)
 
     pipeline = extract_pipeline_json(raw_output)
     if pipeline is None:
@@ -460,10 +461,13 @@ def main() -> None:
         help="Directory for agent persona files (default: agents/)",
     )
     gen.add_argument(
-        "--engine", default="ollama", choices=["ollama", "gemini"], help="LLM backend"
+        "--engine",
+        default="gemini" if _cfg.is_cloud else "ollama",
+        choices=["ollama", "gemini"],
+        help="LLM backend",
     )
     gen.add_argument(
-        "--model", default=ARCHITECT_MODEL, help="Model name (e.g. ornith:35b)"
+        "--model", default=_cfg.local_model, help="Model name (e.g. ornith:35b)"
     )
     gen.add_argument(
         "--num-ctx", type=int, default=65536, help="Context window size for Ollama"
@@ -495,4 +499,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with ForgeProxy(get_config()):
+        main()

@@ -1,6 +1,19 @@
+import re
 import time
 
 import requests
+
+# Matches <think>...</think> reasoning blocks emitted by thinking models
+# (e.g. Qwen3 ThinkingCap / DeepSeek-R1). Many GGUF builds return these
+# inline in `content` rather than Ollama's separate `thinking` field.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks; never return empty (preserve a
+    thinking-only reply intact so a review is never silently dropped)."""
+    cleaned = _THINK_RE.sub("", text).strip()
+    return cleaned or text
 
 
 class StatefulHarnessRunner:
@@ -16,12 +29,21 @@ class StatefulHarnessRunner:
         num_ctx: int = 65536,
         temperature: float | None = None,
         request_timeout: float | None = None,
+        seed: int | None = None,
+        use_openai_format: bool = False,
     ):
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name or model_name
         self.local_fallback_model = local_fallback_model
         self.api_key = api_key
         self.num_ctx = num_ctx
+        # Reproducibility seed for local Ollama requests (options.seed). Cloud
+        # backends ignore it. None lets Ollama choose (non-reproducible).
+        self.seed = seed
+        # When True, use OpenAI chat-completions format (for Forge proxy or cloud).
+        self.use_openai_format = use_openai_format
+
+        self.is_cloud = "gemini" in model_name.lower() or bool(api_key)
 
         # Explicit temperature override; otherwise pick a sensible default
         # based on the model role (coder models -> deterministic, reasoning
@@ -32,16 +54,12 @@ class StatefulHarnessRunner:
             else (0.0 if "coder" in model_name.lower() else 0.4)
         )
 
-        # Per-request timeout. Local models can stall on GPU/RAM pressure, so
-        # bound it to avoid 45-minute CI hangs (was 900s x 3 retries).
-        # Cloud calls use a shorter timeout since latency is predictable.
-        self.request_timeout = request_timeout or (
-            120 if "gemini" in model_name.lower() or api_key else 600
-        )
+        # Per-request timeout. Local models (including via Forge proxy) can
+        # stall on GPU/RAM pressure, so bound them generously. Only true cloud
+        # calls get a short timeout since latency there is predictable.
+        self.request_timeout = request_timeout or (120 if self.is_cloud else 1200)
 
-        self.is_cloud = "gemini" in model_name.lower() or bool(api_key)
-
-        if self.is_cloud:
+        if self.use_openai_format:
             if not base_url.endswith("/chat/completions"):
                 base_url = base_url.rstrip("/") + "/chat/completions"
             self.api_url = base_url
@@ -50,6 +68,13 @@ class StatefulHarnessRunner:
 
     def unload(self):
         pass
+
+    def _local_options(self, temperature: float) -> dict:
+        """Build Ollama options for a local request, including seed if set."""
+        opts = {"num_ctx": self.num_ctx, "temperature": temperature, "top_p": 0.9}
+        if self.seed is not None:
+            opts["seed"] = self.seed
+        return opts
 
     def _call_with_retry(
         self,
@@ -116,7 +141,7 @@ class StatefulHarnessRunner:
 
             temperature = self.temperature
 
-            if self.is_cloud:
+            if self.use_openai_format:
                 payload = {
                     "model": self.model_name,
                     "messages": messages,
@@ -130,17 +155,13 @@ class StatefulHarnessRunner:
                     "messages": messages,
                     "stream": False,
                     "keep_alive": "0",
-                    "options": {
-                        "num_ctx": self.num_ctx,
-                        "temperature": temperature,
-                        "top_p": 0.9,
-                    },
+                    "options": self._local_options(temperature),
                 }
 
             print(f"   --- Pass {idx + 1} / {len(passes)} ---")
             pass_t0 = time.time()
 
-            if self.is_cloud:
+            if self.use_openai_format:
                 response = self._call_with_retry(self.api_url, payload, headers)
             else:
                 response = self._call_with_retry(
@@ -172,11 +193,7 @@ class StatefulHarnessRunner:
                     "messages": fb_messages,
                     "stream": False,
                     "keep_alive": "0",
-                    "options": {
-                        "num_ctx": self.num_ctx,
-                        "temperature": temperature,
-                        "top_p": 0.9,
-                    },
+                    "options": self._local_options(temperature),
                 }
                 fb_headers = {"Content-Type": "application/json"}
 
@@ -219,7 +236,7 @@ class StatefulHarnessRunner:
             response.raise_for_status()
             response_data = response.json()
 
-            if self.is_cloud:
+            if self.use_openai_format:
                 assistant_response = response_data["choices"][0]["message"]["content"]
             else:
                 assistant_response = response_data.get("message", {}).get("content", "")
@@ -248,11 +265,7 @@ class StatefulHarnessRunner:
                             "messages": fb_messages,
                             "stream": False,
                             "keep_alive": "0",
-                            "options": {
-                                "num_ctx": self.num_ctx,
-                                "temperature": temperature,
-                                "top_p": 0.9,
-                            },
+                            "options": self._local_options(temperature),
                         }
                         try:
                             fb_response = self._call_with_retry(
@@ -283,6 +296,12 @@ class StatefulHarnessRunner:
                         assistant_response = (
                             "# Basic Diff Scan\n\nUnable to generate review.\n"
                         )
+
+            # Strip <think> reasoning blocks before storing/chaining. GGUF
+            # thinking models often inline them in `content`; leaving them in
+            # would (a) bloat every subsequent pass — each pass re-sends prior
+            # assistant turns — and (b) pollute the saved review report.
+            assistant_response = _strip_think(assistant_response)
 
             elapsed = time.time() - pass_t0
             print(

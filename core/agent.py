@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 from core.cache import get as cache_get
 from core.cache import get_git_head, make_key
 from core.cache import set as cache_set
+from core.config import DEFAULT_LOCAL_MODEL
 
 AGENTS_DIR = Path(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents")
@@ -55,11 +56,16 @@ class Skill:
 class Agent:
     name: str
     system_prompt: str
-    model_name: str = "ornith:35b"
+    model_name: str = DEFAULT_LOCAL_MODEL
     base_url: str = "http://localhost:11434"
     api_key: str | None = None
     num_ctx: int = 65536
     allowed_skills: list[str] = field(default_factory=list)
+    # Reproducibility seed plumbed into Ollama ``options.seed``. None = let
+    # Ollama pick. Only affects local (Ollama) requests; cloud APIs ignore it.
+    seed: int | None = None
+    # When True, use OpenAI chat-completions format (for Forge proxy or cloud).
+    use_openai_format: bool = False
 
     @property
     def is_cloud(self) -> bool:
@@ -67,7 +73,7 @@ class Agent:
 
     @property
     def api_url(self) -> str:
-        if self.is_cloud:
+        if self.use_openai_format:
             base = self.base_url.rstrip("/")
             if not base.endswith("/chat/completions"):
                 base += "/chat/completions"
@@ -100,7 +106,7 @@ class Agent:
             skill_map = skills
 
         # Streaming mode for code generation (local Ollama only, no tool calls)
-        if stream and not self.is_cloud and not skills:
+        if stream and not self.use_openai_format and not skills:
             return self._execute_stream(messages, headers, _temperature)
 
         max_tool_rounds = 10
@@ -117,8 +123,8 @@ class Agent:
         session.mount("https://", HTTPAdapter(max_retries=retries))
 
         for round_idx in range(max_tool_rounds + 1):
-            if self.is_cloud:
-                payload = {
+            if self.use_openai_format:
+                payload: dict[str, Any] = {
                     "model": self.model_name,
                     "messages": messages,
                     "stream": False,
@@ -137,17 +143,19 @@ class Agent:
                         "top_p": 0.9,
                     },
                 }
+            if self.seed is not None and not self.use_openai_format:
+                payload.setdefault("options", {})["seed"] = self.seed
             if tools:
                 payload["tools"] = tools
 
-            timeout = 600 if self.is_cloud else 1200
+            timeout = 120 if self.is_cloud else 1200
             response = session.post(
                 self.api_url, json=payload, headers=headers, timeout=timeout
             )
             response.raise_for_status()
             data = response.json()
 
-            if self.is_cloud:
+            if self.use_openai_format:
                 msg = data["choices"][0]["message"]
             else:
                 msg = data.get("message", {})
@@ -159,7 +167,7 @@ class Agent:
                 return content
 
             # Append assistant message with tool_calls to conversation
-            if self.is_cloud:
+            if self.use_openai_format:
                 messages.append(
                     {
                         "role": "assistant",
@@ -200,7 +208,7 @@ class Agent:
                     result = f"Unknown skill '{name}'"
 
                 result_str = str(result)
-                if self.is_cloud:
+                if self.use_openai_format:
                     messages.append(
                         {
                             "role": "tool",
@@ -216,19 +224,33 @@ class Agent:
         return "(max tool call rounds reached)"
 
     def _execute_stream(self, messages: list, headers: dict, temperature: float) -> str:
-        """Stream response from Ollama, validate code syntax on completion."""
+        """Stream response, validate code syntax on completion.
+
+        Handles both Ollama NDJSON and OpenAI SSE formats.
+        """
         t0 = time.time()
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "stream": True,
-            "keep_alive": "0",
-            "options": {
-                "num_ctx": self.num_ctx,
+        if self.use_openai_format:
+            payload: dict[str, Any] = {
+                "model": self.model_name,
+                "messages": messages,
+                "stream": True,
                 "temperature": temperature,
                 "top_p": 0.9,
-            },
-        }
+            }
+        else:
+            payload = {
+                "model": self.model_name,
+                "messages": messages,
+                "stream": True,
+                "keep_alive": "0",
+                "options": {
+                    "num_ctx": self.num_ctx,
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                },
+            }
+            if self.seed is not None:
+                payload["options"]["seed"] = self.seed
 
         response = requests.post(
             self.api_url, json=payload, headers=headers, stream=True
@@ -237,21 +259,56 @@ class Agent:
 
         full_content = ""
         last_heartbeat = time.time()
-        for raw_line in response.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            data = json.loads(line)
-            token = data.get("message", {}).get("content", "")
-            full_content += token
-            now = time.time()
-            if now - last_heartbeat >= 30:
-                print(
-                    f"   [Stream] ...{len(full_content)} chars ({now - t0:.0f}s elapsed)"
+
+        if self.use_openai_format:
+            # OpenAI SSE: lines prefixed with "data: "
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = (
+                    raw_line.decode("utf-8")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
                 )
-                last_heartbeat = now
-            if data.get("done", False):
-                break
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                delta = data.get("choices", [{}])[0].get("delta", {})
+                token = delta.get("content", "") or ""
+                full_content += token
+                now = time.time()
+                if now - last_heartbeat >= 30:
+                    print(
+                        f"   [Stream] ...{len(full_content)} chars ({now - t0:.0f}s elapsed)"
+                    )
+                    last_heartbeat = now
+        else:
+            # Ollama NDJSON: one JSON object per line
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = (
+                    raw_line.decode("utf-8")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
+                )
+                data = json.loads(line)
+                token = data.get("message", {}).get("content", "")
+                full_content += token
+                now = time.time()
+                if now - last_heartbeat >= 30:
+                    print(
+                        f"   [Stream] ...{len(full_content)} chars ({now - t0:.0f}s elapsed)"
+                    )
+                    last_heartbeat = now
+                if data.get("done", False):
+                    break
 
         elapsed = time.time() - t0
         print(f"   [Stream] {len(full_content)} chars in {elapsed:.1f}s")
@@ -272,17 +329,17 @@ class Agent:
 
 DEFAULT_AGENT_MAP = {
     "Architect": ("architect.md", "gemini-2.5-flash", None),
-    "Engineer": ("code_implementer.md", "ornith:35b", None),
+    "Engineer": ("code_implementer.md", DEFAULT_LOCAL_MODEL, None),
     "QA_Tester": (
         "integration_auditor.md",
         "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
         None,
     ),
     "Security_Auditor": ("security.md", "gemini-2.5-flash", None),
-    "Code_Reviewer": ("code_reviewer.md", "ornith:35b", None),
+    "Code_Reviewer": ("code_reviewer.md", DEFAULT_LOCAL_MODEL, None),
     "Exploratory_Architect": ("exploratory_architect.md", "gemini-2.5-flash", None),
-    "Staff_Onboarding": ("staff_onboarding.md", "ornith:35b", None),
-    "Systems_Architect": ("architecture_review.md", "ornith:35b", None),
+    "Staff_Onboarding": ("staff_onboarding.md", DEFAULT_LOCAL_MODEL, None),
+    "Systems_Architect": ("architecture_review.md", DEFAULT_LOCAL_MODEL, None),
 }
 
 
@@ -312,6 +369,7 @@ class AgentRegistry:
         persona_path: str,
         model_name: str | None = None,
         api_key: str | None = None,
+        use_openai_format: bool = False,
     ) -> Agent:
         if not os.path.exists(persona_path):
             raise FileNotFoundError(f"Persona file not found: {persona_path}")
@@ -322,22 +380,27 @@ class AgentRegistry:
         agent = Agent(
             name=agent_name,
             system_prompt=persona,
-            model_name=model_name or "ornith:35b",
+            model_name=model_name or DEFAULT_LOCAL_MODEL,
             base_url=(
                 "https://generativelanguage.googleapis.com/v1beta/openai"
                 if is_gemini
                 else "http://localhost:11434"
             ),
             api_key=api_key if is_gemini else None,
+            use_openai_format=use_openai_format or bool(is_gemini),
         )
         self.register_agent(agent)
         return agent
 
-    def load_default_agents(self, gemini_api_key: str | None = None):
+    def load_default_agents(
+        self, gemini_api_key: str | None = None, use_openai_format: bool = False
+    ):
         for agent_name, (filename, model, _) in DEFAULT_AGENT_MAP.items():
             path = AGENTS_DIR / filename
             if path.exists():
-                self.load_agent_from_file(agent_name, str(path), model, gemini_api_key)
+                self.load_agent_from_file(
+                    agent_name, str(path), model, gemini_api_key, use_openai_format
+                )
 
     # ── Skill management ──────────────────────────────────────────────────
 
@@ -390,6 +453,8 @@ def _check_code_syntax(code: str) -> tuple[bool, str]:
 
 
 def build_dependency_graph(repo_path: str) -> dict[str, list[str]]:
+    from core.parser import EXCLUDE_DIRS
+
     head = get_git_head(repo_path)
     if head:
         key = make_key("agent:build_dependency_graph", repo_path, head)
@@ -397,7 +462,11 @@ def build_dependency_graph(repo_path: str) -> dict[str, list[str]]:
         if cached is not None:
             return cached  # type: ignore[return-value]
     imports_by_file: dict[str, list[str]] = {}
-    for root, _dirs, files in os.walk(repo_path):
+    for root, dirs, files in os.walk(repo_path):
+        # Prune venv / caches / migrations so third-party site-packages and
+        # generated dirs don't pollute the reverse-import map (otherwise every
+        # model change reports hundreds of .venv importers as "affected").
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith(".")]
         for f in files:
             if not f.endswith(".py"):
                 continue
@@ -822,10 +891,12 @@ def build_default_skills(target_repo: str | None = None) -> list[Skill]:
 
 
 def build_default_registry(
-    target_repo: str | None = None, gemini_api_key: str | None = None
+    target_repo: str | None = None,
+    gemini_api_key: str | None = None,
+    use_openai_format: bool = False,
 ) -> AgentRegistry:
     registry = AgentRegistry()
-    registry.load_default_agents(gemini_api_key)
+    registry.load_default_agents(gemini_api_key, use_openai_format)
     for skill in build_default_skills(target_repo):
         registry.register_skill(skill)
     return registry

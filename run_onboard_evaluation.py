@@ -2,34 +2,28 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 
-from core.agent import Agent
-from core.judge import AutomatedEvaluator
-from core.mcp_orchestrator import init_orchestrator
+import requests
+
+from core import harness
+from core.config import get_config
 from core.parser import DjangoTopographer
 from core.warehouse import HarnessWarehouse
 
-USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
 
-CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "ornith:35b"
+def _abort_on_conn_error(e: Exception) -> None:
+    """Surface an actionable message for LLM connection failures, then exit."""
+    print(
+        f"\n❌ LLM request failed ({type(e).__name__}). "
+        "If local, Ollama may be down or the model OOM'd during generation. "
+        "Check `ollama ps` / GPU memory and retry."
+    )
+    sys.exit(1)
 
-REASONING_ARCHITECT = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-ARCHITECT_API_BASE = (
-    "https://generativelanguage.googleapis.com/v1beta/openai"
-    if USE_GEMINI
-    else "http://localhost:11434"
-)
-ARCHITECT_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
-
-FALLBACK_REVIEWER = "gemini-2.5-flash"
-HEAVY_REVIEWER = "deepseek-r1:14b"
-LOCAL_JUDGE = "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
 
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
-
-_mcp_orch = None
 
 
 def parse_arguments():
@@ -55,47 +49,14 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def init_mcp(repo_path: str | None = None, config_path: str | None = None):
-    global _mcp_orch
-    if _mcp_orch is not None:
-        return _mcp_orch
-    cfg_path: str = config_path or MCP_CONFIG_PATH
-    path: str = repo_path or os.environ.get("TARGET_REPO") or os.getcwd()
-    orch = init_orchestrator(cfg_path, path)
-    if orch:
-        _mcp_orch = orch
-    return orch
-
-
-def build_mcp_context() -> str:
-    orch = _mcp_orch
-    if not orch:
-        return ""
-    return orch.build_mcp_context_block(tags=["architectural_rule"])
-
-
-def build_django_live_context() -> tuple[str, dict]:
-    orch = _mcp_orch
-    if not orch:
-        return "", {}
-    return orch.build_django_live_context()
-
-
-def build_codebase_memory_context() -> tuple[str, dict]:
-    orch = _mcp_orch
-    if not orch:
-        return "", {}
-    return orch.build_codebase_memory_context()
-
-
 def main():
     args = parse_arguments()
+    cfg = get_config()
 
-    target_repo = args.repo or os.environ.get("TARGET_REPO")
+    target_repo = harness.resolve_target_repo(args.repo)
     mcp_config_path = args.mcp_config or os.environ.get("MCP_CONFIG", MCP_CONFIG_PATH)
 
-    is_local_mode = not ARCHITECT_API_KEY
-    if not is_local_mode and not ARCHITECT_API_KEY:
+    if cfg.is_cloud and not cfg.api_key:
         print("Error: USE_GEMINI=true requires GEMINI_API_KEY to be set.")
         print("Please run: export GEMINI_API_KEY='your_key_here'")
         return
@@ -105,12 +66,12 @@ def main():
         print("Set TARGET_REPO env var or pass --repo /path/to/project")
         return
 
-    print(f"{'=' * 60}")
-    print("Launching Staff Onboarding Engine (Hybrid Mode)")
-    print(f"Target Project   : {target_repo}")
-    print(f"Cloud Architect  : {REASONING_ARCHITECT}")
-    print(f"Local Judge      : {LOCAL_JUDGE}")
-    print(f"{'=' * 60}\n")
+    harness.banner(
+        "Launching Staff Onboarding Engine (Hybrid Mode)",
+        cfg,
+        target_project=target_repo,
+        local_judge=cfg.resolve_judge(),
+    )
 
     start_time = time.time()
 
@@ -134,29 +95,32 @@ def main():
         system_agent_prompt = f.read()
     print("   [Done] Persona loaded")
 
-    # 2b. Initialize MCP workbench for richer context
-    print("Step 2b: Initializing MCP workbench...")
-    orch = init_mcp(repo_path=target_repo, config_path=mcp_config_path)
-    mcp_block = build_mcp_context() if orch else ""
-    django_block, _django_data = build_django_live_context() if orch else ("", {})
-    cm_block, _cm_data = build_codebase_memory_context() if orch else ("", {})
-    live_context = "\n\n".join(filter(None, [mcp_block, django_block, cm_block]))
-    if orch:
-        statuses = []
-        if mcp_block:
-            statuses.append("tools + git + memory")
-        if django_block:
-            statuses.append("django-ai-boost")
-        if cm_block:
-            statuses.append("codebase-memory")
-        print(f"   [Done] MCP workbench active ({' + '.join(statuses)})\n")
-    else:
-        print("   [Skipped] No MCP config found\n")
+    with harness.mcp_context(mcp_config_path, target_repo) as orch:
+        mcp_block = (
+            orch.build_mcp_context_block(tags=["architectural_rule"]) if orch else ""
+        )
+        django_block = ""
+        cm_block = ""
+        if orch:
+            django_block, _django_data = orch.build_django_live_context()
+            cm_block, _cm_data = orch.build_codebase_memory_context()
+        live_context = "\n\n".join(filter(None, [mcp_block, django_block, cm_block]))
+        if orch:
+            statuses = []
+            if mcp_block:
+                statuses.append("tools + git + memory")
+            if django_block:
+                statuses.append("django-ai-boost")
+            if cm_block:
+                statuses.append("codebase-memory")
+            print(f"   [Done] MCP workbench active ({' + '.join(statuses)})\n")
+        else:
+            print("   [Skipped] No MCP config found\n")
 
-    # 3. Build prompt context
-    project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
+        # 3. Build shared context (injected into Pass 1 only; threaded onward)
+        project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
 
-    parser_limitations = """### Parser Capabilities & Limitations
+        parser_limitations = """### Parser Capabilities & Limitations
 
 The topography is built by static AST parsing. Here's what it CAN and CANNOT resolve:
 
@@ -210,34 +174,35 @@ The following facts have been manually verified against the codebase. Your repor
 
 **Note:** The sections below tagged "Live Django" come from `django-ai-boost` runtime introspection and are fully accurate (actual DB schema, URL configs, settings). Cross-reference these against the static parser data above — when they disagree, the Live Django data is authoritative. Use the URL patterns to understand actual route structure, which the parser cannot resolve statically."""
 
-    models_list = project_map.get("models", [])
-    views_list = project_map.get("views", [])
-    concrete_model_count = sum(1 for m in models_list if not m.get("is_abstract"))
-    abstract_model_count = sum(1 for m in models_list if m.get("is_abstract"))
-    class_based_view_count = sum(1 for v in views_list if not v.get("is_function_view"))
-    function_based_view_count = sum(1 for v in views_list if v.get("is_function_view"))
+        models_list = project_map.get("models", [])
+        views_list = project_map.get("views", [])
+        concrete_model_count = sum(1 for m in models_list if not m.get("is_abstract"))
+        abstract_model_count = sum(1 for m in models_list if m.get("is_abstract"))
+        class_based_view_count = sum(
+            1 for v in views_list if not v.get("is_function_view")
+        )
+        function_based_view_count = sum(
+            1 for v in views_list if v.get("is_function_view")
+        )
 
-    parser_limitations_filled = parser_limitations.format(
-        model_count=len(models_list),
-        concrete_model_count=concrete_model_count,
-        abstract_model_count=abstract_model_count,
-        serializer_count=len(project_map.get("serializers", [])),
-        view_count=len(views_list),
-        class_based_view_count=class_based_view_count,
-        function_based_view_count=function_based_view_count,
-        live_context=live_context,
-    )
+        parser_limitations_filled = parser_limitations.format(
+            model_count=len(models_list),
+            concrete_model_count=concrete_model_count,
+            abstract_model_count=abstract_model_count,
+            serializer_count=len(project_map.get("serializers", [])),
+            view_count=len(views_list),
+            class_based_view_count=class_based_view_count,
+            function_based_view_count=function_based_view_count,
+            live_context=live_context,
+        )
 
-    # Two-pass reasoning: split analysis + verification for faster per-pass generation
-    pass1 = f"""[Pass 1: Architecture Synthesis & Risk Discovery]
-Review this parsed structural layout of your new codebase:
+        shared_context = (
+            f"{parser_limitations_filled}\n\n## Project Topography\n```json\n"
+            f"{project_map_json}\n```"
+        )
 
-{parser_limitations_filled}
-
-## Project Topography
-```json
-{project_map_json}
-```
+        pass1 = """[Pass 1: Architecture Synthesis & Risk Discovery]
+Review the parsed structural layout of your new codebase provided above.
 
 Brainstorm a raw ledger of:
 1. **Structural bottlenecks** — Coupling patterns, circular dependencies, fat models or views, inconsistent serializer patterns, missing abstractions.
@@ -248,14 +213,12 @@ Brainstorm a raw ledger of:
 
 Do not structure the 90-day roadmap or write final sections yet. Just map what you see."""
 
-    pass2 = f"""[Pass 2: Timeline Filtering & Production Strategy]
+        pass2 = """[Pass 2: Timeline Filtering & Production Strategy]
 Review your synthesis from Pass 1.
-
-{parser_limitations_filled}
 
 Group, trim, and refine those insights into a concrete, realistic 90-day onboarding strategy.
 
-### Cross-check each finding against the actual topography data:
+### Cross-check each finding against the actual topography data provided above:
 - **Model field exists?** Confirm every referenced field appears in the specific model's `fields` list.
 - **View exists?** Confirm every referenced class appears in the `views` list with its `absolute_path`.
 - **Serializer exists?** Confirm every referenced serializer appears in the `serializers` list.
@@ -271,178 +234,172 @@ Generate the final report matching the schema defined in your system prompt. Inc
 5. **Observability, Telemetry (OpenTelemetry), & Testing Enhancements** — Gap analysis based on what visibility the topography reveals.
 6. **Organizational & Workflow Improvement Recommendations** — Process changes, ownership boundaries, code review triggers evident from the project structure."""
 
-    passes = [pass1, pass2]
+        # 4. Execute Reasoning Pass
+        print(f"Step 3: Processing strategy analysis via [{cfg.reasoning_model}]...")
+        pass_start = time.time()
 
-    # 4. Execute Reasoning Pass via Agent
-    print(f"Step 3: Processing strategy analysis via [{REASONING_ARCHITECT}]...")
-    pass_start = time.time()
-
-    analyst = Agent(
-        name="Staff_Onboarding",
-        system_prompt=system_agent_prompt,
-        model_name=REASONING_ARCHITECT,
-        base_url=ARCHITECT_API_BASE,
-        api_key=ARCHITECT_API_KEY,
-        num_ctx=65536,
-    )
-
-    context_parts: list[str] = []
-    for i, pass_prompt in enumerate(passes):
-        combined = (
-            "\n\n".join([*context_parts, pass_prompt]) if context_parts else pass_prompt
+        try:
+            final_analysis, model_used, _hist = harness.run_multipass(
+                system_prompt=system_agent_prompt,
+                passes=[pass1, pass2],
+                shared_context=shared_context,
+                role="reasoning",
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _abort_on_conn_error(e)
+        print(
+            f"   [Done] Strategy analysis via {model_used} "
+            f"in {time.time() - pass_start:.2f}s"
         )
-        t0 = time.time()
-        output = analyst.execute(combined)
-        print(f"   [Done] Pass {i + 1} / {len(passes)} in {time.time() - t0:.1f}s")
-        context_parts.append(f"[Pass {i + 1} Output]:\n{output}")
 
-    final_analysis = output
-    model_used = analyst.model_name
-
-    print(
-        f"   [Done] Strategy analysis via {model_used} in {time.time() - pass_start:.2f}s"
-    )
-
-    # 5. Evaluate analysis quality
-    print(f"Step 4: Evaluating strategy viability via Local Judge [{LOCAL_JUDGE}]...")
-    judge_start = time.time()
-
-    judge_context = f"Project Topography:\n{project_map_json[:5000]}"
-    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE)
-    scores = evaluator.grade_run(
-        final_analysis, "rubrics/strategy_rubric.json", context=judge_context
-    )
-
-    print(f"   [Done] Judging completed in {time.time() - judge_start:.2f}s")
-    print(f"Strategy Reliability Scores: {scores}")
-
-    # 5b. Fact-check report against known ground truth
-    print("Step 4b: Fact-checking report fidelity...")
-
-    bad_patterns = [
-        (r"\bCOMPLETED\b", '"COMPLETED" (should be FINISHED for JobStatuses)'),
-        (r"\bFAILED\b", '"FAILED" (should be ERROR for JobStatuses)'),
-        (
-            r"AdminBenefactorRetrieveUpdateView",
-            "view name (should be AdminBenefactorRetrieveView)",
-        ),
-    ]
-    fidelity_notes = []
-    fidelity_penalties = 0
-    for pattern, desc in bad_patterns:
-        matches = list(re.finditer(pattern, final_analysis))
-        if matches:
-            for m in matches:
-                line_num = final_analysis[: m.start()].count("\n") + 1
-                fidelity_notes.append(f"  ✗ Line {line_num}: {desc}")
-                fidelity_penalties += 1
-
-    # Check model count claims in the report
-    model_count_patterns = [
-        (
-            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+models?\b",
-            "model count",
-        ),
-        (
-            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+serializers?\b",
-            "serializer count",
-        ),
-        (
-            r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+views?\b",
-            "view count",
-        ),
-    ]
-    parser_model_count = len(project_map.get("models", []))
-    parser_serializer_count = len(project_map.get("serializers", []))
-    parser_view_count = len(project_map.get("views", []))
-    tolerance = 3
-    for pattern, label in model_count_patterns:
-        for m in re.finditer(pattern, final_analysis, re.IGNORECASE):
-            claimed = int(m.group(1))
-            actual = {
-                "model": parser_model_count,
-                "serializer": parser_serializer_count,
-                "view": parser_view_count,
-            }[label.split()[0]]
-            if abs(claimed - actual) > tolerance:
-                line_num = final_analysis[: m.start()].count("\n") + 1
-                fidelity_notes.append(
-                    f"  ⚠ Line {line_num}: Claims {claimed} {label} (parser found {actual})"
-                )
-                fidelity_penalties += 1
-
-    # Check for "concrete" / "abstract" model distinction in the report
-    has_concrete_abstract = bool(
-        re.search(r"(concrete|abstract)\s*model", final_analysis, re.IGNORECASE)
-    )
-    if has_concrete_abstract:
-        fidelity_notes.append("  ✓ Correctly distinguishes concrete vs abstract models")
-    else:
-        fidelity_notes.append("  ⚠ Does not distinguish concrete vs abstract models")
-
-    fidelity_score = max(0, 10 - fidelity_penalties)
-    if fidelity_penalties == 0:
-        fidelity_rating = "Excellent"
-    elif fidelity_penalties <= 2:
-        fidelity_rating = "Good"
-    elif fidelity_penalties <= 4:
-        fidelity_rating = "Fair"
-    else:
-        fidelity_rating = "Poor"
-
-    fidelity_report = [
-        f"\n{'=' * 50}",
-        f"  Report Fidelity Score: {fidelity_score}/10 — {fidelity_rating}",
-        f"  Penalties: {fidelity_penalties}",
-    ]
-    if fidelity_notes:
-        fidelity_report.append("  Details:")
-        fidelity_report.extend(fidelity_notes)
-    fidelity_report.append(f"{'=' * 50}\n")
-    fidelity_report_str = "\n".join(fidelity_report)
-    print(fidelity_report_str)
-
-    # 6. Log and Export Artifacts
-    print("Step 5: Archiving run data...")
-    full_scores = {
-        **scores,
-        "fidelity": fidelity_score,
-        "fidelity_max": 10,
-        "fidelity_notes": fidelity_notes,
-    }
-    warehouse = HarnessWarehouse()
-    warehouse.log_run(
-        model_name=model_used,
-        agent_role="Incoming Staff Engineer (90-Day Strategy)",
-        raw_output=final_analysis,
-        scores=full_scores,
-    )
-
-    report_filename = "reports/staff_90_day_onboarding_roadmap.md"
-    os.makedirs("reports", exist_ok=True)
-    with open(report_filename, "w", encoding="utf-8") as f:
-        f.write(final_analysis)
-        f.write(f"\n\n---\n{'-' * 50}\n")
-        f.write("## Fidelity Check\n\n")
-        f.write(f"**Score:** {fidelity_score}/10 — {fidelity_rating}\n\n")
-        f.write(
-            f"**Parser Ground Truth:** {concrete_model_count} concrete models, {abstract_model_count} abstract, {parser_serializer_count} serializers, {parser_view_count} views ({class_based_view_count} class-based, {function_based_view_count} function-based)\n\n"
+        # 5. Evaluate analysis quality
+        print(
+            f"Step 4: Evaluating strategy viability via Judge [{cfg.resolve_judge()}]..."
         )
+        judge_start = time.time()
+        judge_context = f"Project Topography:\n{project_map_json[:8000]}"
+        scores = harness.grade_and_archive(
+            output=final_analysis,
+            rubric_path="rubrics/strategy_rubric.json",
+            agent_role="Incoming Staff Engineer (90-Day Strategy)",
+            model_used=model_used,
+            config=cfg,
+            judge_context=judge_context,
+            report_path="reports/staff_90_day_onboarding_roadmap.md",
+        )
+        print(f"   [Done] Judging in {time.time() - judge_start:.2f}s")
+        print(f"Strategy Reliability Scores: {scores}")
+
+        # 5b. Fact-check report against known ground truth
+        print("Step 4b: Fact-checking report fidelity...")
+
+        bad_patterns = [
+            (r"\bCOMPLETED\b", '"COMPLETED" (should be FINISHED for JobStatuses)'),
+            (r"\bFAILED\b", '"FAILED" (should be ERROR for JobStatuses)'),
+            (
+                r"AdminBenefactorRetrieveUpdateView",
+                "view name (should be AdminBenefactorRetrieveView)",
+            ),
+        ]
+        fidelity_notes = []
+        fidelity_penalties = 0
+        for pattern, desc in bad_patterns:
+            matches = list(re.finditer(pattern, final_analysis))
+            if matches:
+                for m in matches:
+                    line_num = final_analysis[: m.start()].count("\n") + 1
+                    fidelity_notes.append(f"  ✗ Line {line_num}: {desc}")
+                    fidelity_penalties += 1
+
+        model_count_patterns = [
+            (
+                r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+models?\b",
+                "model count",
+            ),
+            (
+                r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+serializers?\b",
+                "serializer count",
+            ),
+            (
+                r"(?:total|overall|approximately|about|contains?|has|have|of|:|\bwith)\s+(\d+)\s+views?\b",
+                "view count",
+            ),
+        ]
+        parser_model_count = len(project_map.get("models", []))
+        parser_serializer_count = len(project_map.get("serializers", []))
+        parser_view_count = len(project_map.get("views", []))
+        tolerance = 3
+        for pattern, label in model_count_patterns:
+            for m in re.finditer(pattern, final_analysis, re.IGNORECASE):
+                claimed = int(m.group(1))
+                actual = {
+                    "model": parser_model_count,
+                    "serializer": parser_serializer_count,
+                    "view": parser_view_count,
+                }[label.split()[0]]
+                if abs(claimed - actual) > tolerance:
+                    line_num = final_analysis[: m.start()].count("\n") + 1
+                    fidelity_notes.append(
+                        f"  ⚠ Line {line_num}: Claims {claimed} {label} "
+                        f"(parser found {actual})"
+                    )
+                    fidelity_penalties += 1
+
+        has_concrete_abstract = bool(
+            re.search(r"(concrete|abstract)\s*model", final_analysis, re.IGNORECASE)
+        )
+        if has_concrete_abstract:
+            fidelity_notes.append(
+                "  ✓ Correctly distinguishes concrete vs abstract models"
+            )
+        else:
+            fidelity_notes.append(
+                "  ⚠ Does not distinguish concrete vs abstract models"
+            )
+
+        fidelity_score = max(0, 10 - fidelity_penalties)
+        if fidelity_penalties == 0:
+            fidelity_rating = "Excellent"
+        elif fidelity_penalties <= 2:
+            fidelity_rating = "Good"
+        elif fidelity_penalties <= 4:
+            fidelity_rating = "Fair"
+        else:
+            fidelity_rating = "Poor"
+
+        fidelity_report = [
+            f"\n{'=' * 50}",
+            f"  Report Fidelity Score: {fidelity_score}/10 — {fidelity_rating}",
+            f"  Penalties: {fidelity_penalties}",
+        ]
         if fidelity_notes:
-            f.write("**Issues Found:**\n\n")
-            for note in fidelity_notes:
-                f.write(f"{note}\n\n")
+            fidelity_report.append("  Details:")
+            fidelity_report.extend(fidelity_notes)
+        fidelity_report.append(f"{'=' * 50}\n")
+        print("\n".join(fidelity_report))
 
-    if _mcp_orch:
-        _mcp_orch.remember(
-            "eval:onboarding:complete",
-            f"Onboarding strategy completed. Report: {report_filename}",
-            tags=["evaluation", "onboarding", "complete"],
+        # 6. Re-write report with fidelity appendix
+        full_scores = {
+            **scores,
+            "fidelity": fidelity_score,
+            "fidelity_max": 10,
+            "fidelity_notes": fidelity_notes,
+        }
+        with open(
+            "reports/staff_90_day_onboarding_roadmap.md", "w", encoding="utf-8"
+        ) as f:
+            f.write(final_analysis)
+            f.write(f"\n\n---\n{'-' * 50}\n")
+            f.write("## Fidelity Check\n\n")
+            f.write(f"**Score:** {fidelity_score}/10 — {fidelity_rating}\n\n")
+            f.write(
+                f"**Parser Ground Truth:** {concrete_model_count} concrete models, "
+                f"{abstract_model_count} abstract, {parser_serializer_count} "
+                f"serializers, {parser_view_count} views ({class_based_view_count} "
+                f"class-based, {function_based_view_count} function-based)\n\n"
+            )
+            if fidelity_notes:
+                f.write("**Issues Found:**\n\n")
+                for note in fidelity_notes:
+                    f.write(f"{note}\n\n")
+        # Log the augmented scores separately (warehouse already logged via
+        # grade_and_archive; append a fidelity-augmented run for completeness).
+        HarnessWarehouse().log_run(
+            model_name=model_used,
+            agent_role="Incoming Staff Engineer (90-Day Strategy) [fidelity]",
+            raw_output=final_analysis,
+            scores=full_scores,
         )
-        _mcp_orch.stop()
+
+        if orch:
+            orch.remember(
+                "eval:onboarding:complete",
+                "Onboarding strategy completed. Report: reports/staff_90_day_onboarding_roadmap.md",
+                tags=["evaluation", "onboarding", "complete"],
+            )
 
     total_duration = time.time() - start_time
-    print(f"\nReport saved to: {report_filename}")
+    print("\nReport saved to: reports/staff_90_day_onboarding_roadmap.md")
     print(f"Fidelity Score: {fidelity_score}/10 ({fidelity_rating})")
     print(f"Total Time: {total_duration:.2f}s  Model: {model_used}")
 

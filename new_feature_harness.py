@@ -17,6 +17,7 @@ a three-phase loop per pipeline step:
 """
 
 import ast
+import atexit
 import contextlib
 import json
 import os
@@ -27,14 +28,22 @@ import tempfile
 import time
 from typing import Any
 
+import requests
+
 from core.agent import Agent, build_dependency_graph, skill_get_affected_files
+from core.config import get_config
+from core.forge_proxy import ForgeProxy
 from core.headroom import CompressionManager
 from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
+from core.retrieval import retrieve_relevant_code
 
-IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", "ornith:35b")
-AUDITOR_MODEL = os.environ.get("AUDITOR_MODEL", "gpt-oss:20b")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Model roles default to core.config (so runs are comparable across harnesses);
+# env vars still override per-role selection.
+_cfg = get_config()
+IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", _cfg.local_model)
+AUDITOR_MODEL = os.environ.get("AUDITOR_MODEL", _cfg.heavy_reviewer)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _cfg.cloud_model)
 
 DEFAULT_MAX_ENGINEER_ATTEMPTS = 4
 DEFAULT_MAX_AUDITOR_ROUNDS = 3
@@ -53,6 +62,12 @@ PONYTAIL_MAX_DIFF_LINES = int(os.environ.get("PONYTAIL_MAX_DIFF_LINES", "500"))
 PONYTAIL_SHRINK_TARGET = float(os.environ.get("PONYTAIL_SHRINK_TARGET", "0.4"))
 
 
+def _stop_orchestrator(orch) -> None:
+    """Best-effort MCP teardown (idempotent, exception-safe)."""
+    with contextlib.suppress(Exception):
+        orch.stop()
+
+
 def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
     global _mcp_orchestrator
     if _mcp_orchestrator is not None:
@@ -62,6 +77,11 @@ def init_mcp_orchestrator(config_path: str, target_repo: str | None = None):
     orch = init_orchestrator(config_path, target_repo)
     if orch:
         _mcp_orchestrator = orch
+        # Guarantee release on ANY exit path (sys.exit, uncaught exception,
+        # normal completion). Previously stop() ran only on the success path
+        # at the end of main(), orphaning the MCP subprocesses whenever a
+        # pipeline stage hit sys.exit(1) (e.g. max-rounds exhausted).
+        atexit.register(_stop_orchestrator, orch)
     return orch
 
 
@@ -88,7 +108,7 @@ def build_agent(
     base_url = (
         "https://generativelanguage.googleapis.com/v1beta/openai"
         if use_gemini
-        else "http://localhost:11434"
+        else _cfg.base_url
     )
     return Agent(
         name=name,
@@ -97,6 +117,8 @@ def build_agent(
         base_url=base_url,
         api_key=api_key,
         num_ctx=num_ctx,
+        seed=_cfg.seed,
+        use_openai_format=bool(_cfg.use_openai_format or use_gemini),
     )
 
 
@@ -924,6 +946,20 @@ def main() -> None:
                         f"\n\nFiles importing this module (don't break):\n{affected}\n"
                     )
 
+        # BM25 retrieval of existing implementations related to this task, so
+        # the implementer can reuse code instead of reinventing it. This
+        # directly serves the Ponytail "Codebase Reuse" Decision Ladder rung:
+        # the model previously saw only the target file + importers and could
+        # not discover existing helpers/services.
+        rag_context = retrieve_relevant_code(
+            task.get("instruction", "") + " " + task.get("target_file", ""),
+            target_repo,
+            top_k=6,
+            max_chars=8000,
+        )
+        if rag_context:
+            existing_file_context += f"\n\n{rag_context}\n"
+
         max_engineer_attempts = task.get(
             "max_engineer_attempts", DEFAULT_MAX_ENGINEER_ATTEMPTS
         )
@@ -1685,4 +1721,16 @@ Task: {task['instruction']}
 
 
 if __name__ == "__main__":
-    main()
+    # Catch LLM connection failures from any execute() in the 800-line pipeline
+    # loop and surface an actionable message instead of a raw traceback. (The
+    # pipeline is too deeply nested to wrap each call individually.)
+    try:
+        with ForgeProxy(get_config()):
+            main()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        print(
+            f"\n❌ LLM connection failed ({type(e).__name__}). "
+            "If local, Ollama may be down or the model OOM'd during generation. "
+            "Check `ollama ps` / GPU memory and retry."
+        )
+        sys.exit(1)

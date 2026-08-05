@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -29,7 +30,11 @@ import sys
 import time
 from pathlib import Path
 
+import requests
+
 from core.agent import Agent
+from core.config import GEMINI_BASE_URL, OLLAMA_BASE_URL, get_config
+from core.forge_proxy import ForgeProxy
 from core.judge import AutomatedEvaluator
 from core.mcp_orchestrator import init_orchestrator
 from core.parser import minify_markdown
@@ -38,24 +43,20 @@ AGENTS_DIR = Path(__file__).parent / "agents"
 RUBRICS_DIR = Path(__file__).parent / "rubrics"
 REPORTS_DIR = Path(__file__).parent / "reports"
 
-# ── Model Configuration ───────────────────────────────────────────────────────
-USE_GEMINI = os.getenv("USE_GEMINI", "").lower() in ("1", "true", "yes")
+# ── Model Configuration (sourced centrally from core.config) ──────────────────
+# Previously hardcoded here and drifted from every other harness. All harnesses
+# now read from core.config so runs are comparable; override via env vars
+# (LOCAL_MODEL, USE_GEMINI, LOCAL_JUDGE, EVAL_SEED, ...).
+_cfg = get_config()
 
-CLOUD_MODEL = "gemini-2.5-flash"
-LOCAL_MODEL = "ornith:35b"
-LOCAL_JUDGE = os.getenv(
-    "LOCAL_JUDGE", "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0"
-)
-
-REVIEW_MODEL = CLOUD_MODEL if USE_GEMINI else LOCAL_MODEL
-REVIEW_BASE_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/openai"
-    if USE_GEMINI
-    else "http://localhost:11434"
-)
-REVIEW_API_KEY = os.getenv("GEMINI_API_KEY") if USE_GEMINI else None
-
-JUDGE_BASE_URL = "http://localhost:11434"
+LOCAL_MODEL = _cfg.local_model
+CLOUD_MODEL = _cfg.cloud_model
+LOCAL_JUDGE = _cfg.resolve_judge()
+REVIEW_MODEL = _cfg.reasoning_model
+REVIEW_BASE_URL = _cfg.base_url
+REVIEW_API_KEY = _cfg.api_key
+REVIEW_USE_OPENAI = _cfg.use_openai_format
+JUDGE_BASE_URL = OLLAMA_BASE_URL  # judge is always a local Ollama model
 MCP_CONFIG_PATH = os.environ.get("MCP_CONFIG", "mcp_config.json")
 
 _mcp_orch = None
@@ -189,30 +190,53 @@ def load_project_context(project_context_path: str | None) -> str:
     return content
 
 
-def build_repo_context(target_repo: str) -> str:
-    """Scan the target repo for files and structure relevant to the ADR."""
-    from core.parser import scan_file_tree, scan_files_by_keyword
+def _adr_identifiers(adr_text: str) -> str:
+    """Build a retrieval query from code identifiers referenced in the ADR.
 
-    file_tree = scan_file_tree(target_repo)
+    The "Implementation Readiness" dimension asks whether file paths, class
+    names, and method signatures in the ADR are plausible — but the reviewer
+    can only judge that against real source. This extracts CamelCase /
+    snake_case / dotted identifiers from the ADR text and feeds them to BM25
+    retrieval so the actual implementations are returned as ground truth.
+    """
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", adr_text))
+    # Prefer code-shaped tokens (mixed case, underscores, or digits) over
+    # generic prose words, so the query favors ``SoftDeleteModel``,
+    # ``authorize_superuser``, ``perform_claude_ai_job`` over "the"/"decision".
+    codeish = sorted(
+        t
+        for t in tokens
+        if ("_" in t)
+        or (t != t.lower() and t != t.upper())
+        or any(c.isdigit() for c in t)
+    )
+    return " ".join(codeish[:40])
+
+
+def build_repo_context(target_repo: str, adr_text: str = "") -> str:
+    """Scan the target repo for files and implementations relevant to the ADR."""
+    from core.parser import scan_file_tree
+    from core.retrieval import retrieve_relevant_code
+
     parts = ["=== PROJECT FILE TREE ==="]
+    file_tree = scan_file_tree(target_repo)
     parts.append("\n".join(file_tree) if file_tree else "(empty)")
 
-    # Scan for key files mentioned in ADR patterns
-    keywords = [
-        "ClaudeAPI",
-        "PromptTemplate",
-        "perform_claude_ai_job",
-        "llm_provider",
-        "anthropic_provider",
-        "self_hosted_provider",
-        "usage_tracker",
-    ]
-    for kw in keywords:
-        matches = scan_files_by_keyword(target_repo, kw)
-        if matches:
-            for m in matches[:2]:
-                parts.append(f"\n--- {m['file']} ---")
-                parts.append(m["content"].rstrip()[:2000])
+    # BM25 retrieval of the actual implementations the ADR references. This
+    # replaces a previous hardcoded keyword list (ClaudeAPI, llm_provider, ...)
+    # that was memores-specific and silently empty for every other project.
+    if adr_text:
+        rag_query = _adr_identifiers(adr_text)
+        if rag_query:
+            rag_block = retrieve_relevant_code(
+                rag_query, target_repo, top_k=8, max_chars=10000
+            )
+            if rag_block:
+                parts.append(
+                    "\n=== Retrieved Implementations (ground truth for "
+                    "fact-checking file paths, class names, method signatures) ==="
+                )
+                parts.append(rag_block)
 
     return "\n".join(parts)
 
@@ -233,6 +257,15 @@ def build_full_context(
     return "\n\n".join(parts)
 
 
+def _endpoints_for(model_name: str) -> tuple[str, str | None, bool]:
+    """Pick (base_url, api_key, use_openai_format) for a model name from config."""
+    if "gemini" in model_name.lower():
+        return GEMINI_BASE_URL, os.getenv("GEMINI_API_KEY"), True
+    if _cfg.forge_enabled:
+        return _cfg.base_url, None, True
+    return OLLAMA_BASE_URL, None, False
+
+
 def run_single_pass(
     adr_text: str, context_block: str = "", model: str | None = None
 ) -> str:
@@ -243,6 +276,8 @@ def run_single_pass(
         model_name=model or REVIEW_MODEL,
         base_url=REVIEW_BASE_URL,
         api_key=REVIEW_API_KEY,
+        seed=_cfg.seed,
+        use_openai_format=REVIEW_USE_OPENAI,
     )
 
     user_prompt = f"Review this ADR:\n\n{adr_text}"
@@ -260,6 +295,8 @@ def run_multi_pass(adr_text: str, context_block: str = "") -> str:
         model_name=REVIEW_MODEL,
         base_url=REVIEW_BASE_URL,
         api_key=REVIEW_API_KEY,
+        seed=_cfg.seed,
+        use_openai_format=REVIEW_USE_OPENAI,
     )
 
     dimension_results = {}
@@ -281,10 +318,20 @@ def run_multi_pass(adr_text: str, context_block: str = "") -> str:
 
 
 def score_review(review_text: str, adr_text: str) -> dict:
-    """Score the review against the ADR review rubric."""
-    evaluator = AutomatedEvaluator(judge_model=LOCAL_JUDGE, base_url=JUDGE_BASE_URL)
+    """Score the review against the ADR review rubric (judge is non-fatal)."""
+    evaluator = AutomatedEvaluator(
+        judge_model=LOCAL_JUDGE,
+        base_url=JUDGE_BASE_URL,
+        use_openai_format=_cfg.forge_enabled,
+    )
     rubric_path = str(RUBRICS_DIR / "adr_review_rubric.json")
-    return evaluator.grade_run(review_text, rubric_path, context=adr_text[:3000])
+    try:
+        return evaluator.grade_run(review_text, rubric_path, context=adr_text[:3000])
+    except Exception as e:
+        print(
+            f"  Warning: Scoring failed ({type(e).__name__}: {e}); continuing without scores."
+        )
+        return {"_judge_error": str(e)[:200]}
 
 
 def save_report(adr_title: str, review_text: str, scores: dict, output_dir: str) -> str:
@@ -352,7 +399,7 @@ def main():
     parser.add_argument(
         "--engine",
         choices=["ollama", "gemini"],
-        default="ollama" if not USE_GEMINI else "gemini",
+        default="gemini" if _cfg.is_cloud else "ollama",
         help="LLM backend (default: from USE_GEMINI env var)",
     )
     parser.add_argument(
@@ -382,17 +429,14 @@ def main():
     print(f"  ADR Length: {len(adr_text)} chars")
 
     # Resolve model
-    global REVIEW_MODEL, REVIEW_BASE_URL, REVIEW_API_KEY
+    global REVIEW_MODEL, REVIEW_BASE_URL, REVIEW_API_KEY, REVIEW_USE_OPENAI
     if args.model:
         REVIEW_MODEL = args.model
     elif args.engine == "gemini":
         REVIEW_MODEL = CLOUD_MODEL
-        REVIEW_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-        REVIEW_API_KEY = os.getenv("GEMINI_API_KEY")
     else:
         REVIEW_MODEL = LOCAL_MODEL
-        REVIEW_BASE_URL = "http://localhost:11434"
-        REVIEW_API_KEY = None
+    REVIEW_BASE_URL, REVIEW_API_KEY, REVIEW_USE_OPENAI = _endpoints_for(REVIEW_MODEL)
 
     print(f"  Review Model: {REVIEW_MODEL}")
     print(f"  Mode: {'Multi-pass' if args.multi_pass else 'Single-pass'}")
@@ -416,12 +460,12 @@ def main():
     # Load project context
     project_context = load_project_context(args.project_context)
 
-    # Build repo context
+    # Build repo context (RAG query is derived from the ADR's own identifiers)
     repo_context = ""
     if target_repo:
         if os.path.exists(target_repo):
             print(f"  Scanning repo: {target_repo}")
-            repo_context = build_repo_context(target_repo)
+            repo_context = build_repo_context(target_repo, adr_text)
         else:
             print(f"  Warning: target repo not found: {target_repo}")
 
@@ -430,31 +474,46 @@ def main():
         adr_text, repo_context, project_context, mcp_context
     )
 
-    # Run review
-    print("\nRunning ADR review...")
-    t0 = time.time()
-    if args.multi_pass:
-        review_text = run_multi_pass(adr_text, context_block)
-    else:
-        review_text = run_single_pass(adr_text, context_block)
-    elapsed = time.time() - t0
-    print(f"  Review completed in {elapsed:.1f}s")
-
-    # Score
-    scores = {}
-    if not args.no_score:
-        print("  Scoring review against rubric...")
+    try:
+        # Run review
+        print("\nRunning ADR review...")
+        t0 = time.time()
         try:
-            scores = score_review(review_text, adr_text)
-            print(f"  Scores: {json.dumps(scores.get('scores', {}), indent=2)}")
-        except Exception as e:
-            print(f"  Warning: Scoring failed: {e}")
+            if args.multi_pass:
+                review_text = run_multi_pass(adr_text, context_block)
+            else:
+                review_text = run_single_pass(adr_text, context_block)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(
+                f"\n❌ Model request failed ({type(e).__name__}). "
+                "If using a local model, the Ollama server may be down or the "
+                "model may have OOM'd during generation. Check `ollama ps` / "
+                "GPU memory and retry."
+            )
+            sys.exit(1)
+        elapsed = time.time() - t0
+        print(f"  Review completed in {elapsed:.1f}s")
 
-    # Save
-    path = save_report(adr_title, review_text, scores, args.output_dir)
-    print(f"\nReview saved: {path}")
-    print("\nDone. Review the report and address critical gaps before proceeding.")
+        # Score
+        scores = {}
+        if not args.no_score:
+            print("  Scoring review against rubric...")
+            scores = score_review(review_text, adr_text)
+            if "_judge_error" not in scores:
+                print(f"  Scores: {json.dumps(scores.get('scores', {}), indent=2)}")
+
+        # Save
+        path = save_report(adr_title, review_text, scores, args.output_dir)
+        print(f"\nReview saved: {path}")
+        print("\nDone. Review the report and address critical gaps before proceeding.")
+    finally:
+        # Always release MCP subprocesses / HTTP connections, even on failure
+        # or early sys.exit — otherwise an LLM timeout or judge error orphans them.
+        if _mcp_orch:
+            with contextlib.suppress(Exception):
+                _mcp_orch.stop()
 
 
 if __name__ == "__main__":
-    main()
+    with ForgeProxy(get_config()):
+        main()
