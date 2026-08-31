@@ -16,7 +16,8 @@ Env vars:
     USE_GEMINI        (1/true/yes) use the Gemini cloud backend
     GEMINI_API_KEY    cloud API key (required when USE_GEMINI=1)
     CLOUD_MODEL       override default cloud model
-    LOCAL_MODEL       override default local Ollama model
+    LOCAL_MODEL       override default local Ollama model (architect/reasoning)
+    CODE_MODEL        override code implementer/reviewer model
     HEAVY_REVIEWER    override adversarial reviewer model
     LOCAL_JUDGE       override local judge model
     NUM_CTX           context window size (default 65536)
@@ -32,9 +33,10 @@ from dataclasses import dataclass
 
 # ── Canonical defaults ────────────────────────────────────────────────────────
 DEFAULT_CLOUD_MODEL = "gemini-2.5-flash"
-DEFAULT_LOCAL_MODEL = "qwen3.6:35b-mlx"
-DEFAULT_HEAVY_REVIEWER = "gpt-oss:20b"
-DEFAULT_LOCAL_JUDGE = "gemma4-smart"
+DEFAULT_LOCAL_MODEL = "qwen3.8:27b-mlx"
+DEFAULT_CODE_MODEL = "qwen3-coder-128k:latest"
+DEFAULT_HEAVY_REVIEWER = "gpt-oss-fixed:latest"
+DEFAULT_LOCAL_JUDGE = "muse-glimmer:30b-mlx"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_FORGE_PORT = 8081
@@ -50,6 +52,7 @@ _MODEL_FAMILIES: dict[str, set[str]] = {
     "gpt": {"gpt-oss", "gpt", "o1", "o3"},
     "codestral": {"codestral", "mistral"},
     "ornith": {"ornith"},
+    "muse": {"muse"},
 }
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -68,6 +71,14 @@ def model_family(name: str) -> str:
     lower = lower.rsplit("/", 1)[-1]  # hf.co/path/gemma-x -> gemma-x
     for family, prefixes in _MODEL_FAMILIES.items():
         if any(lower.startswith(p) for p in prefixes):
+            return family
+    # Fine-tune merges (e.g. "ThinkingCap-Qwen3.6-27B") embed the base family
+    # mid-name instead of as a prefix; match on containment so they still
+    # classify to the family whose training biases they inherited. Only
+    # prefixes of reasonable length qualify — short tokens like "o1"/"o3"
+    # would false-positive as substrings of unrelated names.
+    for family, prefixes in _MODEL_FAMILIES.items():
+        if any(len(p) >= 4 and p in lower for p in prefixes):
             return family
     return lower.split("-")[0] if "-" in lower else lower
 
@@ -105,6 +116,7 @@ class RuntimeConfig:
     use_gemini: bool
     cloud_model: str
     local_model: str
+    code_model: str
     heavy_reviewer: str
     local_judge: str
     num_ctx: int
@@ -117,7 +129,7 @@ class RuntimeConfig:
     # returning 502. Must be >= the runner's request_timeout so the proxy
     # never gives up before the harness does. 300s (forge's default) is too
     # short for large local models generating long reviews.
-    forge_backend_timeout: float = 1200.0
+    forge_backend_timeout: float = 2700.0
 
     @property
     def reasoning_model(self) -> str:
@@ -172,6 +184,7 @@ def load_config() -> RuntimeConfig:
         use_gemini=use_gemini,
         cloud_model=os.getenv("CLOUD_MODEL", DEFAULT_CLOUD_MODEL),
         local_model=os.getenv("LOCAL_MODEL", DEFAULT_LOCAL_MODEL),
+        code_model=os.getenv("CODE_MODEL", DEFAULT_CODE_MODEL),
         heavy_reviewer=os.getenv("HEAVY_REVIEWER", DEFAULT_HEAVY_REVIEWER),
         local_judge=os.getenv("LOCAL_JUDGE", DEFAULT_LOCAL_JUDGE),
         num_ctx=int(os.getenv("NUM_CTX", "65536")),
@@ -180,7 +193,7 @@ def load_config() -> RuntimeConfig:
         forge_enabled=forge_enabled,
         forge_port=int(os.getenv("FORGE_PROXY_PORT", str(DEFAULT_FORGE_PORT))),
         forge_backend_url=os.getenv("FORGE_BACKEND_URL", DEFAULT_FORGE_BACKEND_URL),
-        forge_backend_timeout=float(os.getenv("FORGE_BACKEND_TIMEOUT", "1200")),
+        forge_backend_timeout=float(os.getenv("FORGE_BACKEND_TIMEOUT", "2700")),
     )
 
 

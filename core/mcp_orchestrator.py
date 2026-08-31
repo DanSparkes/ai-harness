@@ -180,10 +180,16 @@ class MCPOrchestrator:
                 pass
         return functions
 
-    def format_tools_for_prompt(self, server_filter: list[str] | None = None) -> str:
+    def format_tools_for_prompt(
+        self,
+        server_filter: list[str] | None = None,
+        exclude: list[str] | None = None,
+    ) -> str:
         sections = []
         for name, client in self._clients.items():
             if server_filter and name not in server_filter:
+                continue
+            if exclude and name in exclude:
                 continue
             try:
                 tools = client.list_tools()
@@ -387,11 +393,15 @@ class MCPOrchestrator:
         except MCPError:
             return "(sequential thinking server not available)"
 
-    def build_mcp_context_block(self, tags: list[str] | None = None) -> str:
+    def build_mcp_context_block(
+        self,
+        tags: list[str] | None = None,
+        exclude_tools_from: list[str] | None = None,
+    ) -> str:
         if not self.is_running:
             return ""
         sections = ["=== MCP TOOL WORKBENCH (available tools) ==="]
-        sections.append(self.format_tools_for_prompt())
+        sections.append(self.format_tools_for_prompt(server_filter=None, exclude=exclude_tools_from))
         sections.append("")
         sections.append("=== MCP MEMORY CONTEXT ===")
         memory = self.recall(tags=tags or ["active"])

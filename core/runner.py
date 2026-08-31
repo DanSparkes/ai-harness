@@ -3,17 +3,46 @@ import time
 
 import requests
 
+from core.local_payload import (
+    is_unsupported_think_error,
+    ollama_keep_alive,
+    strip_think,
+    with_think_disabled,
+)
+
 # Matches <think>...</think> reasoning blocks emitted by thinking models
 # (e.g. Qwen3 ThinkingCap / DeepSeek-R1). Many GGUF builds return these
 # inline in `content` rather than Ollama's separate `thinking` field.
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_RE = re.compile(r"<think>" + r".*?</think>" + r"", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_think(text: str) -> str:
-    """Remove <think>...</think> blocks; never return empty (preserve a
-    thinking-only reply intact so a review is never silently dropped)."""
+    """Remove <think>...</think> blocks; also handle unclosed <think> tags.
+    Returns the cleaned text. If only thinking content existed, returns a
+    placeholder indicating the model failed to produce output."""
+    # First, strip all closed <think>...</think> blocks
     cleaned = _THINK_RE.sub("", text).strip()
-    return cleaned or text
+
+    # If result starts with unclosed <think>, try to extract content after it
+    if cleaned.startswith("<think>"):
+        # Look for content after the think block (separated by blank line)
+        # Capture everything after the first blank line following <think>
+        match = re.search(r"<think>[\s\S]*?\n\n([\s\S]+)$", cleaned, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+            # Only accept if it looks like actual review content (starts with header, capital, or markdown)
+            if candidate and (candidate[0].isupper() or candidate.startswith('#') or candidate.startswith('[')):
+                cleaned = candidate
+            else:
+                return "# Review Generation Failed\n\nThe model produced only reasoning tokens without a final review. This may indicate the model was overloaded or the request timed out during generation."
+        else:
+            # No blank line found, so no actual content after think block
+            return "# Review Generation Failed\n\nThe model produced only reasoning tokens without a final review. This may indicate the model was overloaded or the request timed out during generation."
+
+    if not cleaned:
+        return "# Review Generation Failed\n\nThe model produced only reasoning tokens without a final review. This may indicate the model was overloaded or the request timed out during generation."
+
+    return cleaned
 
 
 class StatefulHarnessRunner:
@@ -37,26 +66,17 @@ class StatefulHarnessRunner:
         self.local_fallback_model = local_fallback_model
         self.api_key = api_key
         self.num_ctx = num_ctx
-        # Reproducibility seed for local Ollama requests (options.seed). Cloud
-        # backends ignore it. None lets Ollama choose (non-reproducible).
         self.seed = seed
-        # When True, use OpenAI chat-completions format (for Forge proxy or cloud).
         self.use_openai_format = use_openai_format
 
         self.is_cloud = "gemini" in model_name.lower() or bool(api_key)
 
-        # Explicit temperature override; otherwise pick a sensible default
-        # based on the model role (coder models -> deterministic, reasoning
-        # models -> slightly creative).
         self.temperature = (
             temperature
             if temperature is not None
             else (0.0 if "coder" in model_name.lower() else 0.4)
         )
 
-        # Per-request timeout. Local models (including via Forge proxy) can
-        # stall on GPU/RAM pressure, so bound them generously. Only true cloud
-        # calls get a short timeout since latency there is predictable.
         self.request_timeout = request_timeout or (120 if self.is_cloud else 1200)
 
         if self.use_openai_format:
@@ -113,6 +133,20 @@ class StatefulHarnessRunner:
                     continue
                 raise
             if response.status_code not in retry_codes:
+                if is_unsupported_think_error(response) and strip_think(payload):
+                    continue
+                return response
+            # On 500 errors, also try removing the think parameter (Forge proxy
+            # may return 500 when it doesn't understand the think field)
+            if response.status_code == 500 and "think" in payload:
+                print(
+                    "   ⚠️  Backend 500 with think parameter, retrying without it..."
+                )
+                strip_think(payload)
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt)
+                    time.sleep(delay)
+                    continue
                 return response
             if attempt < max_retries:
                 delay = base_delay * (2**attempt)
@@ -121,9 +155,6 @@ class StatefulHarnessRunner:
                     f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})..."
                 )
                 time.sleep(delay)
-        # response may be None if every attempt raised Timeout, but mypy
-        # with ignore_missing_imports treats requests.Response as Any and
-        # does not surface the implicit None possibility here.
         return response
 
     def execute_sequence(
@@ -150,13 +181,15 @@ class StatefulHarnessRunner:
                     "top_p": 0.9,
                 }
             else:
-                payload = {
-                    "model": self.model_name,
-                    "messages": messages,
-                    "stream": False,
-                    "keep_alive": "0",
-                    "options": self._local_options(temperature),
-                }
+                payload = with_think_disabled(
+                    {
+                        "model": self.model_name,
+                        "messages": messages,
+                        "stream": False,
+                        "keep_alive": ollama_keep_alive(),
+                        "options": self._local_options(temperature),
+                    }
+                )
 
             print(f"   --- Pass {idx + 1} / {len(passes)} ---")
             pass_t0 = time.time()
@@ -188,13 +221,15 @@ class StatefulHarnessRunner:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": fallback_prompt or pass_prompt},
                 ]
-                fb_payload = {
-                    "model": self.model_name,
-                    "messages": fb_messages,
-                    "stream": False,
-                    "keep_alive": "0",
-                    "options": self._local_options(temperature),
-                }
+                fb_payload = with_think_disabled(
+                    {
+                        "model": self.model_name,
+                        "messages": fb_messages,
+                        "stream": False,
+                        "keep_alive": ollama_keep_alive(),
+                        "options": self._local_options(temperature),
+                    }
+                )
                 fb_headers = {"Content-Type": "application/json"}
 
                 assistant_response = ""
@@ -260,13 +295,15 @@ class StatefulHarnessRunner:
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": fallback_prompt or pass_prompt},
                         ]
-                        fb_payload = {
-                            "model": self.local_fallback_model,
-                            "messages": fb_messages,
-                            "stream": False,
-                            "keep_alive": "0",
-                            "options": self._local_options(temperature),
-                        }
+                        fb_payload = with_think_disabled(
+                            {
+                                "model": self.local_fallback_model,
+                                "messages": fb_messages,
+                                "stream": False,
+                                "keep_alive": ollama_keep_alive(),
+                                "options": self._local_options(temperature),
+                            }
+                        )
                         try:
                             fb_response = self._call_with_retry(
                                 self.api_url,

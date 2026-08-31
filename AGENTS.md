@@ -31,6 +31,18 @@ Because you are running on a local engine via Ollama, you must strictly adhere t
 - Local context evaluation can suffer from prompt-processing lag. Keep your chat turns concise.
 - Prefer targeted file edits over rewriting entire multi-hundred-line source files.
 
+### D. Deterministic Quality Gates (Layer 4)
+The harness itself is validated by `python3 quality_gate.py` before any change
+is considered done. Default gates:
+- **required**: `tests/` (pytest) + `ruff check .` — must clear.
+- **advisory**: `mypy core/` + `bandit -r core/` — reported, not blocking.
+- **opt-in deep**: `a3 scan core/ --interprocedural` (Z3 symbolic execution)
+  via `--gate a3` or `QUALITY_GATE_DEEP=1`. Slow (~40s), designed for CI.
+- `--strict` promotes advisory gates to required (use after `--write-baseline`
+  to accept known debt).
+- Pre-existing mypy/bandit debt in `core/` should not block routine edits; if
+  you introduce a NEW mypy/bandit finding, fix it before claiming the task done.
+
 ---
 
 ## 3. Standard Operational Playbook

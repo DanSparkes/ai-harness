@@ -35,13 +35,18 @@ from core.config import get_config
 from core.forge_proxy import ForgeProxy
 from core.headroom import CompressionManager
 from core.mcp_orchestrator import init_orchestrator
-from core.parser import minify_markdown
+from core.parser import (
+    extract_json_payloads,
+    find_section,
+    minify_markdown,
+    validate_pipeline_schema,
+)
 from core.retrieval import retrieve_relevant_code
 
 # Model roles default to core.config (so runs are comparable across harnesses);
 # env vars still override per-role selection.
 _cfg = get_config()
-IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", _cfg.local_model)
+IMPLEMENTER_MODEL = os.environ.get("IMPLEMENTER_MODEL", _cfg.code_model)
 AUDITOR_MODEL = os.environ.get("AUDITOR_MODEL", _cfg.heavy_reviewer)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _cfg.cloud_model)
 
@@ -704,34 +709,26 @@ def load_plan(path: str) -> tuple[dict[str, Any], str]:
         with open(path, encoding="utf-8") as f:
             report_text = minify_markdown(f.read())
 
-        sections = re.split(
-            r"^##\s+4\.?\s*Implementation Pipeline\s*$", report_text, flags=re.MULTILINE
+        pipeline_section = find_section(
+            report_text,
+            r"##\s+4\.?\s*Implementation Pipeline",
+            r"##\s+Implementation Pipeline",
         )
-        if len(sections) < 2:
-            sections = re.split(
-                r"^##\s+Implementation Pipeline\s*$", report_text, flags=re.MULTILINE
-            )
-
-        if len(sections) < 2:
+        if pipeline_section is None:
             print(
                 f"Error: '{path}' is a .md file but has no '## Implementation Pipeline' section."
             )
             sys.exit(1)
 
-        json_blocks = re.findall(r"```(?:json)?\s*\n(.*?)```", sections[1], re.DOTALL)
-        if not json_blocks:
-            print(
-                f"Error: No JSON code block found in Implementation Pipeline section of '{path}'."
-            )
-            sys.exit(1)
-
         plan_data = None
-        for block in json_blocks:
-            try:
-                plan_data = json.loads(block.strip())
+        for payload in extract_json_payloads(pipeline_section):
+            if not validate_pipeline_schema(payload):
+                plan_data = payload
                 break
-            except json.JSONDecodeError:
-                continue
+            # Keep the first parseable payload as a last resort so the
+            # validation errors below can name the precise problems.
+            if plan_data is None:
+                plan_data = payload
 
         if plan_data is None:
             print(
@@ -739,10 +736,26 @@ def load_plan(path: str) -> tuple[dict[str, Any], str]:
             )
             sys.exit(1)
 
+        schema_errors = validate_pipeline_schema(plan_data)
+        if schema_errors:
+            print(
+                f"Error: Pipeline in '{path}' failed structural validation "
+                "(missing required step fields):"
+            )
+            for err in schema_errors:
+                print(f"  - {err}")
+            sys.exit(1)
+
         return plan_data, report_text
 
     with open(path, encoding="utf-8") as f:
         plan_data = json.load(f)
+    schema_errors = validate_pipeline_schema(plan_data)
+    if schema_errors:
+        print(f"Error: Pipeline in '{path}' failed structural validation:")
+        for err in schema_errors:
+            print(f"  - {err}")
+        sys.exit(1)
     exploration = plan_data.pop("architectural_report", "")
     return plan_data, exploration
 
@@ -833,7 +846,9 @@ def main() -> None:
         print(
             "  MCP Workbench active: git context, memory, and reasoning tools available.\n"
         )
-        mcp_context = mcp_orch.build_mcp_context_block()
+        mcp_context = mcp_orch.build_mcp_context_block(
+            exclude_tools_from=["gortex"],
+        )
         mcp_project_discovery = mcp_orch.discover_project_context()
         django_context, _django_raw = mcp_orch.build_django_live_context()
     else:

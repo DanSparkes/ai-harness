@@ -1,95 +1,38 @@
-default_language_version:
-  python: python3
+# Pre-commit hooks for the local-harness.
+#
+# Install (one-time): pip install pre-commit && pre-commit install
+# Run on demand:      pre-commit run --all-files
+#
+# The harness's deterministic quality gate (`quality_gate.py`) is invoked here
+# so any edit that breaks pytest or ruff is blocked at commit time. The deep
+# a3 gate stays out of pre-commit by default — it's too slow for every commit
+# and is meant for scheduled CI.
+#
+# `language: python` makes pre-commit manage an ISOLATED Python venv for this
+# hook (created on first run, cached thereafter). It installs the exact
+# dependencies below, independent of whatever `python3` happens to be on the
+# host's PATH. This avoids the trap where the host's default python is
+# missing pytest (e.g. the `pi-harness` virtualenv at
+# ~/.virtualenvs/pi-harness/), so the test gate fails spuriously.
 
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+  - repo: local
     hooks:
-      - id: check-yaml
-      - id: end-of-file-fixer
-      - id: check-json
-      - id: check-toml
-      - id: debug-statements
-      - id: trailing-whitespace
-      - id: check-ast
-      - id: check-builtin-literals
-      - id: check-case-conflict
-      - id: check-executables-have-shebangs
-      - id: check-merge-conflict
-      - id: check-added-large-files
-      - id: detect-private-key
-      - id: mixed-line-ending
-        args: [--fix=lf]
-      - id: name-tests-test
-        args: [--pytest-test-first]
-      - id: requirements-txt-fixer
-
-  - repo: https://github.com/psf/black
-    rev: 26.5.1
-    hooks:
-      - id: black
-        args: ["--target-version", "py312"]
-
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.21.2
-    hooks:
-      - id: pyupgrade
-        args: [--py312-plus]
-
-  - repo: https://github.com/PyCQA/autoflake
-    rev: v2.3.3
-    hooks:
-      - id: autoflake
-
-  - repo: https://github.com/PyCQA/flake8
-    rev: 7.3.0
-    hooks:
-      - id: flake8
-        args:
-          [
-            "--ignore=E501,W503,E203",
-            "--per-file-ignores=__init__.py:F401",
-          ]
+      - id: quality-gate
+        name: Deterministic quality gate (pytest + ruff + advisory mypy/bandit)
+        entry: python quality_gate.py
+        language: python
+        # Pre-commit installs these into its isolated env on first run.
+        # Versions match [project.optional-dependencies] dev in pyproject.toml.
+        # Keep them in sync if you bump the dev extras. ``requests`` is a
+        # runtime dep of core/ (LLM API calls) and is required to import
+        # any module the tests touch.
         additional_dependencies:
-          [
-            "flake8-bugbear",
-            "flake8-comprehensions",
-            "flake8-mutable",
-            "flake8-simplify",
-          ]
-
-  - repo: https://github.com/PyCQA/isort
-    rev: 9.0.0a3
-    hooks:
-      - id: isort
-        args: ["--profile", "black"]
-
-  - repo: https://github.com/charliermarsh/ruff-pre-commit
-    rev: "v0.15.17"
-    hooks:
-      - id: ruff
-        args: ["--fix"]
-
-  - repo: https://github.com/pycqa/pylint
-    rev: v4.0.6
-    hooks:
-      - id: pylint
-        entry: pylint --rcfile=.pylintrc
-        types:
-          - file
-          - python
-
-  - repo: https://github.com/pre-commit/pygrep-hooks
-    rev: v1.10.0
-    hooks:
-      - id: python-use-type-annotations
-      - id: python-no-log-warn
-      - id: python-no-eval
-      - id: python-check-mock-methods
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.1.0
-    hooks:
-      - id: mypy
+          - pytest>=9.0
+          - ruff>=0.16
+          - mypy>=2.3
+          - bandit>=1.9
+          - requests>=2.31
         pass_filenames: false
-        args: ["--show-traceback", "."]
+        types: [python]
+        stages: [pre-commit]

@@ -16,7 +16,19 @@ from pathlib import Path
 
 import pytest
 
-from code_review import _allocate_context_budget, _clip, _read_capped
+from code_review import (
+    CHUNK_PASS_TIMEOUT_S,
+    CHUNK_TARGET_CHARS,
+    _allocate_context_budget,
+    _clip,
+    _domain_key,
+    _is_noise_file,
+    _parse_diff_hunks,
+    _read_capped,
+    group_diff_chunks,
+    merge_chunk_reviews,
+    preprocess_diff,
+)
 from core.claim_verifier import (
     _extract_field_block,
     _strip_string_literals,
@@ -277,3 +289,224 @@ def test_main_returns_int_and_requires_repo(monkeypatch: pytest.MonkeyPatch) -> 
     exit_code = code_review.main()
     assert isinstance(exit_code, int)
     assert exit_code != 0
+
+
+# ── Large-diff chunking + noise summarization ────────────────────────────────
+
+
+_SAMPLE_DIFF = """diff --git a/memores/models.py b/memores/models.py
+index aaa..bbb 100644
+--- a/memores/models.py
++++ b/memores/models.py
+@@ -1,3 +1,4 @@
++class NewModel(models.Model):
++    name = models.CharField(max_length=100)
+-    old_thing
+diff --git a/memores/serializers/user_serializers.py b/memores/serializers/user_serializers.py
+index ccc..ddd 100644
+--- a/memores/serializers/user_serializers.py
++++ b/memores/serializers/user_serializers.py
+@@ -1,3 +1,4 @@
++class UserSerializer(serializers.Serializer):
++    id = serializers.IntegerField()
+diff --git a/memores/migrations/0002_something.py b/memores/migrations/0002_something.py
+index eee..fff 100644
+--- a/memores/migrations/0002_something.py
++++ b/memores/migrations/0002_something.py
+@@ -1,3 +1,5 @@
++import django.db.models.deletion
++migrations.AddField(model_name='x', name='y')
++class Migration(migrations.Migration):
+"""
+
+
+def test_is_noise_file_classifies_auto_generated_paths() -> None:
+    assert _is_noise_file("memores/migrations/0001_initial.py")
+    assert _is_noise_file("uv.lock")
+    assert _is_noise_file("package-lock.json")
+    assert _is_noise_file("static/app.min.js")
+    assert _is_noise_file("memores/fixtures/some.json")
+    assert not _is_noise_file("memores/models.py")
+    assert not _is_noise_file("memores/views/user_views.py")
+
+
+def test_parse_diff_hunks_splits_by_file() -> None:
+    hunks = _parse_diff_hunks(_SAMPLE_DIFF)
+    assert len(hunks) == 3
+    paths = [h["path"] for h in hunks]
+    assert paths == [
+        "memores/models.py",
+        "memores/serializers/user_serializers.py",
+        "memores/migrations/0002_something.py",
+    ]
+    assert all(h["body"] for h in hunks)
+
+
+def test_preprocess_diff_summarizes_noise_keeps_source() -> None:
+    cleaned, noise = preprocess_diff(_SAMPLE_DIFF)
+    # Exactly the migration is summarized away.
+    assert len(noise) == 1
+    assert noise[0]["path"] == "memores/migrations/0002_something.py"
+    assert "0002_something" not in cleaned
+    # Reviewable source hunks survive intact.
+    assert "class NewModel(models.Model):" in cleaned
+    assert "class UserSerializer(serializers.Serializer):" in cleaned
+
+
+def test_group_diff_chunks_preserves_all_user_files() -> None:
+    cleaned, _ = preprocess_diff(_SAMPLE_DIFF)
+    chunks = group_diff_chunks(cleaned)
+    all_files = [f for c in chunks for f in c["files"]]
+    assert "memores/models.py" in all_files
+    assert "memores/serializers/user_serializers.py" in all_files
+    # Noise file must never appear in a review chunk.
+    assert all("migrations" not in f for f in all_files)
+    assert all(c["body"] for c in chunks)
+
+
+def test_group_diff_chunks_returns_noise_only_fallback() -> None:
+    # A diff that is entirely noise still yields one (empty) chunk so the
+    # pipeline doesn't crash downstream.
+    chunks = group_diff_chunks("")
+    assert len(chunks) == 1
+    assert chunks[0]["key"] == "noise-only"
+
+
+def test_merge_chunk_reviews_single_and_multi() -> None:
+    single = merge_chunk_reviews(
+        [{"key": "a", "files": ["f1"], "output": "# only\n"}]
+    )
+    assert single == "# only\n"
+
+    multi = merge_chunk_reviews(
+        [
+            {"key": "a", "files": ["f1"], "output": "# rev A\n"},
+            {"key": "b", "files": ["f2"], "output": "# rev B\n"},
+        ]
+    )
+    assert "## Chunk: a" in multi
+    assert "## Chunk: b" in multi
+    assert "Files reviewed: f1" in multi
+
+    # Single-chunk passthrough returns the raw (unstripped) output verbatim.
+    empty = merge_chunk_reviews(
+        [{"key": "a", "files": ["f1"], "output": "   \n"}]
+    )
+    assert empty == "   \n"
+
+
+# ── Chunking refinement (12K cap, deterministic domain key) ────────────────
+
+
+def test_chunk_target_chars_default_is_bounded() -> None:
+    """Default chunk size must be small enough that a chunk finishes in
+    minutes, not hours. The previous 30K default produced 48-min chunks on
+    large test files; 12K keeps each pass bounded.
+    """
+    assert CHUNK_TARGET_CHARS <= 15000, CHUNK_TARGET_CHARS
+    assert CHUNK_TARGET_CHARS >= 4000, CHUNK_TARGET_CHARS
+
+
+def test_chunk_pass_timeout_is_set() -> None:
+    """A per-chunk wall-clock ceiling must exist; otherwise one stuck pass
+    can silently burn hours via the runner's 5x exponential-backoff retries.
+    """
+    assert 60 <= CHUNK_PASS_TIMEOUT_S <= 1800, CHUNK_PASS_TIMEOUT_S
+
+
+def test_domain_key_uses_explicit_marker() -> None:
+    assert _domain_key("memores/views/user_views.py") == "memores/views"
+    assert _domain_key("memores/serializers/payment.py") == "memores/serializers"
+    assert _domain_key("memores/models/foo.py") == "memores/models"
+    assert _domain_key("memores/tests/test_x.py") == "memores/tests"
+    assert _domain_key("memores/migrations/0001_initial.py") == "memores/migrations"
+
+
+def test_domain_key_does_not_collapse_unrelated_subdirs() -> None:
+    """Regression for the bug that produced giant 'memores' chunks.
+
+    When a path has no explicit domain marker (views/serializers/etc.), the
+    key must include the subdirectory so memores/auth does NOT collide with
+    memores/views or memores/billing.
+    """
+    auth_key = _domain_key("memores/auth/oauth.py")
+    billing_key = _domain_key("memores/billing/webhooks.py")
+    payments_key = _domain_key("memores/payments/charge.py")
+    assert auth_key != billing_key != payments_key
+    assert auth_key == "memores/auth"
+    assert billing_key == "memores/billing"
+    assert payments_key == "memores/payments"
+
+
+def test_domain_key_handles_root_level_files() -> None:
+    # Single-segment paths (rare, e.g. a top-level helper) key on themselves
+    # so they remain distinguishable rather than all collapsing to "".
+    assert _domain_key("utils.py") == "utils.py"
+    assert _domain_key("README.md") == "README.md"
+
+
+def test_group_diff_chunks_respects_smaller_cap() -> None:
+    """A diff with multiple sizable files in the SAME bucket must split
+    under the new (smaller) cap. The previous 30K cap let these pile up.
+    """
+    body = "\n".join(f"+line{i}" for i in range(300))  # ~2K per file
+
+    def hunk(path: str) -> str:
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            f"@@ -1 +1,300 @@\n{body}"
+        )
+
+    # 4 files in memores/views, each ~2K, total ~8K — fits in one 12K chunk.
+    diff = "\n".join(
+        hunk(f"memores/views/f{i}.py") for i in range(4)
+    )
+    chunks = group_diff_chunks(diff)
+    assert len(chunks) == 1
+    assert all(c["size"] <= CHUNK_TARGET_CHARS for c in chunks)
+
+
+def test_group_diff_chunks_splits_bucket_over_cap() -> None:
+    """Same bucket, files totaling > cap → multiple chunks under that key."""
+    body = "\n".join(f"+line{i}" for i in range(500))  # ~3K per file
+
+    def hunk(path: str) -> str:
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            f"@@ -1 +1,500 @@\n{body}"
+        )
+
+    # 6 files x ~3K = ~18K -> must split into 2 chunks at the 12K cap.
+    diff = "\n".join(
+        hunk(f"memores/views/f{i}.py") for i in range(6)
+    )
+    chunks = group_diff_chunks(diff)
+    assert len(chunks) >= 2
+    assert all(c["size"] <= CHUNK_TARGET_CHARS * 1.5 for c in chunks)
+
+
+def test_group_diff_chunks_keeps_unrelated_subdirs_separate() -> None:
+    """End-to-end: the fix must surface in real chunking, not just _domain_key."""
+    body = "\n".join(f"+line{i}" for i in range(100))  # ~700 chars
+
+    def hunk(path: str) -> str:
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            f"@@ -1 +1,100 @@\n{body}"
+        )
+
+    diff = "\n".join(
+        [
+            hunk("memores/views/user.py"),
+            hunk("memores/auth/oauth.py"),
+            hunk("memores/billing/webhooks.py"),
+        ]
+    )
+    chunks = group_diff_chunks(diff)
+    keys = [c["key"] for c in chunks]
+    assert "memores/views" in keys
+    assert "memores/auth" in keys
+    assert "memores/billing" in keys

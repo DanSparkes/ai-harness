@@ -235,7 +235,241 @@ def build_mcp_context() -> str:
     orch = _mcp_orch
     if not orch:
         return ""
-    return orch.build_mcp_context_block(tags=["code_review", "architectural_rule"])
+    return orch.build_mcp_context_block(
+        tags=["code_review", "architectural_rule"],
+        exclude_tools_from=["gortex"],
+    )
+
+
+# ── Large-diff chunking + noise-file summarization ─────────────────────────
+
+
+# Auto-generated / low-signal files where a full hunk dump adds noise without
+# reviewable source. Migrations and lockfiles are the dominant offenders; the
+# reviewer's persona already instructs it not to demand schema migrations
+# (and diff invariants ground that deterministically). We keep a compressed
+# signature (paths + added/removed counts) rather than the full diff body.
+_NOISE_RE = re.compile(
+    r"/(migrations?|fixtures?|node_modules|dist|build)/"
+    r"|\.(lock|json|min\.js|min\.css|map)$"
+    r"|_pb2?\.py$"
+    r"\.pyc$",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_file(path: str) -> bool:
+    """True for auto-generated files whose full diff adds no reviewable signal.
+
+    Matching these keeps a lockfile bump or a synthetic migration out of every
+    chunk's prompt while still recording that it changed (see
+    ``summarize_hunk``), so the reviewer isn't blind to the fact.
+    """
+    if _NOISE_RE.search(path):
+        return True
+    # Django migration check (migrations/0001_initial.py) caught above; this
+    # covers a bare "migrations.py" module name too.
+    return bool(re.search(r"(^|/)migrations?\.py$", path))
+
+
+def _parse_diff_hunks(raw_diff: str) -> list[dict]:
+    """Split a unified git diff into per-file records.
+
+    Each record carries the file path, its hunk text, and running hunk size.
+    The ``path`` includes the leading ``a/``-free dotted path from the
+    ``+++ b/...`` header. Files that only show rename indicators without diff
+    bodies (binary / rename-only) are still captured with ``body=""``.
+    """
+    files: list[dict] = []
+    current: dict | None = None
+    for line in raw_diff.splitlines():
+        if line.startswith("diff --git "):
+            if current is not None:
+                files.append(current)
+            current = {"path": "", "lines": [line], "size": len(line) + 1}
+            m = re.search(r"b/(\S+)\s*$", line)
+            if m and " a/" in line:
+                current["path"] = m.group(1)
+            continue
+        if current is not None:
+            # The concrete new-path header (+++ b/...) is authoritative;
+            # use it to fill the path if the diff --git header didn't carry it.
+            if line.startswith("+++ b/") and not current["path"]:
+                current["path"] = line[6:]
+            current["lines"].append(line)
+            current["size"] += len(line) + 1
+        elif line.startswith("+++ b/"):
+            # Unlikely without a preceding diff --git header, but be safe.
+            current = {
+                "path": line[6:],
+                "lines": [line],
+                "size": len(line) + 1,
+            }
+    if current is not None:
+        files.append(current)
+    for f in files:
+        f["body"] = "\n".join(f["lines"])
+    return files
+
+
+def _hunk_signature(body: str) -> str:
+    """Compress a noise-file hunk into 'N+/M-' counts so it stays visible but tiny."""
+    lines = body.splitlines()
+    added = sum(1 for ln in lines if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in lines if ln.startswith("-") and not ln.startswith("---"))
+    changed = sum(1 for ln in lines if ln.startswith(("+", "-")))
+    return f"({added:+} / {removed:-} lines changed, {changed} lines total)"
+
+
+def preprocess_diff(raw_diff: str) -> tuple[str, list[dict]]:
+    """Summarize noise files and return (cleaned_diff, noise_records).
+
+    ``cleaned_diff`` keeps every reviewable (non-noise) file's diff intact and
+    replaces noise files with a one-line signature. ``noise_records`` lists the
+    summarized files for the report/meta section.
+    """
+    hunks = _parse_diff_hunks(raw_diff)
+    kept: list[str] = []
+    noise: list[dict] = []
+    for h in hunks:
+        if not h["path"]:
+            kept.append(h["body"])
+            continue
+        if _is_noise_file(h["path"]):
+            noise.append(
+                {"path": h["path"], "signature": _hunk_signature(h["body"])}
+            )
+        else:
+            kept.append(h["body"])
+    cleaned = "\n".join(kept)
+    return cleaned, noise
+
+
+# Per-chunk char budget for multi-chunk reviews. Default 12000 keeps each
+# review pass bounded at a few minutes on a 30B-class local model; the
+# previous 30000 default produced hour-long passes on the slowest chunks
+# (e.g. test files with massive fixtures). Override via env if your model is
+# faster/slower.
+CHUNK_TARGET_CHARS = int(os.environ.get("CODE_REVIEW_CHUNK_CHARS", "12000"))
+
+# Hard per-chunk wall-clock cap. Each chunk review is one execute_sequence
+# call; if it doesn't return inside this window we abort the whole run with
+# a clear message instead of burning hours on a single stuck pass.
+CHUNK_PASS_TIMEOUT_S = int(
+    os.environ.get("CODE_REVIEW_CHUNK_TIMEOUT_S", "600")
+)
+
+
+# Domain markers inside a path that justify aggregating all files under that
+# marker into one chunk. Order matters only for the tiebreak when a path
+# happens to contain more than one (rare).
+_DOMAIN_MARKERS = {"models", "views", "serializers", "tests", "migrations"}
+
+
+def _domain_key(path: str) -> str:
+    """Return a stable, path-disambiguating bucket key for a changed file.
+
+    Strategy (in priority order):
+      1. If the path contains an explicit domain marker (e.g. ``memores/views``),
+         key on ``<root>/<marker>`` so all files in that tier cluster.
+      2. Otherwise, key on the first two path segments (``root/sub``). This
+         is the bugfix for the previous behavior, which fell back to just the
+         top directory — that collapsed unrelated subtrees like
+         ``memores/auth`` and ``memores/billing`` into a single ``memores``
+         bucket and produced giant chunks.
+      3. Single-segment paths (rare; usually generated noise) key on the
+         segment itself so they're distinguishable.
+    """
+    parts = path.split("/")
+    for i, part in enumerate(parts):
+        if part in _DOMAIN_MARKERS:
+            return "/".join(parts[: i + 1])
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return parts[0] or "(root)"
+
+
+def _file_hunk_size(h: dict) -> int:
+    return int(h.get("size") or 0)
+
+
+def group_diff_chunks(raw_diff: str) -> list[dict]:
+    """Group a diff into review chunks bounded by CHUNK_TARGET_CHARS.
+
+    Files are grouped by directory/domain prefix when possible (so related
+    files — e.g. all serializers in one change — land together and reviewers
+    see them in context), then packed greedily under the per-chunk char cap.
+    A single file larger than the cap becomes its own chunk (one review pass
+    still covers it fully; the cap is a target, not a hard truncation).
+    """
+    hunks = _parse_diff_hunks(raw_diff)
+    hunks = [h for h in hunks if h["path"] and not _is_noise_file(h["path"])]
+
+    # Group by domain, preserving file order within each group.
+    buckets: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for h in hunks:
+        k = _domain_key(h["path"])
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(h)
+
+    chunks: list[dict] = []
+    for key in order:
+        bucket = buckets[key]
+        # Split a bucket further if it alone exceeds the target.
+        chunk: list[dict] = []
+        chunk_size = 0
+        for h in bucket:
+            size = _file_hunk_size(h)
+            if chunk and chunk_size + size > CHUNK_TARGET_CHARS:
+                chunks.append(_finalize_chunk(chunk, key))
+                chunk = []
+                chunk_size = 0
+            chunk.append(h)
+            chunk_size += size
+        if chunk:
+            chunks.append(_finalize_chunk(chunk, key))
+
+    # Emergency guard: if grouping produced zero chunks (only noise files),
+    # fall back to a single empty chunk so the pipeline still runs.
+    if not chunks:
+        chunks = [_finalize_chunk([], "noise-only")]
+    return chunks
+
+
+def _finalize_chunk(files: list[dict], key: str) -> dict:
+    files = [f for f in files if f.get("body")]
+    body = "\n".join(f.get("body", "") for f in files)
+    return {
+        "key": key,
+        "files": [f["path"] for f in files],
+        "body": body,
+        "size": len(body),
+    }
+
+
+def merge_chunk_reviews(chunk_reviews: list[dict]) -> str:
+    """Combine per-chunk review outputs into a single final report.
+
+    Each chunk's markdown headings (file paths) remain authoritative; we
+    assemble them with clear separators. A per-chunk header keeps findings
+    attributable to their review unit.
+    """
+    if len(chunk_reviews) == 1:
+        return chunk_reviews[0]["output"]
+    parts = []
+    for cr in chunk_reviews:
+        body = (cr.get("output") or "").strip()
+        if not body:
+            continue
+        header = (
+            f"## Chunk: {cr['key']}\n"
+            f"Files reviewed: {', '.join(cr['files']) or '(none)'}\n\n"
+        )
+        parts.append(header + body)
+    return "\n\n---\n\n".join(parts)
 
 
 def collect_key_file_context(
@@ -513,11 +747,38 @@ def _run_review(
     else:
         print("   [Skipped] No project context file specified (-c to add)\n")
 
+    # 4d. Preprocess the diff for large/branchy changes: summarize
+    # auto-generated noise (migrations, lockfiles, minified bundles, fixtures)
+    # down to a signature so they don't bloat every prompt, then group the
+    # remaining reviewable files into size-bounded chunks. A small diff stays a
+    # single chunk and follows the original two-pass path below; a large diff
+    # is split so no single model call overflows the context window.
+    cleaned_diff, _noise_records = preprocess_diff(raw_diff)
+    review_chunks = group_diff_chunks(cleaned_diff)
+    multi_chunk = len(review_chunks) > 1
+    chunked_diff = (
+        "\n\n".join(c["body"] for c in review_chunks)
+        if multi_chunk
+        else review_chunks[0]["body"]
+    )
+    if multi_chunk:
+        sizes = ", ".join(f"{c['key']}:{c['size']:,}" for c in review_chunks)
+        print(
+            f"   [Large diff] Split review into {len(review_chunks)} chunks "
+            f"({sizes}) — each reviewed as its own pass, then merged."
+        )
+
     # 5. Compute a single token-budget allocation shared by all prompts.
-    # This replaces the previous ad-hoc [:8000] clips that were applied
-    # inconsistently between the fallback and two-pass prompts.
+    # Uses the CLEANED diff (post noise-summarization). For multi-chunk diffs
+    # only one chunk (~CHUNK_TARGET_CHARS) streams into any single review call,
+    # so we reserve just that bounded amount and give map/key-file context a
+    # healthy slice instead of letting a 150K+ diff starve it.
+    if multi_chunk:
+        reserve_diff_chars = min(len(chunked_diff), CHUNK_TARGET_CHARS)
+    else:
+        reserve_diff_chars = len(cleaned_diff)
     budget = _allocate_context_budget(
-        persona_chars=len(system_agent_prompt), diff_chars=len(raw_diff)
+        persona_chars=len(system_agent_prompt), diff_chars=reserve_diff_chars
     )
 
     project_map_json = json.dumps(project_map, default=str, separators=(",", ":"))
@@ -712,15 +973,117 @@ Follow the markdown schema and headers defined in your system prompt."""
         # security harness: deterministic sampling at the audit temperature.
         temperature=temperature_for("audit"),
     )
-    history = runner.execute_sequence(
-        system_prompt=system_agent_prompt,
-        passes=passes,
-        fallback_prompt=fallback_prompt,
-    )
-    if not history:
-        print("❌ Error: Review produced no output (both primary and fallback failed).")
-        return 2
-    final_review = history[-1]["output"]
+
+    if multi_chunk:
+        # Large diff: run each size-bounded chunk as its OWN fresh conversation
+        # so the model never sees a 150K+ diff that overflows its context window.
+        # Every chunk still receives the full shared context (map, key files,
+        # MCP, invariants) so its findings stay grounded in the same facts.
+        #
+        # Per-chunk wall-clock cap. The runner's default request_timeout is
+        # ~20 min for cloud (Forge proxy) and ~20 min for local; combined with
+        # its 5x exponential-backoff retries a single stuck chunk can burn
+        # 40+ minutes. For chunked review we tighten the request timeout AND
+        # enforce an outer wall-clock so the whole run can't silently hang.
+        # Respect user --timeout if they passed one; otherwise use the chunk
+        # default (CHUNK_PASS_TIMEOUT_S, 10 min).
+        chunk_request_timeout = (
+            request_timeout if request_timeout is not None else CHUNK_PASS_TIMEOUT_S
+        )
+        runner.request_timeout = chunk_request_timeout
+
+        chunk_reviews: list[dict] = []
+        run_start = time.time()
+        for idx, chunk in enumerate(review_chunks, 1):
+            elapsed = time.time() - run_start
+            print(
+                f"   --- Chunk {idx}/{len(review_chunks)} "
+                f"[{chunk['key']}] ({len(chunk['files'])} files, "
+                f"{chunk['size']:,} chars) "
+                f"[elapsed {elapsed/60:.1f}m, "
+                f"per-pass timeout {chunk_request_timeout}s] ---"
+            )
+            chunk_pass = f"""[Code Review — Chunk {idx}/{len(review_chunks)}]
+Below is the project model map, key source files, MCP live state, project rules, and diff invariants for the whole change, followed by the diff chunk you are responsible for reviewing.
+{clipped_map}
+{key_file_section}
+{mcp_prompt_section}{project_context_section}
+
+Files in this chunk:
+{json.dumps(chunk['files'], separators=(",", ":"))}
+{invariant_section}
+
+## Git Diff (this chunk only)
+```diff
+{chunk['body']}
+```
+
+Review ONLY the files shown in this chunk's diff. For each changed file evaluate: (a) what changed, (b) is it correct, (c) any issues found. Cite real diff lines; never fabricate names; if unsure say `UNCERTAIN: ...`.
+
+### Mandatory Rules (violations will be flagged):
+1. **CITE DIFF LINES** — For every issue, quote the actual `+` or `-` lines from this chunk's diff.
+2. **NO FABRICATED EXAMPLES** — Never invent function names, method signatures, or field names that aren't in this chunk's diff, the project map, or the key source files above.
+3. **UNCERTAIN MEANS UNCERTAIN** — If you aren't sure whether a change is correct, say `UNCERTAIN: [what you're unsure about]`.
+4. **CORRECT IS A FINDING** — If a change looks correct, say "Looks correct" explicitly.
+5. **NO GENERIC ADVICE** — Only comment on what this chunk's diff actually changes.
+6. **FILE-BY-FILE** — Cover each file in this chunk in order: (a) what changed, (b) is it correct, (c) any issues found.
+7. **TEST COVERAGE & VALIDITY** — For every changed source file, check corresponding test files exist and flag weak/tautological assertions.
+8. **CONCISION & REUSE (Ponytail lens)** — Flag over-engineering where existing utilities, stdlib, or a smaller diff would have sufficed. Flag with "OVER-ENGINEERED" where applicable.
+9. **VERIFY CLAIMS** — Cross-reference field attributes against the project map / key source files above. Do not assume defaults without evidence.
+10. **GROUND TO INVARIANTS** — The Machine-Derived Diff Invariants are deterministic ground truth. If an invariant says a field was REMOVED or MOVED (column already exists), never claim a schema-altering migration (AddField OR RemoveField) is required for it.
+
+Format as markdown with file paths as headings. Review ONLY your chunk — do not review files from other chunks."""
+
+            chunk_t0 = time.time()
+            history = runner.execute_sequence(
+                system_prompt=system_agent_prompt,
+                passes=[chunk_pass],
+                fallback_prompt=None,
+            )
+            chunk_elapsed = time.time() - chunk_t0
+
+            # Per-chunk wall-clock sanity check. The runner's internal retries
+            # can stretch a stuck request past the request_timeout ceiling
+            # (5x exponential backoff = ~6x the per-request budget). If a chunk
+            # ate >2x its allotted budget we abort the run cleanly with what we
+            # have rather than burning hours on one stuck pass.
+            chunk_budget = chunk_request_timeout * 2
+            if chunk_elapsed > chunk_budget:
+                print(
+                    f"\n⛔ CHUNK {idx} exceeded wall-clock budget "
+                    f"({chunk_elapsed/60:.1f}m > {chunk_budget/60:.1f}m). "
+                    "Aborting remaining chunks to preserve elapsed work."
+                )
+                print(
+                    f"   Partial review covers {len(chunk_reviews)} of "
+                    f"{len(review_chunks)} chunks — saved below."
+                )
+                break
+
+            if not history:
+                print(f"   ⚠️  Chunk {idx} produced no output; skipping.")
+                continue
+            chunk_reviews.append(
+                {"key": chunk["key"], "files": chunk["files"], "output": history[-1]["output"]}
+            )
+
+        if not chunk_reviews:
+            print("❌ Error: All review chunks produced no output.")
+            return 2
+        final_review = merge_chunk_reviews(chunk_reviews)
+    else:
+        history = runner.execute_sequence(
+            system_prompt=system_agent_prompt,
+            passes=passes,
+            fallback_prompt=fallback_prompt,
+        )
+        if not history:
+            print(
+                "❌ Error: Review produced no output (both primary and fallback failed)."
+            )
+            return 2
+        final_review = history[-1]["output"]
+
     model_used = runner.model_name
 
     print(
@@ -774,9 +1137,12 @@ Follow the markdown schema and headers defined in your system prompt."""
     # Provide the diff + project map + key file contents as ground truth.
     # The diff is clipped to a generous window; tell the judge explicitly
     # when it cannot see the full diff so it doesn't down-score claims it
-    # can't verify.
-    diff_visible = raw_diff[:20000]
-    diff_truncated = len(raw_diff) > 20000
+    # can't verify. For multi-chunk reviews, use the cleaned/chunked diff
+    # (noise summarized away) which faithfully represents what the reviewer
+    # saw, rather than blindly clipping the raw first-20K.
+    judge_source_diff = chunked_diff if multi_chunk else raw_diff
+    diff_visible = judge_source_diff[:20000]
+    diff_truncated = len(judge_source_diff) > 20000
     judge_diff_note = (
         "\n(Note: diff truncated to first 20000 chars for judge context.)\n"
         if diff_truncated
@@ -792,7 +1158,7 @@ Follow the markdown schema and headers defined in your system prompt."""
         else ""
     )
     judge_context = (
-        f"Diff ({len(raw_diff)} chars total"
+        f"Diff ({len(judge_source_diff)} chars total"
         + (", showing first 20000" if diff_truncated else "")
         + f"):\n```diff\n{diff_visible}\n```{judge_diff_note}\n\n"
         f"Project Map:\n{_clip(project_map_json, 8000, 'project map')}\n\n"

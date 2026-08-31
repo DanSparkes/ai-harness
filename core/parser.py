@@ -1,5 +1,6 @@
 # core/parser.py
 import ast
+import json
 import os
 import re
 import shutil
@@ -1110,3 +1111,120 @@ def minify_markdown(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     lines = [line.rstrip() for line in text.splitlines()]
     return "\n".join(lines).strip()
+
+
+# ── Model-output schema extraction ───────────────────────────────────────────
+#
+# Different models format structured output with different levels of
+# discipline: fenced ```json blocks with or without a trailing newline after
+# the info string, bare fenced blocks, unfenced {...} payloads, or JSON
+# wrapped in <think>...</think> reasoning. These helpers normalize that
+# variance so pipelines depending on embedded JSON payloads parse reliably
+# across all supported models instead of silently failing on one dialect.
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Fence opener: ```json (or plain ```) optionally followed by whitespace —
+# the payload may start on the SAME line for some models.
+_JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n?(.*?)```", re.DOTALL)
+# First balanced top-level {...} object in free text.
+_BRACE_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
+
+
+def _strip_think_blocks(text: str) -> str:
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
+
+def extract_json_payloads(text: str) -> list[dict]:
+    """Extract every parseable JSON object dict from a model response.
+
+    Tries fenced code blocks first (in order), then falls back to any
+    brace-balanced {...} span. Malformed candidates are skipped rather than
+    raising, so callers can try the next block.
+    """
+    cleaned = _strip_think_blocks(text)
+    payloads: list[dict] = []
+    seen_spans: list[str] = []
+
+    candidates: list[str] = _JSON_FENCE_RE.findall(cleaned)
+    for block in candidates:
+        block = block.strip()
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+
+    if not payloads:
+        match = _BRACE_OBJECT_RE.search(cleaned)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    payloads.append(parsed)
+            except json.JSONDecodeError:
+                pass
+
+    # De-duplicate identical payloads while preserving order.
+    unique: list[dict] = []
+    for p in payloads:
+        key = json.dumps(p, sort_keys=True)
+        if key not in seen_spans:
+            seen_spans.append(key)
+            unique.append(p)
+    return unique
+
+
+def parse_first_json_payload(text: str) -> dict | None:
+    """Return the first parseable JSON object in ``text``, or None."""
+    payloads = extract_json_payloads(text)
+    return payloads[0] if payloads else None
+
+
+def find_section(markdown_text: str, *headers: str) -> str | None:
+    """Return the body of the first section matching any header regex.
+
+    Each header is a regex matched against ``## ``-prefixed lines. The body
+    extends until the next heading of the same or higher level. Returns None
+    when no header matches, so callers can fail fast with a clear error.
+    """
+    for header in headers:
+        pattern = rf"^{header}\s*$"
+        parts = re.split(pattern, markdown_text, maxsplit=1, flags=re.MULTILINE)
+        if len(parts) < 2:
+            continue
+        body = parts[1]
+        # Trim anything after the next same-or-higher-level heading.
+        next_heading = re.search(r"^#{1,2} ", body, flags=re.MULTILINE)
+        if next_heading:
+            body = body[: next_heading.start()]
+        return body.strip()
+    return None
+
+
+def validate_pipeline_schema(plan: dict) -> list[str]:
+    """Validate an implementation-pipeline plan dict. Returns error lists.
+
+    Empty list = valid. Checks the structural contract that
+    ``new_feature_harness.py`` executes against (non-empty ``pipeline`` list
+    where each step defines the fields the Engineer/QA loop reads), so a
+    malformed plan fails fast with precise errors instead of crashing
+    mid-execution or writing a corrupt pipeline artifact.
+    """
+    errors: list[str] = []
+    pipeline = plan.get("pipeline")
+    if not isinstance(pipeline, list) or not pipeline:
+        errors.append(
+            "missing or empty 'pipeline' list (expected non-empty array of steps)"
+        )
+        return errors
+    required_step_keys = ("name", "target_file", "task")
+    for i, step in enumerate(pipeline, start=1):
+        if not isinstance(step, dict):
+            errors.append(f"step {i}: not a JSON object")
+            continue
+        for key in required_step_keys:
+            value = step.get(key)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"step {i}: missing or empty '{key}'")
+    return errors

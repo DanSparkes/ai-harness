@@ -1,5 +1,5 @@
 {
-  "description": "MCP servers for JS/TS frontend projects (memores-admin). Includes Puppeteer for visual review and web fetch for API testing.",
+  "description": "MCP servers for JS/TS frontend projects (memores-admin). Includes Puppeteer for visual review, web fetch for API testing, and gortex for graph-based code intelligence.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",
@@ -58,6 +58,13 @@
       "module": "core.mcp_servers.LspServer",
       "enabled": true,
       "description": "Built-in. Python code intelligence: find definitions, references, list symbols, get code context."
+    },
+    "gortex": {
+      "type": "stdio",
+      "command": "gortex",
+      "args": ["mcp", "serve"],
+      "enabled": true,
+      "description": "Code intelligence engine. Graph-based lookups, blast radius, clone detection, semantic search, cross-repo contracts. 257 languages. Install: curl -fsSL https://get.gortex.dev | sh"
     },
     "headroom": {
       "type": "stdio",

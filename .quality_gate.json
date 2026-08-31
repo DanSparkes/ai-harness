@@ -1,0 +1,6 @@
+{
+  "advisory_fail_rc": {
+    "type": 1,
+    "security": 1
+  }
+}

@@ -20,7 +20,8 @@ from urllib3.util.retry import Retry
 from core.cache import get as cache_get
 from core.cache import get_git_head, make_key
 from core.cache import set as cache_set
-from core.config import DEFAULT_LOCAL_MODEL
+from core.config import DEFAULT_CODE_MODEL, DEFAULT_LOCAL_MODEL
+from core.local_payload import is_unsupported_think_error, ollama_keep_alive, strip_think, with_think_disabled
 
 AGENTS_DIR = Path(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agents")
@@ -132,17 +133,19 @@ class Agent:
                     "top_p": 0.9,
                 }
             else:
-                payload = {
-                    "model": self.model_name,
-                    "messages": messages,
-                    "stream": False,
-                    "keep_alive": "0",
-                    "options": {
-                        "num_ctx": self.num_ctx,
-                        "temperature": _temperature,
-                        "top_p": 0.9,
-                    },
-                }
+                payload = with_think_disabled(
+                    {
+                        "model": self.model_name,
+                        "messages": messages,
+                        "stream": False,
+                        "keep_alive": ollama_keep_alive(),
+                        "options": {
+                            "num_ctx": self.num_ctx,
+                            "temperature": _temperature,
+                            "top_p": 0.9,
+                        },
+                    }
+                )
             if self.seed is not None and not self.use_openai_format:
                 payload.setdefault("options", {})["seed"] = self.seed
             if tools:
@@ -152,6 +155,10 @@ class Agent:
             response = session.post(
                 self.api_url, json=payload, headers=headers, timeout=timeout
             )
+            if is_unsupported_think_error(response) and strip_think(payload):
+                response = session.post(
+                    self.api_url, json=payload, headers=headers, timeout=timeout
+                )
             response.raise_for_status()
             data = response.json()
 
@@ -238,23 +245,29 @@ class Agent:
                 "top_p": 0.9,
             }
         else:
-            payload = {
-                "model": self.model_name,
-                "messages": messages,
-                "stream": True,
-                "keep_alive": "0",
-                "options": {
-                    "num_ctx": self.num_ctx,
-                    "temperature": temperature,
-                    "top_p": 0.9,
-                },
-            }
+            payload = with_think_disabled(
+                {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "stream": True,
+                    "keep_alive": ollama_keep_alive(),
+                    "options": {
+                        "num_ctx": self.num_ctx,
+                        "temperature": temperature,
+                        "top_p": 0.9,
+                    },
+                }
+            )
             if self.seed is not None:
                 payload["options"]["seed"] = self.seed
 
         response = requests.post(
             self.api_url, json=payload, headers=headers, stream=True
         )
+        if is_unsupported_think_error(response) and strip_think(payload):
+            response = requests.post(
+                self.api_url, json=payload, headers=headers, stream=True
+            )
         response.raise_for_status()
 
         full_content = ""
@@ -329,14 +342,14 @@ class Agent:
 
 DEFAULT_AGENT_MAP = {
     "Architect": ("architect.md", "gemini-2.5-flash", None),
-    "Engineer": ("code_implementer.md", DEFAULT_LOCAL_MODEL, None),
+    "Engineer": ("code_implementer.md", DEFAULT_CODE_MODEL, None),
     "QA_Tester": (
         "integration_auditor.md",
         "hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0",
         None,
     ),
     "Security_Auditor": ("security.md", "gemini-2.5-flash", None),
-    "Code_Reviewer": ("code_reviewer.md", DEFAULT_LOCAL_MODEL, None),
+    "Code_Reviewer": ("code_reviewer.md", DEFAULT_CODE_MODEL, None),
     "Exploratory_Architect": ("exploratory_architect.md", "gemini-2.5-flash", None),
     "Staff_Onboarding": ("staff_onboarding.md", DEFAULT_LOCAL_MODEL, None),
     "Systems_Architect": ("architecture_review.md", DEFAULT_LOCAL_MODEL, None),

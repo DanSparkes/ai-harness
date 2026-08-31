@@ -59,7 +59,8 @@ def build_mcp_context() -> str:
     if not orch:
         return ""
     return orch.build_mcp_context_block(
-        tags=["dependabot_review", "architectural_rule"]
+        tags=["dependabot_review", "architectural_rule"],
+        exclude_tools_from=["gortex"],
     )
 
 

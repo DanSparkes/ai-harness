@@ -8,6 +8,33 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 forge = ["forge-guardrails"]
+# Default quality gate: lint + tests + advisory type/security checks.
+# Install with: pip install -e ".[dev]"
+dev = ["ruff>=0.16", "mypy>=2.3", "bandit>=1.9"]
+# Optional deep gate: a3-python (Z3 symbolic execution). Slow; opt-in via
+# QUALITY_GATE_DEEP=1 or `python quality_gate.py --gate a3`. Heavy ~40MB.
+gate-deep = ["a3-python>=0.1"]
+
+# Explicit package discovery. The repo uses a flat layout where most
+# top-level directories (agents/, evals/, rubrics/, reports/, scorecards/,
+# project_contexts/) are DATA, not Python packages. Without this block,
+# setuptools auto-discovers all top-level packages and aborts on the
+# "multiple top-level packages" error. We package only `core` (the actual
+# library); harness entry-points (code_review.py, etc.) are run directly
+# via `python3 <script>.py` and don't need to be packaged.
+[tool.setuptools.packages.find]
+include = ["core*"]
+exclude = [
+    "agents*",
+    "evals*",
+    "reports*",
+    "rubrics*",
+    "scorecards*",
+    "project_contexts*",
+    "tests*",
+    "results*",
+]
+namespaces = false
 
 [tool.black]
 target-version = ["py312"]

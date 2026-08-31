@@ -13,6 +13,7 @@ def _cfg(use_gemini: bool = False) -> RuntimeConfig:
         use_gemini=use_gemini,
         cloud_model="gemini-2.5-flash",
         local_model="ornith:35b",
+        code_model="qwen3-coder-128k:latest",
         heavy_reviewer="gpt-oss:20b",
         local_judge="hf.co/x/gemma-9b:Q8_0",
         num_ctx=65536,

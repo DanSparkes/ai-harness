@@ -23,11 +23,18 @@ from core.config import (
         ("ornith-fast:latest", "ornith"),
         ("gemini-2.5-flash", "gemma"),
         ("gpt-oss:20b", "gpt"),
+        ("gpt-oss-fixed:latest", "gpt"),
         ("qwen3.6:35b-mlx", "qwen"),
+        ("qwen3-coder-128k:latest", "qwen"),
+        ("muse-glimmer:30b-mlx", "muse"),
         ("deepseek-r1:32b", "deepseek"),
         # HuggingFace GGUF pull must resolve through its registry path to the
         # underlying family — otherwise gemini architects get gemma judges.
         ("hf.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF:Q8_0", "gemma"),
+        # Fine-tune merges embed the base family mid-name; they must classify
+        # to the inherited family, not the tune's own brand.
+        ("BhupendraA/ThinkingCap-Qwen3.6-27B-MTP-GGUF:Q4_K_M-MTP", "qwen"),
+        ("hf.co/bottlecapai/ThinkingCap-Qwen3.6-27B-GGUF:Q6_K", "qwen"),
     ],
 )
 def test_model_family_classification(name: str, expected: str) -> None:
@@ -46,6 +53,7 @@ def _cfg(local_model: str, cloud_model: str, use_gemini: bool) -> RuntimeConfig:
         use_gemini=use_gemini,
         cloud_model=cloud_model,
         local_model=local_model,
+        code_model=config.DEFAULT_CODE_MODEL,
         heavy_reviewer="gpt-oss:20b",
         local_judge="hf.co/x/gemma-9b:Q8_0",
         num_ctx=65536,
@@ -118,10 +126,35 @@ def test_load_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.is_cloud is False
     assert cfg.api_key is None
     assert cfg.reasoning_model == config.DEFAULT_LOCAL_MODEL
+    assert cfg.code_model == config.DEFAULT_CODE_MODEL
     assert cfg.seed is None
     # Backend timeout must be generous (forge's 300s default is too short for
     # large local models) and overridable.
     assert cfg.forge_backend_timeout >= 600
+
+
+def test_default_roles_are_family_separated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped defaults must give every role a distinct model family so
+    no harness silently degrades to same-family grading."""
+    for var in (
+        "USE_GEMINI",
+        "LOCAL_MODEL",
+        "CODE_MODEL",
+        "HEAVY_REVIEWER",
+        "LOCAL_JUDGE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    cfg = load_config()
+    # Architect and implementer may share a family (both qwen); the judge must
+    # be independent of every role it can grade, and the heavy reviewer must
+    # not mirror the architect.
+    judge_family = model_family(cfg.local_judge)
+    assert judge_family != model_family(cfg.reasoning_model)
+    assert judge_family != model_family(cfg.code_model)
+    assert judge_family != model_family(cfg.heavy_reviewer)
+    assert model_family(cfg.heavy_reviewer) != model_family(cfg.reasoning_model)
+    assert cfg.local_judge == config.DEFAULT_LOCAL_JUDGE
+    assert cfg.heavy_reviewer == config.DEFAULT_HEAVY_REVIEWER
 
 
 def test_load_config_forge_backend_timeout_override(

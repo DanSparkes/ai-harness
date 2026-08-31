@@ -32,7 +32,12 @@ from core.agent import Agent
 from core.config import GEMINI_BASE_URL, get_config
 from core.forge_proxy import ForgeProxy
 from core.mcp_orchestrator import init_orchestrator
-from core.parser import minify_markdown
+from core.parser import (
+    extract_json_payloads,
+    find_section,
+    minify_markdown,
+    validate_pipeline_schema,
+)
 
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
@@ -103,7 +108,8 @@ def get_mcp_context(args: argparse.Namespace) -> str:
     # orphaned the MCP subprocesses.
     try:
         return orch.build_mcp_context_block(
-            tags=["architectural_rule", "active", "campaign_complete"]
+            tags=["architectural_rule", "active", "campaign_complete"],
+            exclude_tools_from=["gortex"],
         )
     finally:
         orch.stop()
@@ -249,39 +255,40 @@ def build_agent(
 
 def extract_pipeline_json(markdown_text: str) -> dict[str, Any] | None:
     """
-    Find the first JSON code block inside the ## Implementation Pipeline section
-    and parse it. Returns the parsed dict or None.
+    Find the first valid JSON code block inside the ## Implementation Pipeline
+    section and parse it. Returns the parsed dict or None.
+
+    Uses the shared cross-model extractor in core.parser, which tolerates
+    fenced blocks with/without a newline after the ```json info string and
+    falls back to brace-balanced spans for models that omit the fence.
     """
-    # Split on the pipeline section header
-    sections = re.split(
-        r"^##\s+4\.?\s*Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE
+    pipeline_section = find_section(
+        markdown_text,
+        r"##\s+4\.?\s*Implementation Pipeline",
+        r"##\s+Implementation Pipeline",
     )
-    if len(sections) < 2:
-        sections = re.split(
-            r"^##\s+Implementation Pipeline\s*$", markdown_text, flags=re.MULTILINE
-        )
-    if len(sections) < 2:
+    if pipeline_section is None:
         print("Warning: Could not find '## Implementation Pipeline' section in report.")
         return None
 
-    pipeline_section = sections[1]
-
-    json_blocks = re.findall(r"```(?:json)?\s*\n(.*?)```", pipeline_section, re.DOTALL)
-    if not json_blocks:
-        print("Warning: No JSON code block found in Implementation Pipeline section.")
+    payloads = extract_json_payloads(pipeline_section)
+    if not payloads:
+        print("Warning: No valid JSON payload found in Implementation Pipeline section.")
         return None
 
-    for block in json_blocks:
-        block = block.strip()
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            continue
+    for payload in payloads:
+        errors = validate_pipeline_schema(payload)
+        if not errors:
+            return payload
+        print(
+            f"Warning: JSON payload rejected by schema validation: {'; '.join(errors)}"
+        )
+        # Keep trying later payloads — some models emit an example block
+        # before the real pipeline.
 
-    print(
-        "Warning: Found JSON block(s) in pipeline section but none parsed successfully."
-    )
-    return None
+    # If nothing validated but at least one payload parsed, return the first
+    # so callers can decide (cmd_generate re-validates and fails fast).
+    return payloads[0]
 
 
 def build_feature_prompt(
@@ -376,6 +383,18 @@ def cmd_generate(args: argparse.Namespace) -> None:
     pipeline = extract_pipeline_json(raw_output)
     if pipeline is None:
         print("Could not extract a valid pipeline from the LLM response.")
+        print("The raw response has been saved for review.")
+        fallback_path = report_path.replace(".md", "_raw.md")
+        save_report(raw_output, fallback_path)
+        sys.exit(1)
+
+    # Fail fast on a malformed pipeline rather than saving a corrupt .json
+    # artifact that new_feature_harness.py would choke on mid-execution.
+    schema_errors = validate_pipeline_schema(pipeline)
+    if schema_errors:
+        print("Pipeline JSON failed structural validation:")
+        for err in schema_errors:
+            print(f"  - {err}")
         print("The raw response has been saved for review.")
         fallback_path = report_path.replace(".md", "_raw.md")
         save_report(raw_output, fallback_path)

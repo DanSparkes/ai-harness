@@ -1,5 +1,5 @@
 {
-  "description": "MCP servers for Terragrunt/OpenTofu infrastructure-as-code projects (memores-infrastructure). Includes HCL validation, state inspection, AWS resource queries, and documentation indexing.",
+  "description": "MCP servers for Terragrunt/OpenTofu infrastructure-as-code projects (memores-infrastructure). Includes HCL validation, state inspection, AWS resource queries, documentation indexing, and graph-based code intelligence.",
   "mcp_servers": {
     "filesystem": {
       "type": "stdio",
@@ -76,12 +76,12 @@
       "enabled": true,
       "description": "Real-time Terragrunt document context provider and repository issue tracker via Deno."
     },
-    "codebase-memory": {
+    "gortex": {
       "type": "stdio",
-      "command": "codebase-memory-mcp",
-      "args": [],
+      "command": "gortex",
+      "args": ["mcp", "serve"],
       "enabled": true,
-      "description": "Persistent local code knowledge graph via Tree-Sitter AST parsing. Run the official curl-to-bash installation script before enabling."
+      "description": "Code intelligence engine. Graph-based lookups, blast radius, clone detection, semantic search, cross-repo contracts. 257 languages. Replaces codebase-memory. Install: curl -fsSL https://get.gortex.dev | sh"
     }
   }
 }

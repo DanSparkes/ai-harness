@@ -101,7 +101,12 @@ def main():
 
     with harness.mcp_context(mcp_config_path, target_repo) as orch:
         mcp_block = (
-            orch.build_mcp_context_block(tags=["architectural_rule"]) if orch else ""
+            orch.build_mcp_context_block(
+                tags=["architectural_rule"],
+                exclude_tools_from=["gortex"],
+            )
+            if orch
+            else ""
         )
         if orch:
             print("   [Done] MCP workbench active (tools + git + memory)\n")
@@ -310,7 +315,7 @@ Report:
             "Adversary",
             system_prompt="",
             model_override=cfg.heavy_reviewer,
-            num_ctx=32768,
+            num_ctx=65536,
         )
         try:
             critique = adversary.execute(adversarial_prompt)

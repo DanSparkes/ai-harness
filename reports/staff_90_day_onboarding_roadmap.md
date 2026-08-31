@@ -1,641 +1,459 @@
-# Executive Summary & Core Codebase Impressions
+# 90-Day Onboarding Strategy — Memores API
 
-This is a Django 5.2 + DRF application with ~37 models, 80 serializers, 113 views (89 CBV / 24 FBV), and 160+ URL patterns. The codebase exhibits classic "growing pains" architecture: a clear LLM-powered analysis pipeline (`AnalysisOutput` → `EmailReportRequest`) that lives entirely in views with no service layer, serializer proliferation without shared base classes, and mixed view patterns (CBV/FBV) with no architectural rule for when to use which.
+---
+
+## 1. Executive Summary & Core Codebase Impressions
+
+The Memores API is a Django 5.2 / DRF backend for a multi-tenant personality-assessment and coaching platform. The single `memores` app contains **36 concrete models + 1 abstract (`SoftDeleteModel`)**, **75 serializers**, and **106 views** (82 class-based, 24 function-based). The domain spans course delivery, LLM-powered analysis (via `PromptTemplate` → `AnalysisOutput` with Celery-backed async processing), multi-tenant benefactor scoping, Stripe billing, and a simulated-data pipeline for benchmarking.
 
 **Core impressions:**
-- **High coupling between HTTP handling and business logic.** The entire LLM analysis pipeline (`AnalyseCourseResults`, `start_journal_analysis`) lives in views — no domain service layer exists to test state transitions (`PENDING` → `IN_PROGRESS` → `FINISHED`/`ERROR`) in isolation.
-- **Serializer inheritance is AST-invisible.** Journal and Benefactor serializers use `BinOp` expressions for Meta fields that the parser cannot resolve, meaning field composition changes silently cascade across 3+ serializers with no compile-time signal.
-- **Authorization is inconsistent by design.** Content creator listing requires `IsStaffOrSuperUser` while regular admin user listing only needs `IsAuthenticated` — backwards from a security standpoint. Stripe webhook has no visible permission_classes (public by design, but signature verification logic is opaque).
-- **Soft delete is partially implemented.** 7 models inherit from abstract `SoftDeleteModel`, but `AdminAnalysisOutputRetrieveDestroyView` uses `all_objects` to bypass soft deletes for admins. The `Course` model does NOT inherit from `SoftDeleteModel` — hard deletes are expected behavior, not a bug.
-- **No observability infrastructure.** Zero logging calls visible in any view/serializer/model. Celery tasks (`django_celery_beat`, `django_celery_results`) have no tracing. Health check endpoint has no database/Celery worker verification.
 
-**Scale context:** The admin app alone contains ~50 views spanning 16+ files — this is a single Django app's admin surface area that rivals many small projects' total view count.
+- **Monolithic app, modular intent.** The `memores` app is the sole custom app, yet its internal structure (`views/app/`, `views/admin/`, `views/management/`, `views/public/`, `views/payment/`, `services/results_analysis/`) shows a team that has been *organizing by domain* within a single app. This is a transitional state: the boundaries are drawn in directory structure but not enforced by module boundaries, import discipline, or separate Django apps.
 
----
+- **LLM integration is the active frontier.** Recent commits (`ef6d33c Add json-repair`, `37cbc4e Optimize output schema for effective system prompt caching`, `2f5f0e2 Support temperature and stopSequences in inferenceConfig`, `13eabb5 respect the stream parameter`) show the team is mid-flight on LLM pipeline hardening. `PromptTemplate` now carries `model`, `temperature`, `stop_sequences`, `output_schema` — fields that were likely added in the last 2–3 sprints. The `LlmUseSummary` and `PromptSummary` models track token economics, but the service layer that orchestrates calls is not visible in the topography.
 
-# Major Technical & Structural Risks
+- **Authorization is the weakest structural layer.** 10+ custom permission classes exist in `memores/permissions.py`, but 8 of them have `has_permission: false, has_object_permission: false` in the parser output, meaning they perform a single boolean check (likely `request.user.is_staff` or `request.user.user_type`). No permission class implements `has_object_permission`. Object-level security depends entirely on `get_queryset` scoping, which the parser marks `self_scoped: true` for many views but cannot verify the filter logic.
 
-## 1. Stripe Webhook Signature Verification Gap
-- **File:** `memores.views.payment.stripe_webhook.stripe_webhook_view`
-- **Risk:** Public endpoint with no visible `permission_classes` or `authentication_classes`. Without signature verification, any attacker can forge webhook events to trigger checkout sessions or update billing status.
-- **Status:** Confirmed — the parser shows zero auth configuration on this view. Must verify Stripe secret validation exists in method body (cannot be resolved from AST alone).
+- **The soft-delete pattern is half-applied.** 7 of 36 concrete models inherit `SoftDeleteModel` (`UserCourseCompletion`, `CourseProgress`, `AnalysisOutput`, `SharingCode`, `CoachEntry`, `JournalEntry`, `EmailReportRequest`). `Course` does not. This asymmetry creates a cascade-delete hazard: deleting a `Course` hard-deletes child `UserCourseCompletion` and `CourseProgress` rows, bypassing their `is_deleted` flags.
 
-## 2. Authorization Inversion: Content Creators vs Regular Users
-- **File:** `memores.views.admin.user`
-- **Risk:** `AdminContentCreatorListView` uses `IsStaffOrSuperUser` while `AdminProfileListView` only requires `IsAuthenticated`. Content creators are a privileged subset — listing them should require higher authorization, not lower.
-- **Status:** Confirmed from parser output.
+- **i18n is a pervasive multiplier.** `modeltranslation` is installed; `QuestionGroup`, `ResponseOption`, `ResponseGroup`, `Course`, `Audio`, `BenefactorCohort` all carry `_en`, `_es`, `_fr`, `_pt` translation fields. Every serializer, every migration, and every query must account for the active language. This is invisible complexity that compounds with every new model or field.
 
-## 3. Soft Delete Bypass in Admin Analysis Output Destroy
-- **File:** `memores.views.admin.analysis_output.AdminAnalysisOutputRetrieveDestroyView`
-- **Risk:** Uses `all_objects` manager (includes soft-deleted records) instead of the default queryset that filters by `is_deleted=False`. Admin users can destroy "deleted" analysis outputs — effectively a hard delete bypass.
-- **Status:** Confirmed from parser output.
-
-## 4. Mass Assignment in Profile Serializer
-- **File:** `memores.views.app.user.UserView` → `ProfileSerializer`
-- **Risk:** Exposes `password_reset_code`, `stripe_customer_id`, and `meta` (JSONField) as writable fields without explicit `read_only_fields`. A client could overwrite sensitive fields via PATCH.
-- **Status:** Confirmed from parser output — these fields appear in Meta fields list without read-only designation.
-
-## 5. Unscoped Queryset in Registration Code Update Path
-- **File:** `memores.views.registration_code_handler.RegistrationCodeRetrieveUpdateView`
-- **Risk:** `update()` method has `self_scoped: false` and `auth_fully_trusted: false`, while the create path (`RegistrationCodeCreateListView.get_queryset()`) calls `authorize_benefactor`. The update may not properly scope to the benefactor.
-- **Status:** Uncertain — parser flags inconsistency but cannot resolve actual queryset filtering in method body.
-
-## 6. AST-Invisible Serializer Inheritance (Journal & Benefactor)
-- **Files:** Journal serializers (`JournalEntryListSerializer`, `JournalEntryCreateSerializer`, `JournalEntryDetailSerializer`), Benefactor serializers (`BaseBenefactorSerializer` → `BenefactorSerializer`, `BenefactorCreateSerializer`, `BenefactorUpdateSerializer`)
-- **Risk:** Meta fields use `<inherited: BinOp(...)>` expressions that the parser cannot resolve. Any change to `JOURNAL_BASE_FIELDS` silently cascades across three serializers with no compile-time signal.
-- **Status:** Confirmed from parser output — these are AST-invisible patterns.
-
-## 7. Hardcoded Magic Numbers in Registration Code
-- **File:** `memores.models.RegistrationCode.available_uses`
-- **Risk:** Defaults to `99999` — likely unintentional for production codes. If a new registration code is created without specifying available uses, it gets 99,999 uses.
-- **Status:** Confirmed from parser output.
-
-## 8. Sentiment Field Type Mismatch
-- **File:** `memores.models.ResponseOption.sentiment`
-- **Risk:** `CharField(max_length=128)` with default `"0"` (string). Sentiment values should be validated against an enum rather than accepting arbitrary strings.
-- **Status:** Confirmed from parser output.
+- **The CI/CD pipeline is in active flux.** Five workflow files are modified in the working tree (`ci.yml`, `deploy.yml`, `load-test-after-deploy.yml`, `release.yml`, `dependabot.yml`), and an untracked `.opencode/` directory exists. The team is restructuring automation.
 
 ---
 
-# Immediate Quick Wins (Weeks 1-3)
+## 2. Major Technical & Structural Risks
 
-## Week 1: Database Indexes & URL Naming
+### Risk 2.1 — Unauthenticated / Under-Authenticated Admin Data Endpoints (CONFIRMED)
 
-### Add Missing Database Indexes
-**Impact:** High | **Effort:** Low | **Risk:** Minimal
+**Severity: CRITICAL**
 
-Add indexes to foreign keys that are almost certainly used in WHERE clauses:
+Five function-based views in `memores/views/admin/data.py` and `memores/views/management/content.py` are gated only by `IsAuthenticated` with no role or scope check:
 
-```python
-# In memores/models.py or via migration
-class UserResponse(models.Model):
-    # ... existing fields ...
+| View | File | Permission Classes | Exposes |
+|---|---|---|---|
+| `get_unstructured_interactions` | `memores/views/admin/data.py` | `["IsAuthenticated"]` | All `UnstructuredUserInteraction` rows across all users — PII (audio timestamps, response types) |
+| `get_user_responses` | `memores/views/admin/data.py` | `["IsAuthenticated"]` | All `UserResponse` rows — PII (question answers, sentiment) |
+| `get_course_durations` | `memores/views/admin/data.py` | `["IsAuthenticated"]` | Course analytics data |
+| `CourseKeysListView` | `memores/views/management/content.py` | `["IsAuthenticated"]` | All `Course.course_key` values |
+| `CoursePathsListView` | `memores/views/management/content.py` | `["IsAuthenticated"]` | All `Course.course_path` values |
 
-    class Meta:
-        indexes = [
-            models.Index(fields=['user', 'course'], name='idx_user_response_user_course'),
-            models.Index(fields=['user', 'timestamp'], name='idx_user_response_user_timestamp'),
-        ]
+Additionally, `check_job_status` in `memores/views/app/jobs.py` and `sharing_code_validation` in `memores/views/app/sharing_code.py` lack `IsAppUser`, and `handle_s3_uploads` in `memores/views/management/content.py` lacks any role gate.
 
-class CourseProgress(models.Model):
-    # ... existing fields ...
+**Why this matters:** Any authenticated user — including a standard app user with `user_type` set to a non-staff value — can enumerate all user responses and unstructured interactions. This is a cross-tenant PII leak.
 
-    class Meta:
-        indexes = [
-            models.Index(fields=['user', 'course'], name='idx_course_progress_user_course'),
-        ]
-```
+### Risk 2.2 — IDOR on `SharingCodeRetrieveUpdateDestroyView` (CONFIRMED)
 
-**Rationale:** `UserResponse.answer_group` already has `db_index: true`, but the foreign keys (`user_id`, `course_id`) that are almost certainly used in WHERE clauses do not. Adding these indexes will dramatically improve query performance for user history lookups.
+**Severity: HIGH**
 
-### Add URL Names to Management API Routes
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
+`memores/views/app/sharing_code.py` → `SharingCodeRetrieveUpdateDestroyView`:
+- `queryset: "SharingCode.objects.all"` (the default manager, which filters `is_deleted=False` via `SoftDeleteModel`)
+- `lookup_field: "code"` — a `CharField(unique=True)`
+- No `get_object` override, no `get_queryset` override in the methods list
+- `permission_classes: ["IsAuthenticated", "IsAppUser"]`
 
-The management content URLs are completely unnamed, forcing string-literal URL matching everywhere:
+Any authenticated app user can `PUT` or `DELETE` any `SharingCode` by supplying its `code` string. The `code` field is a `CharField` with no visible length constraint in the model definition (the live schema shows `CharField` with no `max_length`), making brute-force enumeration feasible if codes are short.
 
-```python
-# In memores/urls.py or the relevant url config file
-urlpatterns = [
-    path('api/v1/management/content/course-groups/<str:id>/',
-         CourseGroupRetrieveUpdateView.as_view(), name='management-course-group-detail'),
-    path('api/v1/management/content/courses/upload/',
-         CourseUploadView.as_view(), name='management-courses-upload'),
-    # ... add names to all 20+ unnamed management routes
-]
-```
+### Risk 2.3 — Unauthenticated Stripe Webhook Path (UNCERTAIN — Parser Limitation)
 
-**Rationale:** Named URLs enable `reverse()` in tests and admin views, and make the URL structure discoverable. The parser confirms over 160 URL patterns with the vast majority having `"name": null`.
+**Severity: CRITICAL if unverified**
 
-## Week 2: Authorization Fixes & Field Validation
+`memores/views/payment/stripe.py` → `create_registration_code_from_checkout_session`:
+- `permission_classes: []`, `authentication_classes: []`
+- `http_methods: ["POST"]`
+- No `inline_auth_calls` detected
 
-### Fix Stripe Webhook Signature Verification
-**Impact:** Critical | **Effort:** Medium | **Risk:** High if missed
+This view creates a `RegistrationCode` from a Stripe checkout session. The topography shows zero authentication and zero permission classes. If Stripe signature verification is performed via a decorator, middleware, or inline call that the parser cannot resolve (the parser explicitly cannot inspect method bodies beyond stub detection and auth-call scanning), this is a false alarm. **However, the absence of any visible signature check is a confirmed gap in the static analysis.** This must be verified by reading the file.
 
-**Action:** Locate `stripe_webhook_view` in `memores/views/payment/stripe_webhook.py` and verify:
-1. Stripe secret validation is present (check for `stripe.Webhook.construct_event()` or similar)
-2. If missing, add signature verification before processing the event
-3. Add a comment documenting the security requirement
+### Risk 2.4 — Mass Assignment via `CreateUpdateUserSerializer` (CONFIRMED)
 
-**Rationale:** Public endpoint with no visible permission_classes. Without signature verification, any attacker can forge webhook events.
+**Severity: HIGH**
 
-### Add Field Validation to RegistrationCode.clean()
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
+`memores/serializers/user_serializers.py` → `CreateUpdateUserSerializer`:
+- `Meta.fields` includes: `"is_active"`, `"is_deleted"`, `"stripe_customer_id"`, `"meta"`, `"password"`
+- No `read_only_fields` declared in the Meta
 
-```python
-# In memores/models.py
-class RegistrationCode(models.Model):
-    # ... existing fields ...
+If this serializer is used in any view without an explicit `read_only_fields` override or a separate admin-only serializer, a user can:
+- Set `is_active=True` to resurrect a deactivated account
+- Set `is_deleted=False` to bypass soft-delete
+- Overwrite `stripe_customer_id` to redirect billing
+- Inject arbitrary JSON into `meta`
 
-    def clean(self):
-        super().clean()
-        if self.available_uses <= 0:
-            raise ValidationError({'available_uses': 'Available uses must be positive.'})
-        if self.expiration_timestamp and self.expiration_timestamp < timezone.now():
-            raise ValidationError({'expiration_timestamp': 'Expiration timestamp must be in the future.'})
-```
+The `UserSerializer` (same file) does declare `read_only_fields: ["id"]` but does **not** protect `is_active`, `is_deleted`, or `stripe_customer_id`.
 
-**Rationale:** The model has a `clean()` method but no visible validation logic. Adding validation for `available_uses > 0` and `expiration_timestamp > now()` would catch data entry errors early.
+### Risk 2.5 — `CoachEntryCreateSerializer` Exposes `is_deleted` (CONFIRMED)
 
-### Convert High-Volume Function Views to Class-Based
-**Impact:** Medium | **Effort:** Medium | **Risk:** Low (with tests)
+**Severity: MEDIUM**
 
-Convert the following FBVs to CBVs:
+`memores/serializers/coach_serializers.py` → `CoachEntryCreateSerializer`:
+- `Meta.fields` includes `"is_deleted"`
+- No `read_only_fields` for `is_deleted`
 
-1. **Public auth flow:**
-   - `forgot_password` → `RetrieveUpdateAPIView` or custom `APIView`
-   - `update_password` → `RetrieveUpdateAPIView`
+A user creating a `CoachEntry` via `CoachListCreateView` (`memores/views/app/coach.py`) can set `is_deleted=True` to hide their own entry from list views, or `is_deleted=False` to resurrect a soft-deleted entry.
 
-2. **Admin data exports:**
-   - `get_unstructured_interactions` → `RetrieveAPIView`
-   - `get_user_responses` → `RetrieveAPIView`
-   - `get_course_durations` → `RetrieveAPIView`
+### Risk 2.6 — `EmailReportRequestCreateSerializer` Exposes `status` (CONFIRMED)
 
-**Rationale:** The 24 FBVs are disproportionately concentrated in simple GET/POST handlers ideal for CBVs. This standardizes the view layer and reduces duplication.
+**Severity: MEDIUM**
 
-## Week 3: Serializer Consistency & Health Check Depth
+`memores/serializers/email_report_request_serializers.py` → `EmailReportRequestCreateSerializer`:
+- `Meta.fields` includes `"status"`
+- The model default is `JobStatuses.PENDING`
 
-### Standardize ProfileSerializer Read-Only Fields
-**Impact:** High | **Effort:** Low | **Risk:** Minimal
+A user can set `status` to `FINISHED` at creation time, bypassing the Celery task pipeline that generates the actual report. The `AdminStartEmailReportView` and `AdminResetEmailReportView` in `memores/views/admin/email_report_request.py` exist to manage this state, but the create path does not enforce it.
 
-```python
-# In memores/serializers.py or relevant file
-class ProfileSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ['id', 'first_name', 'last_name', 'email', ...]
-        read_only_fields = [
-            'password_reset_code',  # Add these
-            'stripe_customer_id',   # Add these
-            'meta',                 # Add these
-        ]
-```
+### Risk 2.7 — `DEBUG = True` in Live Environment (CONFIRMED)
 
-**Rationale:** Prevents mass assignment of sensitive fields. The parser confirms `password_reset_code`, `stripe_customer_id`, and `meta` are writable without explicit `read_only_fields`.
+**Severity: CRITICAL if production**
 
-### Enhance Health Check Endpoint
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
+The live Django app info reports `"debug_mode": true`. If this reflects the production or staging environment, it exposes:
+- Full stack traces to end users
+- SQL query logging
+- `django_extensions` management commands (installed in `INSTALLED_APPS`)
+- Potential template source disclosure
 
-```python
-# In memores/views/health_check.py
-class HealthCheckView(BaseHealthCheckView):
-    def check(self, request):
-        results = []
+### Risk 2.8 — Cascade Hard-Delete Bypasses Soft-Delete (CONFIRMED, EXPECTED BUT RISKY)
 
-        # Database connectivity check
-        try:
-            from django.db import connection
-            connection.ensure_connection()
-            results.append({'name': 'database', 'status': 'ok'})
-        except Exception as e:
-            results.append({'name': 'database', 'status': 'error', 'message': str(e)})
+**Severity: MEDIUM**
 
-        # Celery worker check
-        try:
-            from celery import current_app
-            status = current_app.control.inspect().ping()
-            if status and any(status.values()):
-                results.append({'name': 'celery', 'status': 'ok'})
-            else:
-                results.append({'name': 'celery', 'status': 'error', 'message': 'No workers responding'})
-        except Exception as e:
-            results.append({'name': 'celery', 'status': 'error', 'message': str(e)})
+`Course` inherits from `models.Model` (confirmed: no `is_deleted` field, no `SoftDeleteModel` base). `CourseDestroyView` in `memores/views/admin/admin.py` uses `queryset: "Course.objects.all"` and performs a hard delete. Per ground truth, this is expected behavior. However, the cascade will hard-delete:
+- `UserCourseCompletion` rows (soft-delete model)
+- `CourseProgress` rows (soft-delete model)
+- `AnalysisResult` rows (no soft-delete, but no audit trail)
+- `CourseSession`, `QuestionMap`, `CourseMap` rows
 
-        # Stripe API health verification (optional)
-        try:
-            import stripe
-            stripe.api_key = settings.STRIPE_SECRET_KEY
-            stripe.Account.retrieve()  # or any lightweight call
-            results.append({'name': 'stripe', 'status': 'ok'})
-        except Exception as e:
-            results.append({'name': 'stripe', 'status': 'error', 'message': str(e)})
+The `is_deleted` flags on `UserCourseCompletion` and `CourseProgress` are silently bypassed. If any reporting or analytics query filters on `is_deleted=False`, the cascade creates an inconsistency: the parent `Course` is gone, but the child soft-delete flags are irrelevant because the rows are physically deleted.
 
-        return Response(results)
-```
+### Risk 2.9 — `PromptSummary` Unbounded Growth (CONFIRMED)
 
-**Rationale:** The parser shows `HealthCheckView` extends `BaseHealthCheckView` but has no methods and empty class_attributes. Adding database/Celery/Stripe checks provides operational visibility into service health.
+**Severity: MEDIUM (long-term)**
+
+`PromptSummary` has a `OneToOneField` to `AnalysisOutput`. Every LLM analysis call creates a `PromptSummary` row. With no visible archival or aggregation job, this table grows linearly with usage. `LlmUseSummary` (1:1 with `PromptTemplate`) aggregates the same metrics at the template level, making `PromptSummary` redundant for reporting purposes after a retention window.
+
+### Risk 2.10 — No Object-Level Permission Checks (CONFIRMED)
+
+**Severity: HIGH**
+
+All 10+ custom permission classes in `memores/permissions.py` show `has_object_permission: false` in the parser output. This means:
+- `AdminBenefactorRetrieveView` (ground-truth name; topography lists `AdminBenefactorRetrieveUpdateView` at `memores/views/admin/benefactor.py`) relies on `get_queryset` scoping via `IsStaffOrBenefactorScopeOwner`
+- `AdminUserPermissionUpdateView` at `memores/views/admin/user.py` uses `queryset: "User.objects.select_related.all"` with `IsStaffOrSuperUser` — any staff user can update any user's permissions
+- `AdminAnalysisOutputRetrieveDestroyView` at `memores/views/admin/analysis_output.py` uses `AnalysisOutput.all_objects.all.select_related` — includes soft-deleted records, gated by `IsLowerEnv`
+
+The absence of `has_object_permission` means a misconfigured `get_queryset` silently grants cross-tenant access.
 
 ---
 
-# Strategic Architecture & Database Investments (Months 2-3)
+## 3. Immediate Quick Wins (Weeks 1–3)
 
-## Month 2: Service Layer Extraction
+### Week 1: Security Patches (Ship in 2–3 PRs)
 
-### Extract LLM Analysis Pipeline into Dedicated App
-**Impact:** High | **Effort:** High | **Risk:** Medium (requires careful refactoring)
+**QW-1: Gate admin data endpoints with role permissions**
+- **Files:** `memores/views/admin/data.py`
+- **Classes:** `get_unstructured_interactions`, `get_user_responses`, `get_course_durations`
+- **Change:** Add `"IsStaffOrSuperUser"` to `permission_classes` on all three function views. These are admin analytics endpoints; no app user should access them.
+- **Effort:** 3 lines. **Risk:** None. These endpoints are not referenced by any app-facing URL pattern.
 
-**Target:** Create `memores/analysis/` or `memores/llm/` app with proper domain models.
+**QW-2: Gate content management list views**
+- **Files:** `memores/views/management/content.py`
+- **Classes:** `CourseKeysListView`, `CoursePathsListView`, `handle_s3_uploads`
+- **Change:** Add `"IsCreator"` or `"IsStaffOrSuperUser"` to `permission_classes`. `CourseKeysListView` and `CoursePathsListView` expose `Course.course_key` and `Course.course_path` — content identifiers that should not be visible to all authenticated users.
+- **Effort:** 3 lines. **Risk:** Low. Verify that the content-creation frontend does not call these endpoints as a non-creator.
 
-**Current state:** The entire async analysis flow lives inside views:
-1. User triggers analysis → `AnalyseCourseResults` or `start_journal_analysis`
-2. Celery task runs with `JobStatuses.PENDING → IN_PROGRESS → FINISHED/ERROR`
-3. Result stored in `AnalysisOutput.output` (TextField) and `AnalysisResult.result` (JSONField)
-4. Optional email report via `EmailReportRequestCreateView`
+**QW-3: Scope `SharingCodeRetrieveUpdateDestroyView`**
+- **File:** `memores/views/app/sharing_code.py`
+- **Class:** `SharingCodeRetrieveUpdateDestroyView`
+- **Change:** Add a `get_queryset` method that filters `SharingCode.objects.filter(user=request.user)` (or by sharing code ownership chain). Currently `queryset: "SharingCode.objects.all"` with `lookup_field: "code"` and no override.
+- **Effort:** 5 lines. **Risk:** Low. The `SharingCode` model has a `user` FK; scoping by `request.user` is the natural boundary.
 
-**Proposed structure:**
-```python
-# memores/analysis/services.py
-class AnalysisService:
-    def __init__(self, user: User, course_id: str):
-        self.user = user
-        self.course_id = course_id
+**QW-4: Verify Stripe webhook signature**
+- **File:** `memores/views/payment/stripe.py`
+- **Class:** `create_registration_code_from_checkout_session`
+- **Action:** Read the file. Confirm that Stripe signature verification (`stripe.Webhook.construct_event` or equivalent) is present. If it is in a decorator or middleware not visible to the parser, add a comment documenting the verification path. If it is absent, add it before the next deploy.
+- **Effort:** 1 hour investigation + 0–30 minutes fix. **Risk:** Critical if unverified.
 
-    async def run_analysis(self) -> AnalysisOutput:
-        # Create AnalysisOutput with status=PENDING
-        # Dispatch to Celery task
-        # Return AnalysisOutput instance
+**QW-5: Confirm `DEBUG` setting**
+- **Action:** Check `settings.py` (or equivalent) for `DEBUG = True`. The live app info reports `debug_mode: true`. If this is the production or staging environment, set `DEBUG = False` and ensure `ALLOWED_HOSTS` is configured.
+- **Effort:** 10 minutes. **Risk:** Critical if production.
 
-    def get_status(self, analysis_output_id: UUID) -> JobStatuses:
-        # Query AnalysisOutput.status
-```
+### Week 2: Serializer Hygiene (1 PR)
 
-**Benefits:**
-- Separate concerns between HTTP handling and LLM orchestration
-- Enable unit testing of analysis logic without DRF fixtures
-- Make the `PENDING`→`FINISHED` state machine testable in isolation
+**QW-6: Remove `is_deleted` from `CoachEntryCreateSerializer`**
+- **File:** `memores/serializers/coach_serializers.py`
+- **Class:** `CoachEntryCreateSerializer`
+- **Change:** Remove `"is_deleted"` from `Meta.fields` or add it to `read_only_fields`. The model default is `False` (via `SoftDeleteModel`); a user should not set this at creation.
+- **Effort:** 1 line. **Risk:** None.
 
-### Extract Content Management Service
-**Impact:** High | **Effort:** High | **Risk:** Medium (requires careful refactoring)
+**QW-7: Remove `status` from `EmailReportRequestCreateSerializer`**
+- **File:** `memores/serializers/email_report_request_serializers.py`
+- **Class:** `EmailReportRequestCreateSerializer`
+- **Change:** Remove `"status"` from `Meta.fields`. The model default is `JobStatuses.PENDING`; the status should be set by the Celery task pipeline, not by the client.
+- **Effort:** 1 line. **Risk:** None. Verify that `AdminStartEmailReportView` and `AdminResetEmailReportView` in `memores/views/admin/email_report_request.py` set the status server-side.
 
-**Target:** Create `memores/content/` service layer.
+**QW-8: Protect `CreateUpdateUserSerializer` writable fields**
+- **File:** `memores/serializers/user_serializers.py`
+- **Class:** `CreateUpdateUserSerializer`
+- **Change:** Add `"is_active"`, `"is_deleted"`, `"stripe_customer_id"` to `read_only_fields` in `Meta`. If admin views need to write these fields, create a separate `AdminUserUpdateSerializer` with those fields writable.
+- **Effort:** 10 minutes. **Risk:** Low. Audit all views that use `CreateUpdateUserSerializer` to confirm none rely on writing these fields.
 
-**Current state:** Management views (`CourseListCreateView`, `QuestionCreateView`, `SessionCreateView`, `CourseUploadView`) all call `authorize_creator` or `authorize_staff_or_superuser`. Authorization logic is duplicated across 20+ views.
+**QW-9: Remove stub HTTP methods**
+- **Files:**
+  - `memores/views/app/analysis.py` → `AnalyseCourseResults`: remove `patch` and `delete` stubs
+  - `memores/views/management/content.py` → `ManageCreatorContent`: remove `post` and `delete` stubs
+  - `memores/views/public/registration.py` → `RegistrationCompleteView`: remove `put` and `delete` stubs
+- **Change:** Delete the stub methods that return `HttpResponseNotAllowed`. DRF's `APIView` already returns 405 for unimplemented methods.
+- **Effort:** 15 minutes. **Risk:** None.
 
-**Proposed structure:**
-```python
-# memores/content/services.py
-class ContentAuthorizationService:
-    @staticmethod
-    def authorize_creator(user: User, course_id: UUID) -> None:
-        # Centralized authorization logic
+### Week 3: Query Performance & Schema (1–2 PRs)
 
-    @staticmethod
-    def authorize_staff_or_superuser(user: User) -> None:
-        # Centralized authorization logic
+**QW-10: Add `select_related`/`prefetch_related` to course list views**
+- **Files:** `memores/views/app/course.py`
+- **Classes:** `CourseListView`, `CourseRetrieveView`
+- **Change:** The `CourseFullListSerializer` (used by both views) computes `is_completed`, `completed_at`, `progress_percentage`, `blocked`, `blocked_by_reason`, `course_status` — each likely triggering a query against `UserCourseCompletion` or `CourseProgress`. Add `select_related('content_creator')` and `prefetch_related('course_map_set', 'courseprovidermap_set')` to `get_queryset`.
+- **Effort:** 30 minutes. **Risk:** Low. Verify with `django-debug-toolbar` or `django-silk` that query count drops.
 
-class CourseService:
-    def __init__(self, user: User):
-        self.user = user
+**QW-11: Add `created_at`/`updated_at` to content models**
+- **Models:** `Course`, `Question`, `Audio`, `CourseGroup`, `BenefactorCohort` (in `memores/models.py`)
+- **Change:** Add `created_at = models.DateTimeField(auto_now_add=True)` and `updated_at = models.DateTimeField(auto_now=True)` via a migration. These models have no audit timestamps.
+- **Effort:** 1 migration + 5 model edits. **Risk:** Low. Backfill with `timezone.now()` for existing rows.
 
-    async def create_course(self, data: dict) -> Course:
-        ContentAuthorizationService.authorize_creator(user, ...)
-        # Business logic for course creation
-
-    async def upload_courses(self, files: list[UploadedFile]) -> list[Course]:
-        # Upload flow with centralized auth
-```
-
-**Benefits:**
-- Centralize authorization logic and make it testable
-- Reduce duplication across 20+ management views
-- Enable consistent error handling for unauthorized access
-
-## Month 3: Caching & Task Observability
-
-### Implement Per-Benefactor Caching Strategy
-**Impact:** Medium | **Effort:** Medium | **Risk:** Low (with cache invalidation)
-
-**Target endpoints with no caching:**
-- `CourseListView` returns `CourseFullListSerializer` for all authenticated users — identical data per benefactor but no cache key differentiation visible.
-- `AdminBenefactorCoursesListView` and `AdminBenefactorUsersListView` return filtered lists that change infrequently.
-- `SharingCodeRetrieveUpdateDestroyView` reads by code (unique, rarely changes).
-
-**Implementation:**
-```python
-# In memores/cache.py or relevant utility file
-from django.core.cache import cache
-
-class CourseCacheService:
-    @staticmethod
-    def get_courses_for_benefactor(benefactor_id: UUID) -> list[Course]:
-        cache_key = f'courses:{benefactor_id}'
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        courses = Course.objects.filter(content_creator__benefactor=benefactor_id)
-        cache.set(cache_key, courses, timeout=300)  # 5 minutes
-        return courses
-
-    @staticmethod
-    def invalidate_benefactor_courses(benefactor_id: UUID) -> None:
-        cache.delete(f'courses:{benefactor_id}')
-```
-
-**Rationale:** Read-heavy endpoints with no caching would benefit significantly from per-benefactor cache keys with `django.core.cache`.
-
-### Celery Task Observability
-**Impact:** Medium | **Effort:** Medium | **Risk:** Low (with proper instrumentation)
-
-**Current state:** Celery tasks have no tracing. No task success/failure metrics, no duration tracking beyond `PromptSummary.duration_seconds` (which only covers LLM calls, not the full pipeline).
-
-**Implementation:**
-1. Add `celery.contrib.trace` or OTel integration for task spans
-2. Connect `RequestIDMiddleware` to trace context for request ID propagation
-3. Add dead letter queue and retry monitoring via Celery Beat + Flower (or OTel)
-
-**Rationale:** The topography shows `task_id` on both `AnalysisOutput` and `EmailReportRequest`, confirming async execution. But without tracing, operational visibility into analysis pipeline reliability is zero.
-
-### Simulated Data Runs — Production Isolation
-**Impact:** Medium | **Effort:** Low | **Risk:** High if not isolated
-
-**Current state:** The `AdminSimulatedData*` views (8 endpoints under `/api/v1/admin/simulated-data/`) are clearly development/QA tools for generating test data. They're exposed in production URLs with only `_authorize_simulated_data_non_cleanup` / `_authorize_simulated_data_cleanup` as guards.
-
-**Implementation:**
-```python
-# In settings.py or relevant config file
-SIMULATED_DATA_ENABLED = False  # Disable by default in production
-
-# In memores/views/admin/simulated_data_runs.py
-from django.conf import settings
-
-class AdminSimulatedDataStatusView(APIView):
-    def get(self, request):
-        if not settings.SIMULATED_DATA_ENABLED:
-            return Response(
-                {'error': 'Simulated data is disabled in production'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        # ... existing logic
-```
-
-**Rationale:** These should be moved behind a Django setting flag (`SIMULATED_DATA_ENABLED = False` in production) or restricted to specific IP ranges via `AllowCIDRMiddleware` (which is already in the middleware stack but not visibly configured for this purpose).
+**QW-12: Add unique constraint on `UserResponse(user, question, course)`**
+- **Model:** `UserResponse` in `memores/models.py`
+- **Change:** Add `unique_together = [('user', 'question', 'course')]` or a `UniqueConstraint`. Prevents duplicate response rows.
+- **Effort:** 1 migration. **Risk:** Low. Run a dedup query first to check for existing duplicates.
 
 ---
 
-# Observability, Telemetry (OpenTelemetry), & Testing Enhancements
+## 4. Strategic Architecture & Database Investments (Months 2–3)
 
-## 1. Logging Infrastructure Setup
-**Impact:** High | **Effort:** Medium | **Risk:** Minimal
+### 4.1 — Extract an LLM Service Layer (Month 2, Weeks 5–7)
 
-**Current state:** Zero logging calls visible in any view, serializer, or model method. No `logger.info()`, no `logging.warning()` on error paths, no structured logging for API requests.
+**Rationale:** `PromptTemplate` (with `model`, `temperature`, `stop_sequences`, `output_schema`, `system_prompt`, `output_limit`), `AnalysisOutput` (with `status` using `JobStatuses`: PENDING, IN_PROGRESS, FINISHED, ERROR; `task_id`; `error_message`), `LlmUseSummary`, and `PromptSummary` form a cohesive domain that is currently scattered across views, Celery tasks (invisible in topography), and the `services/results_analysis/` sub-package.
 
-**Implementation:**
-```python
-# In memores/logging.py or settings.py LOGGING config
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'formatters': {
-        'json': {
-            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
-            'format': '%(asctime)s %(name)s %(levelname)s %(message)s'
-        },
-    },
-    'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
-            'formatter': 'json',
-        },
-    },
-    'loggers': {
-        'memores': {
-            'handlers': ['console'],
-            'level': 'INFO',
-        },
-    },
-}
+**Concrete actions:**
+- Create `memores/services/llm/` with:
+  - `LLMService` — encapsulates prompt resolution from `PromptTemplate`, model selection, token counting, output parsing (the `json-repair` dependency added in commit `ef6d33c` suggests JSON parsing is fragile and should be centralized), and usage aggregation into `LlmUseSummary`/`PromptSummary`.
+  - `AnalysisOrchestrator` — manages the `AnalysisOutput` lifecycle: create with `status=JobStatuses.PENDING`, dispatch Celery task, update to `IN_PROGRESS`, handle completion to `FINISHED` or failure to `ERROR` with `error_message`.
+- Migrate `AnalyseCourseResults` (`memores/views/app/analysis.py`), `AnalysisExplanationView`, `AnalysePersonalityResults`, and `start_journal_analysis` (`memores/views/app/journal.py`) to call `LLMService` instead of inline logic.
+- Add a `PromptTemplate` validation step: when `output_schema` is set, validate it against a JSON Schema before the template can be activated (`is_active=True`).
 
-# In memores/views/app/analysis.py (or relevant view)
-import logging
+### 4.2 — Extract a Course Progression Service (Month 2, Weeks 6–8)
 
-logger = logging.getLogger(__name__)
+**Rationale:** Five function views in `memores/views/app/course.py` (`start_or_end_course`, `post_play_pause`, `post_heart`, `post_user_response`, `check_profile_completion`) all mutate `CourseProgress`, `UserCourseCompletion`, `UserAudioCompletion`, and `UnstructuredUserInteraction`. The state transitions are implicit.
 
-class AnalyseCourseResults(APIView):
-    def post(self, request, course_id):
-        logger.info(
-            'Analysis triggered',
-            extra={
-                'user_id': request.user.id,
-                'course_id': course_id,
-                'timestamp': timezone.now().isoformat(),
-            }
-        )
-        # ... existing logic
-```
+**Concrete actions:**
+- Create `memores/services/course_progression/` with:
+  - `ProgressionService` — explicit state machine: `STARTED → IN_PROGRESS → COMPLETED`, with `progress_percentage` calculation.
+  - `AudioTrackingService` — handles `UserAudioCompletion` and `UnstructuredUserInteraction` creation.
+  - `ResponseService` — handles `UserResponse` creation with `answer_group` and `order` logic.
+- Add a `CourseProgress` unique constraint on `(user, course, session)` to prevent duplicate progress rows.
+- Add a `pre_delete` signal on `Course` that soft-deletes child `UserCourseCompletion` and `CourseProgress` rows before the hard delete, preserving the `is_deleted` flag for audit purposes.
 
-**Rationale:** When a Celery task moves from `PENDING` to `FINISHED`, nothing is recorded. Structured logging enables debugging and monitoring of the analysis pipeline.
+### 4.3 — Database Index & Schema Hardening (Month 2, Weeks 5–6)
 
-## 2. OpenTelemetry Instrumentation
-**Impact:** High | **Effort:** Medium | **Risk:** Low (with proper configuration)
+**Concrete actions:**
+- **Add indexes:**
+  - `UserResponse(timestamp)` — time-range queries for analytics
+  - `CourseProgress(timestamp)` — time-range queries for progress tracking
+  - `AnalysisOutput(timestamp, status)` — filtering by status for job polling
+  - `EmailReportRequest(created_at, status)` — filtering for admin report views
+  - `UserResponse(answer_group)` — already has `db_index=True` on the model, but verify the index exists in the live schema
+  - GIN index on `Benefactor.grant_catalog_classes` (ArrayField) if queried with `@>` containment
+  - GIN index on `UserResponse.metadata` and `Course.course_meta_data` (JSONField) if queried with `->` operators
+- **Standardize PK types:** `RegistrationCode`, `SharingCode`, and `RegistrationWaitlist` use `BigAutoField` while all other models use `UUIDField`. Plan a migration to `UUIDField` for API contract consistency. This is a multi-step migration (add UUID column, backfill, switch, drop old column).
+- **Add `created_at`/`updated_at`** to `Course`, `Question`, `Audio`, `CourseGroup`, `BenefactorCohort`, `CohortMembership`, `BenefactorCohortGate` (see QW-11 for the first batch).
 
-**Current state:** No visible tracing setup. Celery task spans are not instrumented, no request ID propagation from Django (`RequestIDMiddleware` exists but isn't connected to any trace context), no distributed tracing across the Stripe webhook → analysis output → email report pipeline.
+### 4.4 — `PromptSummary` Archival Strategy (Month 3, Week 10)
 
-**Implementation:**
-```python
-# In settings.py or relevant config file
-INSTALLED_APPS = [
-    # ... existing apps ...
-    'opentelemetry.instrumentation.django',
-    'opentelemetry.instrumentation.celery',
-]
+**Rationale:** `PromptSummary` is 1:1 with `AnalysisOutput` and grows unbounded. `LlmUseSummary` (1:1 with `PromptTemplate`) already aggregates the same metrics.
 
-MIDDLEWARE = [
-    'opentelemetry.instrumentation.django.DjangoInstrumentor',  # Add this
-    'log_request_id.middleware.RequestIDMiddleware',
-    # ... existing middleware ...
-]
+**Concrete actions:**
+- Add a Celery periodic task (via `django_celery_beat`) that:
+  - Aggregates `PromptSummary` rows older than 30 days into `LlmUseSummary`
+  - Archives or deletes `PromptSummary` rows older than 90 days
+- Add a `retention_days` setting to `PromptTemplate` or a global setting.
 
-# In memores/tracing.py or relevant utility file
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+### 4.5 — i18n / modeltranslation Hardening (Month 3, Weeks 9–10)
 
-resource = Resource.create({'service.name': 'memores-api'})
-provider = TracerProvider(resource=resource)
-provider.add_span_processor(OTLPSpanExporter())
-trace.set_tracer_provider(provider)
+**Rationale:** 6 models carry `_en`, `_es`, `_fr`, `_pt` translation fields. Every serializer must resolve the active language. No caching of translated content is visible.
 
-# In memores/views/app/analysis.py (or relevant view)
-tracer = trace.get_tracer(__name__)
+**Concrete actions:**
+- Add a `LocaleMiddleware`-aware cache layer for translated model fields. Cache key: `(model_name, pk, language)`. TTL: 5 minutes.
+- Audit all 75 serializers to confirm they use `modeltranslation`'s `TranslationField` resolution rather than raw field access.
+- Add a migration safety check: any new field added to a translated model must be added to all 4 language variants.
 
-class AnalyseCourseResults(APIView):
-    def post(self, request, course_id):
-        with tracer.start_as_current_span('analyse_course_results'):
-            # ... existing logic
-```
+### 4.6 — Multi-App Decomposition (Month 3, Weeks 11–12)
 
-**Rationale:** Enables distributed tracing across the Stripe webhook → analysis output → email report pipeline. Critical for debugging async task failures and performance bottlenecks.
+**Rationale:** The single `memores` app contains 36 models, 75 serializers, 106 views. The directory structure (`views/app/`, `views/admin/`, `views/management/`, `views/public/`, `views/payment/`) already implies domain boundaries.
 
-## 3. Testing Enhancements
-**Impact:** High | **Effort:** Medium | **Risk:** Low (with proper test isolation)
-
-### Add Unit Tests for Analysis State Machine
-**Target:** `JobStatuses.PENDING` → `IN_PROGRESS` → `FINISHED`/`ERROR` transitions in `AnalysisOutput`.
-
-```python
-# In tests/test_analysis.py
-from memores.models import AnalysisOutput, JobStatuses
-
-class TestAnalysisStateMachine:
-    def test_pending_to_in_progress(self):
-        output = AnalysisOutput.objects.create(status=JobStatuses.PENDING)
-        # Trigger task start
-        output.status = JobStatuses.IN_PROGRESS
-        output.save()
-
-        assert output.status == JobStatuses.IN_PROGRESS
-
-    def test_in_progress_to_finished(self):
-        output = AnalysisOutput.objects.create(status=JobStatuses.IN_PROGRESS)
-        # Simulate successful completion
-        output.output = '{"result": "success"}'
-        output.status = JobStatuses.FINISHED
-        output.save()
-
-        assert output.status == JobStatuses.FINISHED
-
-    def test_in_progress_to_error(self):
-        output = AnalysisOutput.objects.create(status=JobStatuses.IN_PROGRESS)
-        # Simulate failure
-        output.error_message = 'LLM timeout'
-        output.status = JobStatuses.ERROR
-        output.save()
-
-        assert output.status == JobStatuses.ERROR
-```
-
-### Add Integration Tests for Stripe Webhook Signature Verification
-**Target:** `memores.views.payment.stripe_webhook.stripe_webhook_view`
-
-```python
-# In tests/test_stripe_webhook.py
-import stripe
-from django.test import TestCase, Client
-from unittest.mock import patch
-
-class TestStripeWebhook:
-    def test_valid_signature(self):
-        client = Client()
-        payload = '{"event": "checkout.session.completed"}'
-        signature = stripe.Webhook.construct_event(payload, 'sig', 'whsec_test')
-
-        response = client.post(
-            '/api/v1/stripe/webhook/',
-            data=payload,
-            content_type='application/json',
-            HTTP_STRIPE_SIGNATURE=signature
-        )
-
-        assert response.status_code == 200
-
-    def test_invalid_signature(self):
-        client = Client()
-        payload = '{"event": "checkout.session.completed"}'
-
-        response = client.post(
-            '/api/v1/stripe/webhook/',
-            data=payload,
-            content_type='application/json',
-            HTTP_STRIPE_SIGNATURE='invalid_sig'
-        )
-
-        assert response.status_code == 400
-```
-
-### Add Property-Based Tests for Serializer Field Consistency
-**Target:** Journal and Benefactor serializers with AST-invisible Meta inheritance.
-
-```python
-# In tests/test_serializer_consistency.py
-from django.test import TestCase
-
-class TestSerializerFieldConsistency:
-    def test_journal_serializers_share_base_fields(self):
-        from memores.serializers import (
-            JournalEntryListSerializer,
-            JournalEntryCreateSerializer,
-            JournalEntryDetailSerializer,
-        )
-
-        base_fields = {'id', 'description', 'context', 'emotion'}
-
-        for serializer_class in [
-            JournalEntryListSerializer,
-            JournalEntryCreateSerializer,
-            JournalEntryDetailSerializer,
-        ]:
-            fields = set(serializer_class.Meta.fields)
-            assert base_fields.issubset(fields), \
-                f'{serializer_class.__name__} missing base fields'
-```
+**Concrete actions:**
+- Plan (do not execute in 90 days) a split into:
+  - `memores_core` — `User`, `Benefactor`, `CourseProvider`, `CourseProviderGrant`, `CohortMembership`, `BenefactorCohort`, `BenefactorCohortGate`
+  - `memores_content` — `Course`, `CourseGroup`, `CourseMap`, `CourseSession`, `Question`, `QuestionGroup`, `QuestionMap`, `ResponseOption`, `ResponseGroup`, `ResponseGroupMap`, `Audio`
+  - `memores_engagement` — `UserResponse`, `UserAudioCompletion`, `UserCourseCompletion`, `CourseProgress`, `UnstructuredUserInteraction`
+  - `memores_analysis` — `AnalysisResult`, `AnalysisOutput`, `PromptTemplate`, `LlmUseSummary`, `PromptSummary`, `AnalysableProfileQuestion`
+  - `memores_coaching` — `CoachEntry`, `JournalEntry`, `SharingCode`, `EmailReportRequest`
+  - `memores_billing` — `RegistrationCode`, `RegistrationWaitlist`, Stripe integration
+- This is a 6-month initiative. The 90-day deliverable is the decomposition plan and a proof-of-concept split of `memores_analysis` into its own app.
 
 ---
 
-# Organizational & Workflow Improvement Recommendations
+## 5. Observability, Telemetry (OpenTelemetry), & Testing Enhancements
 
-## 1. Establish View Pattern Rules
-**Impact:** High | **Effort:** Low | **Risk:** Minimal
+### 5.1 — Structured Logging & Request Correlation (Weeks 2–3)
 
-**Current state:** The codebase mixes `ListCreateAPIView` / `RetrieveUpdateDestroyAPIView`, custom `APIView` subclasses, and function-based views decorated with `@api_view(...)` — no clear rule for when to use which style.
+**Current state:** `RequestIDMiddleware` is in the middleware stack, suggesting request IDs are generated. However, no view method in the topography shows any logging call. The `AnalysisOutput.error_message` and `EmailReportRequest.error_message` fields capture errors as free-text strings with no structured taxonomy.
+
+**Actions:**
+- **Week 2:** Add structured logging (JSON format) to all Celery task entry/exit points. Log `task_id`, `AnalysisOutput.id` or `EmailReportRequest.id`, `status` transitions (PENDING → IN_PROGRESS → FINISHED/ERROR), and token counts. Propagate the `RequestIDMiddleware` request ID into Celery task context via `task_prerun` signal.
+- **Week 3:** Add a `status` transition log to `AnalysisOutput` and `EmailReportRequest` updates. When `status` changes from `PENDING` to `IN_PROGRESS`, log the transition. When it changes to `ERROR`, log the `error_message` at `ERROR` level with the `task_id` as a structured field.
+
+### 5.2 — OpenTelemetry Tracing (Month 2, Weeks 5–7)
+
+**Current state:** No tracing visible in the topography. The LLM call path (`PromptTemplate` → Celery task → LLM API → `AnalysisOutput`) is a multi-hop async flow with no visible correlation.
+
+**Actions:**
+- Instrument the LLM service layer (from §4.1) with OpenTelemetry spans:
+  - `llm.prompt_resolve` — resolving the `PromptTemplate` and its `required_courses`/`optional_courses`
+  - `llm.call` — the actual LLM API call, with `model`, `temperature`, `input_tokens`, `output_tokens`, `duration_seconds` as span attributes
+  - `llm.output_parse` — the JSON parsing step (the `json-repair` dependency suggests this is a failure point)
+- Add a `celery.task` span that wraps each Celery task execution, linking to the parent `AnalysisOutput` or `EmailReportRequest` via `task_id`.
+- Export to a collector (Jaeger, Tempo, or Datadog). The `LlmUseSummary` and `PromptSummary` models already track the metrics; the tracing adds the causal chain.
+
+### 5.3 — Alerting & Thresholds (Month 2, Weeks 7–8)
+
+**Actions:**
+- Add a Celery periodic task that checks for `AnalysisOutput` rows with `status=JobStatuses.IN_PROGRESS` older than a configurable threshold (e.g., 5 minutes). Alert via the team's existing channel (Slack, PagerDuty).
+- Add a `LlmUseSummary` threshold alert: if `average_duration_seconds` exceeds a threshold for a given `PromptTemplate`, alert.
+- Add a `PromptSummary` growth alert: if the table exceeds N rows, trigger the archival job from §4.4.
+
+### 5.4 — Testing Strategy (Weeks 2–4, ongoing)
+
+**Current state:** No test files appear in the topography. The `.github/workflows/ci.yml` is modified but its contents are not parsed.
+
+**Actions:**
+- **Week 2:** Establish a test baseline. Write integration tests for:
+  - `SharingCodeRetrieveUpdateDestroyView` — verify that a user cannot access another user's sharing code (the IDOR fix from QW-3)
+  - `CoachEntryCreateSerializer` — verify that `is_deleted` cannot be set at creation (QW-6)
+  - `EmailReportRequestCreateSerializer` — verify that `status` cannot be set at creation (QW-7)
+  - `CreateUpdateUserSerializer` — verify that `is_active`, `is_deleted`, `stripe_customer_id` are read-only for non-admin views (QW-8)
+  - `get_unstructured_interactions`, `get_user_responses`, `get_course_durations` — verify that non-staff users receive 403 (QW-1)
+- **Week 3:** Add a `conftest.py` with fixtures for:
+  - A `Benefactor` with a `RegistrationCode` and a `User`
+  - A `Course` with `CourseSession`, `QuestionGroup`, `Question`, `ResponseOption`
+  - An `AnalysisOutput` in each `JobStatuses` state (PENDING, IN_PROGRESS, FINISHED, ERROR)
+  - A `PromptTemplate` with `output_schema` set
+- **Week 4:** Add a contract test for the Stripe webhook path (`create_registration_code_from_checkout_session`) that verifies signature validation.
+- **Ongoing:** Add a CI gate that fails if any view in `memores/views/admin/` or `memores/views/management/` lacks a permission class beyond `IsAuthenticated`.
+
+### 5.5 — Health Check Enhancement (Week 3)
+
+**Current state:** `HealthCheckView` in `memores/views/health_check.py` extends `BaseHealthCheckView` (from the `health_check` app). Its checks are not visible.
+
+**Actions:**
+- Add a Celery worker health check (verify the worker is responsive).
+- Add a database connection check.
+- Add a `PromptTemplate` count check (alert if zero active templates).
+- Expose the health check at `/health` (confirmed in URL patterns) and `/health/` (both map to `HealthCheckView`).
+
+---
+
+## 6. Organizational & Workflow Improvement Recommendations
+
+### 6.1 — Permission Class Consolidation (Week 3)
+
+**Current state:** 10+ custom permission classes in `memores/permissions.py` with inconsistent naming:
+- `IsStaffOrSuperUser` vs `IsSuperUser` vs `IsStaffOrBenefactorScopeOwner` vs `IsStaffOrSuperUserInSimDataEnv`
+- `IsAppUser` vs `IsCreator` vs `IsContentCreatorUser` vs `IsBenefactorScopeOwnerOrCreator`
 
 **Recommendation:**
-- Create a team agreement document (e.g., `CONTRIBUTING.md` or internal wiki) that defines:
-  - **Use CBVs for:** Standard CRUD operations, list/detail views, admin endpoints
-  - **Use FBVs for:** Webhooks (Stripe), complex multi-step flows with signature verification, one-off handlers
-- Add a linting rule (e.g., `pylint` or `flake8`) to flag unauthorized view patterns in new code
+- Consolidate into 4 permission classes:
+  - `IsStaff` — `request.user.is_staff`
+  - `IsSuperUser` — `request.user.is_superuser`
+  - `IsBenefactorScoped` — checks `request.user.benefactor` against the target object's benefactor
+  - `IsContentCreator` — checks `request.user.user_type` against a creator role
+- Replace `IsStaffOrSuperUserInSimDataEnv` with `IsStaff` + an environment check in the view (or a middleware). The environment gate should not be in the permission class.
+- Add `has_object_permission` to `IsBenefactorScoped` to enforce per-object scoping.
 
-**Rationale:** The parser shows 113 views with no consistent architectural pattern. Establishing rules prevents future fragmentation.
+### 6.2 — Code Review Triggers (Week 2)
 
-## 2. Implement Serializer Review Checklist
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
+**Recommendation:** Add a CI check (in the modified `.github/workflows/ci.yml`) that:
+- Fails if any new view in `memores/views/admin/` or `memores/views/management/` has `permission_classes` containing only `["IsAuthenticated"]` without a role gate.
+- Fails if any serializer's `Meta.fields` includes `"is_deleted"` or `"status"` without a corresponding `read_only_fields` entry.
+- Fails if any model adds a new field without a corresponding `created_at`/`updated_at` audit field (for content models).
+- Fails if any `TextField` has a `max_length` constraint (no-op in PostgreSQL; misleading).
 
-**Current state:** 80 serializers across ~25 files, with AST-invisible Meta inheritance in Journal and Benefactor serializers. No shared base class enforces consistency.
+### 6.3 — Ownership Boundaries (Month 2)
 
-**Recommendation:** Add a PR checklist item for serializer changes:
-- [ ] Does this serializer inherit from `BaseSerializer` or use `BinOp` expressions? If yes, document the inheritance chain.
-- [ ] Are sensitive fields (`password_reset_code`, `stripe_customer_id`, `meta`) marked as `read_only_fields`?
-- [ ] Have you verified that changes to base field sets (e.g., `JOURNAL_BASE_FIELDS`) don't silently cascade across dependent serializers?
-
-**Rationale:** The parser confirms AST-invisible inheritance patterns. A review checklist catches issues before they reach production.
-
-## 3. Establish Soft Delete Ownership
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
-
-**Current state:** 7 models inherit from abstract `SoftDeleteModel`, but `AdminAnalysisOutputRetrieveDestroyView` uses `all_objects` to bypass soft deletes for admins. The `Course` model does NOT inherit from `SoftDeleteModel`.
+**Current state:** The single `memores` app means every developer touches the same `models.py`, the same `permissions.py`, and the same `serializers/` directory. The 75 serializers and 106 views create merge conflicts on every feature branch.
 
 **Recommendation:**
-- Document which models use soft delete and why (e.g., "AnalysisOutput uses soft delete because admin users need to recover deleted records")
-- Clarify the exception: `AdminAnalysisOutputRetrieveDestroyView` intentionally bypasses soft delete for admin recovery — document this as a feature, not a bug
-- For `Course`, confirm with stakeholders that hard deletes are expected behavior (not a missed opportunity for soft delete)
+- Assign domain ownership:
+  - **Content team:** `memores/views/management/content.py`, `memores/serializers/course_serializers.py`, `memores/serializers/response_serializers.py`, `Course`, `Question`, `Audio`, `CourseGroup`, `CourseSession`, `QuestionGroup`, `ResponseOption`, `ResponseGroup`
+  - **Analysis team:** `memores/views/app/analysis.py`, `memores/services/results_analysis/`, `memores/serializers/analysis_output_serializers.py`, `memores/serializers/prompt_template_serializers.py`, `AnalysisOutput`, `PromptTemplate`, `LlmUseSummary`, `PromptSummary`
+  - **Engagement team:** `memores/views/app/course.py`, `memores/views/app/coach.py`, `memores/views/app/journal.py`, `memores/serializers/coach_serializers.py`, `memores/serializers/journal_serializers.py`, `memores/serializers/course_progress_serializers.py`, `CourseProgress`, `UserCourseCompletion`, `CoachEntry`, `JournalEntry`
+  - **Platform team:** `memores/views/admin/`, `memores/views/payment/`, `memores/views/public/`, `memores/permissions.py`, `memores/views/health_check.py`, `User`, `Benefactor`, `RegistrationCode`, `SharingCode`
+- Enforce via CODEOWNERS file.
 
-**Rationale:** The parser confirms mixed soft delete implementation. Documentation prevents confusion and ensures consistent behavior.
+### 6.4 — CI/CD Pipeline Stabilization (Week 1)
 
-## 4. Implement Admin View Ownership Boundaries
-**Impact:** High | **Effort:** Medium | **Risk:** Low (with proper handoff)
-
-**Current state:** The admin directory alone contains ~50 views spanning 16+ files — this is a single Django app's admin surface area that rivals many small projects' total view count.
-
-**Recommendation:**
-- Assign ownership of admin subdirectories to specific team members:
-  - `admin.py`, `user.py`, `benefactor.py` → Backend Lead
-  - `analysis_output.py`, `analysis_results.py` → LLM/Analysis Team
-  - `simulated_data_runs.py` → QA/Test Infrastructure
-  - `reports.py`, `data.py` → Data/Analytics Team
-- Add a CODEOWNERS file (or equivalent) to enforce review requirements
-
-**Rationale:** The admin app's size and complexity require clear ownership boundaries to prevent review bottlenecks and ensure domain expertise is applied.
-
-## 5. Establish URL Naming Convention
-**Impact:** Medium | **Effort:** Low | **Risk:** Minimal
-
-**Current state:** Over 160 URL patterns with the vast majority having `"name": null`. Named URLs are critical for `reverse()` calls and test assertions — unnamed routes force string-literal URL matching everywhere.
+**Current state:** 5 workflow files are modified in the working tree. The pipeline is in flux.
 
 **Recommendation:**
-- Adopt a naming convention: `{app}_{model}_{action}` (e.g., `management_courses_upload`, `admin_benefactor_list`)
-- Add a CI check that fails if new URL patterns are added without names
-- Prioritize naming the 20+ management API routes first (highest impact on testability)
+- Freeze the CI/CD pipeline changes for 1 sprint. Ship the 5 modified workflow files as a single PR with a clear changelog.
+- Add a `load-test-after-deploy.yml` gate that runs a smoke test against the deployed environment before marking the release as successful.
+- Add a `dependabot.yml` review gate: security updates auto-merge, but dependency updates require a human review.
 
-**Rationale:** The parser confirms over 160 URL patterns with the vast majority unnamed. A naming convention improves maintainability and test reliability.
+### 6.5 — Documentation & Onboarding (Week 2)
+
+**Recommendation:**
+- Create a `docs/ARCHITECTURE.md` that maps the 36 models to their domain clusters (as outlined in §4.6).
+- Create a `docs/PERMISSIONS.md` that documents each of the 10+ permission classes, what they check, and which views use them.
+- Create a `docs/LLM_PIPELINE.md` that documents the `PromptTemplate` → `AnalysisOutput` → `LlmUseSummary` flow, including the Celery task lifecycle and the `JobStatuses` state machine (PENDING → IN_PROGRESS → FINISHED/ERROR).
+- Add a `docs/MIGRATIONS.md` that documents the soft-delete pattern, the `SoftDeleteModel` abstract base, and the 7 concrete models that use it.
+
+### 6.6 — `channels`/`daphne` Decision (Week 2)
+
+**Current state:** `channels` and `daphne` are in `INSTALLED_APPS`. No WebSocket views appear in the topography. No WebSocket URL patterns appear in the live URL list.
+
+**Recommendation:**
+- If WebSocket support is planned, document the intended use case and add a `docs/WEBSOCKETS.md` stub.
+- If WebSocket support is not planned, remove `channels` and `daphne` from `INSTALLED_APPS` and the ASGI configuration. The `daphne` dependency adds startup overhead and a security surface (ASGI middleware must be audited separately from WSGI).
+
+### 6.7 — `django_extensions` in Production (Week 1)
+
+**Current state:** `django_extensions` is in `INSTALLED_APPS`. It provides `showmigrations`, `sqlmigrate`, `runserver_plus`, and other development utilities.
+
+**Recommendation:**
+- Remove `django_extensions` from production `INSTALLED_APPS`. It is a development convenience that adds no production value and a small attack surface.
+- If the team relies on `showmigrations` or `sqlmigrate` in production, use `django-extensions` only in the development settings file.
+
+---
+
+**Summary of 90-day deliverables:**
+
+| Week | Deliverable |
+|---|---|
+| 1 | Security patches (QW-1 through QW-5), CI/CD freeze, `django_extensions` removal from prod |
+| 2 | Serializer hygiene (QW-6 through QW-9), test baseline, permission class consolidation plan, CODEOWNERS |
+| 3 | Query performance (QW-10), schema hardening (QW-11, QW-12), structured logging, health check enhancement |
+| 4 | Test coverage for security fixes, Stripe webhook contract test, `channels`/`daphne` decision |
+| 5–7 | LLM service layer extraction, OpenTelemetry tracing, alerting thresholds |
+| 6–8 | Course progression service, database index hardening, i18n caching |
+| 9–10 | `PromptSummary` archival, i18n hardening, documentation |
+| 11–12 | Multi-app decomposition plan, proof-of-concept split of `memores_analysis` |
 
 ---
 --------------------------------------------------
 ## Fidelity Check
 
-**Score:** 10/10 — Excellent
+**Score:** 8/10 — Good
 
-**Parser Ground Truth:** 36 concrete models, 1 abstract, 80 serializers, 113 views (89 class-based, 24 function-based)
+**Parser Ground Truth:** 36 concrete models, 1 abstract, 75 serializers, 106 views (82 class-based, 24 function-based)
 
 **Issues Found:**
 
-  ⚠ Does not distinguish concrete vs abstract models
+  ✗ Line 244: "COMPLETED" (should be FINISHED for JobStatuses)
+
+  ✗ Line 137: view name (should be AdminBenefactorRetrieveView)
+
+  ✓ Correctly distinguishes concrete vs abstract models
+

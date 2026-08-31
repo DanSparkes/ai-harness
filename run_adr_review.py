@@ -160,7 +160,10 @@ def build_mcp_context_block() -> str:
     orch = _mcp_orch
     if not orch:
         return ""
-    return orch.build_mcp_context_block(tags=["architectural_rule"])
+    return orch.build_mcp_context_block(
+        tags=["architectural_rule"],
+        exclude_tools_from=["gortex"],
+    )
 
 
 # ── Core Functions ────────────────────────────────────────────────────────────

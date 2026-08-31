@@ -26,3 +26,10 @@ reports/__pycache__/
 evals/__pycache__/
 scorecards/__pycache__/
 rubrics/__pycache__/
+
+# Quality-gate generated outputs (a3 SARIF dumps, etc.)
+results/
+
+# pytest cache (created by quality_gate's test gate; prevents pre-commit
+# from reporting "files were modified by this hook")
+.pytest_cache/

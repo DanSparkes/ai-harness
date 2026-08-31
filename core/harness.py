@@ -246,6 +246,13 @@ def grade_and_archive(
 
     Returns the scores dict.
     """
+    if not output or not output.strip():
+        # Never grade or archive an empty output — that means the run failed
+        # (connection drop / exhausted retries), and persisting it would
+        # write a corrupt report file and a blank warehouse row.
+        print("   ⚠️  Output is empty (run failed?); skipping grading/archive.")
+        return {"_error": "empty output"}
+
     cfg = config or get_config()
     judge_model = _resolve_judge_for(model_used, cfg, judge_override)
     evaluator = AutomatedEvaluator(
@@ -254,7 +261,12 @@ def grade_and_archive(
         use_openai_format=cfg.use_openai_format,
     )
     try:
-        scores = evaluator.grade_run(output, rubric_path, context=judge_context)
+        # The judge talks to cfg.base_url, which points at the Forge proxy when
+        # forge is enabled — but run_multipass tears its own proxy down after
+        # the analysis pass. Keep a proxy alive for the judge call too
+        # (ForgeProxy is reentrant, so this is a no-op if one is already up).
+        with ForgeProxy(cfg):
+            scores = evaluator.grade_run(output, rubric_path, context=judge_context)
     except Exception as e:
         print(f"   ⚠️  Judge failed ({type(e).__name__}: {e}); continuing.")
         scores = {"_judge_error": str(e)[:200]}
