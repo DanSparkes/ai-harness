@@ -1,5 +1,7 @@
 import re
 import time
+import os
+from dataclasses import dataclass, field
 
 import requests
 
@@ -9,6 +11,124 @@ from core.local_payload import (
     strip_think,
     with_think_disabled,
 )
+
+
+@dataclass
+class _CallStats:
+    """Accumulated inference diagnostics for one execute_sequence call.
+
+    All durations are in seconds; token counts are raw Ollama integers.
+    Populated from the ``eval_count`` / ``*_duration`` fields Ollama returns
+    in every non-streaming response body — these are thrown away by default
+    but are the only reliable way to distinguish prompt-eval time from
+    generation time from model-load time.
+    """
+
+    llm_calls: int = 0          # total HTTP calls that reached the model
+    retries: int = 0            # calls that were retried (timeout / 5xx / 429)
+    prompt_tokens: int = 0      # tokens evaluated from the prompt
+    generated_tokens: int = 0   # tokens the model generated (eval_count)
+    load_ms: float = 0.0        # model load time in ms  (load_duration / 1e6)
+    prompt_eval_ms: float = 0.0 # prompt eval time in ms (prompt_eval_duration / 1e6)
+    generation_ms: float = 0.0  # generation time in ms  (eval_duration / 1e6)
+    # Per-pass snapshots so callers can print pass-level lines.
+    # Each entry mirrors the fields above but scoped to one pass.
+    passes: list[dict] = field(default_factory=list)
+
+    def add_pass(
+        self,
+        *,
+        calls: int,
+        retries: int,
+        prompt_tokens: int,
+        generated_tokens: int,
+        load_ms: float,
+        prompt_eval_ms: float,
+        generation_ms: float,
+    ) -> None:
+        self.llm_calls += calls
+        self.retries += retries
+        self.prompt_tokens += prompt_tokens
+        self.generated_tokens += generated_tokens
+        self.load_ms += load_ms
+        self.prompt_eval_ms += prompt_eval_ms
+        self.generation_ms += generation_ms
+        self.passes.append(
+            {
+                "calls": calls,
+                "retries": retries,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": generated_tokens,
+                "load_ms": load_ms,
+                "prompt_eval_ms": prompt_eval_ms,
+                "generation_ms": generation_ms,
+            }
+        )
+
+    def pass_summary(self, idx: int) -> str:
+        """One-line summary for pass ``idx`` (0-based)."""
+        if idx >= len(self.passes):
+            return ""
+        p = self.passes[idx]
+        parts = [f"calls={p['calls']}"]
+        if p["retries"]:
+            parts.append(f"retries={p['retries']}")
+        if p["prompt_tokens"]:
+            parts.append(f"prompt_tok={p['prompt_tokens']:,}")
+        if p["generated_tokens"]:
+            parts.append(f"gen_tok={p['generated_tokens']:,}")
+        timings: list[str] = []
+        if p["load_ms"] > 0:
+            timings.append(f"load={p['load_ms']/1000:.1f}s")
+        if p["prompt_eval_ms"] > 0:
+            timings.append(f"prompt_eval={p['prompt_eval_ms']/1000:.1f}s")
+        if p["generation_ms"] > 0:
+            timings.append(f"generation={p['generation_ms']/1000:.1f}s")
+        if timings:
+            parts.append("  ".join(timings))
+        return "  ".join(parts)
+
+    def chunk_summary(self) -> str:
+        """Multi-line diagnostic block printed at the end of a chunk."""
+        lines = ["   [Inference stats]"]
+        lines.append(f"     LLM calls      : {self.llm_calls}")
+        if self.retries:
+            lines.append(f"     Retries        : {self.retries}")
+        if self.prompt_tokens:
+            lines.append(f"     Prompt tokens  : {self.prompt_tokens:,}")
+        if self.generated_tokens:
+            lines.append(f"     Gen tokens     : {self.generated_tokens:,}")
+        total_model_ms = self.load_ms + self.prompt_eval_ms + self.generation_ms
+        if total_model_ms > 0:
+            lines.append(
+                f"     Time breakdown : "
+                f"load={self.load_ms/1000:.1f}s  "
+                f"prompt_eval={self.prompt_eval_ms/1000:.1f}s  "
+                f"generation={self.generation_ms/1000:.1f}s"
+            )
+            if self.generated_tokens and self.generation_ms > 0:
+                tps = self.generated_tokens / (self.generation_ms / 1000)
+                lines.append(f"     Gen throughput : {tps:.1f} tok/s")
+        return "\n".join(lines)
+
+
+def _parse_ollama_stats(data: dict) -> dict:
+    """Extract timing/token fields from an Ollama /api/chat response body.
+
+    All ``*_duration`` fields are nanoseconds; we convert to milliseconds here
+    so the rest of the code works in a human-readable unit.  Missing fields
+    default to 0 so callers can always add without guarding.
+
+    Fields documented at https://github.com/ollama/ollama/blob/main/docs/api.md
+    """
+    ns_to_ms = 1e-6
+    return {
+        "prompt_tokens": int(data.get("prompt_eval_count") or 0),
+        "generated_tokens": int(data.get("eval_count") or 0),
+        "load_ms": float((data.get("load_duration") or 0) * ns_to_ms),
+        "prompt_eval_ms": float((data.get("prompt_eval_duration") or 0) * ns_to_ms),
+        "generation_ms": float((data.get("eval_duration") or 0) * ns_to_ms),
+    }
 
 # Matches <think>...</think> reasoning blocks emitted by thinking models
 # (e.g. Qwen3 ThinkingCap / DeepSeek-R1). Many GGUF builds return these
@@ -90,8 +210,23 @@ class StatefulHarnessRunner:
         pass
 
     def _local_options(self, temperature: float) -> dict:
-        """Build Ollama options for a local request, including seed if set."""
-        opts = {"num_ctx": self.num_ctx, "temperature": temperature, "top_p": 0.9}
+        """Build Ollama options for a local request, including seed if set.
+
+        ``num_predict`` caps per-call output length so a regeneration loop on
+        a local 27B model can't run for hours on a single chunk.  The ceiling
+        is intentionally generous (4096 tokens ≈ 16-20K chars) — enough for a
+        thorough per-chunk review — but tight enough to abort a runaway loop
+        within minutes rather than hours.  Override via the NUM_PREDICT env var
+        when reviewing very large files that legitimately need more output.
+        """
+
+        num_predict = int(os.environ.get("NUM_PREDICT", "4096"))
+        opts: dict = {
+            "num_ctx": self.num_ctx,
+            "temperature": temperature,
+            "top_p": 0.9,
+            "num_predict": num_predict,
+        }
         if self.seed is not None:
             opts["seed"] = self.seed
         return opts
@@ -105,12 +240,21 @@ class StatefulHarnessRunner:
         base_delay: float = 2.0,
         extra_retry_codes: set[int] | None = None,
         timeout: float | None = None,
-    ) -> requests.Response:
+    ) -> tuple[requests.Response, int]:
+        """POST to ``url`` with retry logic.
+
+        Returns ``(response, calls_made)`` where ``calls_made`` is the total
+        number of HTTP requests that actually reached the network (including
+        retried attempts).  Previously returned only the response; callers that
+        only unpack the first element are unaffected by the added second value.
+        """
         retry_codes = {429, 503} | (extra_retry_codes or set())
         request_timeout = timeout if timeout is not None else self.request_timeout
         response: requests.Response | None = None
+        calls_made = 0
         for attempt in range(max_retries + 1):
             try:
+                calls_made += 1
                 response = requests.post(
                     url, json=payload, headers=headers, timeout=request_timeout
                 )
@@ -135,7 +279,7 @@ class StatefulHarnessRunner:
             if response.status_code not in retry_codes:
                 if is_unsupported_think_error(response) and strip_think(payload):
                     continue
-                return response
+                return response, calls_made
             # On 500 errors, also try removing the think parameter (Forge proxy
             # may return 500 when it doesn't understand the think field)
             if response.status_code == 500 and "think" in payload:
@@ -147,7 +291,7 @@ class StatefulHarnessRunner:
                     delay = base_delay * (2**attempt)
                     time.sleep(delay)
                     continue
-                return response
+                return response, calls_made
             if attempt < max_retries:
                 delay = base_delay * (2**attempt)
                 code = response.status_code
@@ -155,13 +299,14 @@ class StatefulHarnessRunner:
                     f"   \u23f3 Cloud API {code}. Retrying in {delay}s ({attempt + 1}/{max_retries})..."
                 )
                 time.sleep(delay)
-        return response
+        return response, calls_made
 
     def execute_sequence(
         self, system_prompt: str, passes: list[str], fallback_prompt: str | None = None
     ) -> list[dict]:
         messages = [{"role": "system", "content": system_prompt}]
         execution_history: list[dict] = []
+        stats = _CallStats()
 
         for idx, pass_prompt in enumerate(passes):
             messages.append({"role": "user", "content": pass_prompt})
@@ -195,9 +340,9 @@ class StatefulHarnessRunner:
             pass_t0 = time.time()
 
             if self.use_openai_format:
-                response = self._call_with_retry(self.api_url, payload, headers)
+                response, calls_made = self._call_with_retry(self.api_url, payload, headers)
             else:
-                response = self._call_with_retry(
+                response, calls_made = self._call_with_retry(
                     self.api_url,
                     payload,
                     headers,
@@ -233,8 +378,10 @@ class StatefulHarnessRunner:
                 fb_headers = {"Content-Type": "application/json"}
 
                 assistant_response = ""
+                fb_ollama_stats: dict = {}
+                fb_calls = 0
                 try:
-                    fb_response = self._call_with_retry(
+                    fb_response, fb_calls = self._call_with_retry(
                         self.api_url,
                         fb_payload,
                         fb_headers,
@@ -244,6 +391,7 @@ class StatefulHarnessRunner:
                     )
                     fb_response.raise_for_status()
                     fb_data = fb_response.json()
+                    fb_ollama_stats = _parse_ollama_stats(fb_data)
                     assistant_response = fb_data.get("message", {}).get(
                         "content", ""
                     ) or fb_data.get("message", {}).get("thinking", "")
@@ -259,6 +407,24 @@ class StatefulHarnessRunner:
                         "Unable to generate review (cloud down and local fallback failed).\n"
                     )
 
+                stats.add_pass(
+                    calls=calls_made + fb_calls,
+                    retries=max(0, calls_made + fb_calls - 1),
+                    **fb_ollama_stats if fb_ollama_stats else {
+                        "prompt_tokens": 0,
+                        "generated_tokens": 0,
+                        "load_ms": 0.0,
+                        "prompt_eval_ms": 0.0,
+                        "generation_ms": 0.0,
+                    },
+                )
+                elapsed = time.time() - pass_t0
+                print(
+                    f"   [Done] Pass {idx + 1} in {elapsed:.1f}s  "
+                    f"({len(assistant_response)} chars)  "
+                    f"{stats.pass_summary(idx)}"
+                )
+
                 execution_history.append(
                     {
                         "pass_index": idx + 1,
@@ -273,7 +439,16 @@ class StatefulHarnessRunner:
 
             if self.use_openai_format:
                 assistant_response = response_data["choices"][0]["message"]["content"]
+                # OpenAI/Gemini format doesn't expose Ollama timing fields.
+                pass_ollama_stats: dict = {
+                    "prompt_tokens": 0,
+                    "generated_tokens": 0,
+                    "load_ms": 0.0,
+                    "prompt_eval_ms": 0.0,
+                    "generation_ms": 0.0,
+                }
             else:
+                pass_ollama_stats = _parse_ollama_stats(response_data)
                 assistant_response = response_data.get("message", {}).get("content", "")
                 thinking = response_data.get("message", {}).get("thinking", "")
                 if not assistant_response and thinking:
@@ -305,7 +480,7 @@ class StatefulHarnessRunner:
                             }
                         )
                         try:
-                            fb_response = self._call_with_retry(
+                            fb_response, fb_calls = self._call_with_retry(
                                 self.api_url,
                                 fb_payload,
                                 headers,
@@ -315,6 +490,13 @@ class StatefulHarnessRunner:
                             )
                             fb_response.raise_for_status()
                             fb_data = fb_response.json()
+                            # Merge fallback Ollama stats into this pass.
+                            fb_stats = _parse_ollama_stats(fb_data)
+                            for k, v in fb_stats.items():
+                                pass_ollama_stats[k] = (
+                                    pass_ollama_stats.get(k, 0) + v
+                                )
+                            calls_made += fb_calls
                             fallback_output = fb_data.get("message", {}).get(
                                 "content", ""
                             ) or fb_data.get("message", {}).get("thinking", "")
@@ -340,9 +522,18 @@ class StatefulHarnessRunner:
             # assistant turns — and (b) pollute the saved review report.
             assistant_response = _strip_think(assistant_response)
 
+            retries_this_pass = max(0, calls_made - 1)
+            stats.add_pass(
+                calls=calls_made,
+                retries=retries_this_pass,
+                **pass_ollama_stats,
+            )
+
             elapsed = time.time() - pass_t0
             print(
-                f"   [Done] Pass {idx + 1} in {elapsed:.1f}s  ({len(assistant_response)} chars)"
+                f"   [Done] Pass {idx + 1} in {elapsed:.1f}s  "
+                f"({len(assistant_response)} chars)  "
+                f"{stats.pass_summary(idx)}"
             )
 
             execution_history.append(
@@ -358,5 +549,8 @@ class StatefulHarnessRunner:
             # pass N's analysis and the "two-pass" design collapses into two
             # independent single-pass prompts.
             messages.append({"role": "assistant", "content": assistant_response})
+
+        if stats.llm_calls:
+            print(stats.chunk_summary())
 
         return execution_history

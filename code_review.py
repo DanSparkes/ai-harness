@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from core.agent import build_dependency_graph, skill_get_affected_files
@@ -345,18 +346,126 @@ def preprocess_diff(raw_diff: str) -> tuple[str, list[dict]]:
     return cleaned, noise
 
 
-# Per-chunk char budget for multi-chunk reviews. Default 12000 keeps each
-# review pass bounded at a few minutes on a 30B-class local model; the
-# previous 30000 default produced hour-long passes on the slowest chunks
-# (e.g. test files with massive fixtures). Override via env if your model is
-# faster/slower.
-CHUNK_TARGET_CHARS = int(os.environ.get("CODE_REVIEW_CHUNK_CHARS", "12000"))
+# Per-chunk char budget for multi-chunk reviews. Default 8000 keeps each
+# review pass small enough that the 27B-class local model doesn't get
+# stuck in regeneration loops on large files (observed: 4-hour chunks
+# on 12-20K-char inputs producing 5K-15K chars of output). Smaller chunks
+# also run faster, so the per-chunk timeout rarely fires. The previous
+# 20000 default split too few chunks (~9 per PR) and triggered long
+# runaway loops; the original 30000 default was even worse. Override via
+# env if your model handles larger inputs reliably.
+CHUNK_TARGET_CHARS = int(os.environ.get("CODE_REVIEW_CHUNK_CHARS", "8000"))
+
+
+# Minimum total cleaned-diff size before chunking kicks in. Below this
+# threshold we always run a single detailed pass, even if `group_diff_chunks`
+# would have split into multiple buckets. Rationale: chunking loses cross-
+# file context (each chunk sees files in isolation, can't spot patterns
+# that span files), pays per-chunk overhead (system prompt + project map +
+# key files + invariants are re-prepended to every chunk), and produces a
+# concatenated final report with no synthesis. A 30-50K-char diff fits in
+# a 65K-token context window with room for shared context; splitting into
+# 5-8 chunks of 5-8K chars each is strictly worse for review quality and
+# wall-clock.
+CHUNK_THRESHOLD_CHARS = int(
+    os.environ.get("CODE_REVIEW_CHUNK_THRESHOLD_CHARS", "80000")
+)
+
+
+def _resolve_chunk_timeout(
+    *,
+    request_timeout: float | None,
+    no_chunk_timeout: bool,
+    env_timeout_s: int,
+) -> float | None:
+    """Decide the per-chunk ``request_timeout`` value for multi-chunk runs.
+
+    Precedence (highest first):
+        1. ``--no-chunk-timeout`` / env ``CODE_REVIEW_CHUNK_TIMEOUT_S=0`` →
+           ``None`` (disabled — runner uses its own default, no chunk cap).
+        2. User ``--timeout`` (already applied at the runner level for every
+           non-chunk call; we reuse it here as a per-chunk ceiling).
+        3. Env default ``CODE_REVIEW_CHUNK_TIMEOUT_S`` (default 600s).
+
+    The disabled case (1) MUST win over the user ``--timeout`` because the
+    forge-backend path silently sets ``request_timeout`` to a 45-min ceiling
+    when Forge is enabled — that would override ``--no-chunk-timeout``
+    and re-enable a cap the user explicitly disabled.
+    """
+    if no_chunk_timeout or env_timeout_s <= 0:
+        return None
+    if request_timeout is not None:
+        return float(request_timeout)
+    return float(env_timeout_s)
+
+
+# Heartbeat interval for multi-chunk runs when --no-chunk-timeout is set.
+# Every HEARTBEAT_INTERVAL_S while a chunk is in flight we print a "still
+# alive" line so the user can confirm progress and Ctrl-C if clearly stuck.
+HEARTBEAT_INTERVAL_S = int(os.environ.get("CODE_REVIEW_HEARTBEAT_S", "1800"))
+
+
+def _run_with_heartbeat(
+    *,
+    label: str,
+    started_monotonic: float,
+    interval_s: int,
+    clock: Callable[[], float] | None = None,
+):
+    """Return a context manager that prints a heartbeat every ``interval_s``.
+
+    The heartbeat only fires AFTER the first interval has passed (so a chunk
+    that finishes in <30 min never triggers one). Daemon-threaded so it dies
+    cleanly with the parent process; ``Event``-driven so it shuts down
+    immediately when the ``with`` block exits — no trailing prints after
+    the chunk finishes.
+
+    ``clock`` is injectable for tests; defaults to ``time.monotonic``.
+    Yields nothing. The caller is responsible for actually doing the work
+    inside the ``with`` block.
+    """
+    import threading
+
+    stop = threading.Event()
+    clock = clock or time.monotonic
+
+    def _beat() -> None:
+        while not stop.wait(interval_s):
+            elapsed = clock() - started_monotonic
+            print(
+                f"\n   ⏳ {label} still running "
+                f"({elapsed/60:.1f}m elapsed, "
+                f"Ctrl-C to abort) ",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=_beat, daemon=True, name="chunk-heartbeat")
+    thread.start()
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            stop.set()
+            thread.join(timeout=2)
+            return False
+
+    return _Ctx()
 
 # Hard per-chunk wall-clock cap. Each chunk review is one execute_sequence
 # call; if it doesn't return inside this window we abort the whole run with
 # a clear message instead of burning hours on a single stuck pass.
+#
+# Default 1800s (30 min) is the longest we let a chunk run. With the
+# 8000-char default chunk size most chunks finish in 5-10 min on a 27B
+# model; the 30-min cap only fires on genuine outliers (regeneration
+# loops, very large test files). The outer wall-clock guard aborts at
+# 2x this (60 min) to preserve elapsed work. Set
+# CODE_REVIEW_CHUNK_TIMEOUT_S=0 to disable the cap entirely — useful
+# when you trust the model and need to wait through a slow chunk.
 CHUNK_PASS_TIMEOUT_S = int(
-    os.environ.get("CODE_REVIEW_CHUNK_TIMEOUT_S", "600")
+    os.environ.get("CODE_REVIEW_CHUNK_TIMEOUT_S", "1800")
 )
 
 
@@ -614,6 +723,19 @@ def parse_arguments():
             "for local models, 120s for cloud."
         ),
     )
+    parser.add_argument(
+        "--no-chunk-timeout",
+        action="store_true",
+        help=(
+            "Disable the per-chunk wall-clock cap for multi-chunk reviews. "
+            "WARNING: with --no-chunk-timeout a chunk that gets stuck in a "
+            "regeneration loop (observed: 4-hour chunks on 12-20K-char "
+            "inputs) will run until completion. The heartbeat prints every "
+            "30 min so you can Ctrl-C manually. Prefer the default 30-min "
+            "cap unless you have a specific reason to wait. Equivalent to "
+            "CODE_REVIEW_CHUNK_TIMEOUT_S=0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -691,6 +813,7 @@ def main() -> int:
             system_agent_prompt=system_agent_prompt,
             project_context_path=args.project_context,
             request_timeout=args.timeout,
+            no_chunk_timeout=args.no_chunk_timeout,
             start_time=start_time,
         )
     except KeyboardInterrupt:
@@ -721,6 +844,7 @@ def _run_review(
     system_agent_prompt: str,
     project_context_path: str | None,
     request_timeout: float | None,
+    no_chunk_timeout: bool = False,
     start_time: float,
 ) -> int:
     """Execute the review pipeline. Returns process exit code."""
@@ -750,22 +874,38 @@ def _run_review(
     # 4d. Preprocess the diff for large/branchy changes: summarize
     # auto-generated noise (migrations, lockfiles, minified bundles, fixtures)
     # down to a signature so they don't bloat every prompt, then group the
-    # remaining reviewable files into size-bounded chunks. A small diff stays a
-    # single chunk and follows the original two-pass path below; a large diff
-    # is split so no single model call overflows the context window.
+    # remaining reviewable files into size-bounded chunks. Below the
+    # CHUNK_THRESHOLD_CHARS threshold we always run a single detailed pass
+    # even if group_diff_chunks would have split; chunking loses cross-file
+    # context and pays per-chunk overhead, which hurts review quality for
+    # diffs that fit comfortably in the model's context window.
     cleaned_diff, _noise_records = preprocess_diff(raw_diff)
     review_chunks = group_diff_chunks(cleaned_diff)
-    multi_chunk = len(review_chunks) > 1
-    chunked_diff = (
-        "\n\n".join(c["body"] for c in review_chunks)
-        if multi_chunk
-        else review_chunks[0]["body"]
+    multi_chunk = (
+        len(review_chunks) > 1 and len(cleaned_diff) > CHUNK_THRESHOLD_CHARS
     )
+    if multi_chunk:
+        chunked_diff = "\n\n".join(c["body"] for c in review_chunks)
+    elif len(review_chunks) > 1:
+        # Single-pass mode (below threshold) but the chunker wanted to split
+        # — use the full cleaned diff so the model sees every file.
+        chunked_diff = cleaned_diff
+    else:
+        chunked_diff = review_chunks[0]["body"]
     if multi_chunk:
         sizes = ", ".join(f"{c['key']}:{c['size']:,}" for c in review_chunks)
         print(
             f"   [Large diff] Split review into {len(review_chunks)} chunks "
             f"({sizes}) — each reviewed as its own pass, then merged."
+        )
+    elif len(review_chunks) > 1:
+        # Diff is split-able but small enough to keep whole. Force a single
+        # chunk so the model sees all files together and the report is
+        # synthesized, not concatenated. We rebuild chunked_diff below to
+        # include every hunk — no need to mutate the chunk list itself.
+        print(
+            f"   [Diff {len(cleaned_diff):,} chars, below {CHUNK_THRESHOLD_CHARS:,} "
+            f"threshold] Reviewing as a single pass for cross-file context."
         )
 
     # 5. Compute a single token-budget allocation shared by all prompts.
@@ -985,23 +1125,38 @@ Follow the markdown schema and headers defined in your system prompt."""
         # its 5x exponential-backoff retries a single stuck chunk can burn
         # 40+ minutes. For chunked review we tighten the request timeout AND
         # enforce an outer wall-clock so the whole run can't silently hang.
-        # Respect user --timeout if they passed one; otherwise use the chunk
-        # default (CHUNK_PASS_TIMEOUT_S, 10 min).
-        chunk_request_timeout = (
-            request_timeout if request_timeout is not None else CHUNK_PASS_TIMEOUT_S
+        #
+        # Set CODE_REVIEW_CHUNK_TIMEOUT_S=0 or pass --no-chunk-timeout to disable
+        # the cap entirely — chunks run as long as the model needs (useful for
+        # local 27B+ models where quality > latency and there's no API rate-limit
+        # pressure to escape).
+        chunk_request_timeout = _resolve_chunk_timeout(
+            request_timeout=request_timeout,
+            no_chunk_timeout=no_chunk_timeout,
+            env_timeout_s=CHUNK_PASS_TIMEOUT_S,
         )
         runner.request_timeout = chunk_request_timeout
+
+        # Outer wall-clock guard disabled when timeout is disabled.
+        chunk_budget: float = (
+            float("inf") if chunk_request_timeout is None
+            else chunk_request_timeout * 2
+        )
 
         chunk_reviews: list[dict] = []
         run_start = time.time()
         for idx, chunk in enumerate(review_chunks, 1):
             elapsed = time.time() - run_start
+            timeout_note = (
+                "no per-pass cap"
+                if chunk_request_timeout is None
+                else f"per-pass timeout {chunk_request_timeout}s"
+            )
             print(
                 f"   --- Chunk {idx}/{len(review_chunks)} "
                 f"[{chunk['key']}] ({len(chunk['files'])} files, "
                 f"{chunk['size']:,} chars) "
-                f"[elapsed {elapsed/60:.1f}m, "
-                f"per-pass timeout {chunk_request_timeout}s] ---"
+                f"[elapsed {elapsed/60:.1f}m, {timeout_note}] ---"
             )
             chunk_pass = f"""[Code Review — Chunk {idx}/{len(review_chunks)}]
 Below is the project model map, key source files, MCP live state, project rules, and diff invariants for the whole change, followed by the diff chunk you are responsible for reviewing.
@@ -1035,23 +1190,38 @@ Review ONLY the files shown in this chunk's diff. For each changed file evaluate
 Format as markdown with file paths as headings. Review ONLY your chunk — do not review files from other chunks."""
 
             chunk_t0 = time.time()
-            history = runner.execute_sequence(
-                system_prompt=system_agent_prompt,
-                passes=[chunk_pass],
-                fallback_prompt=None,
+            # Heartbeat only when the cap is disabled. With a cap, the
+            # cap-abort would fire long before any heartbeat — keeping the
+            # output clean for the bounded case.
+            heartbeat_ctx = (
+                _run_with_heartbeat(
+                    label=f"Chunk {idx}/{len(review_chunks)} [{chunk['key']}]",
+                    started_monotonic=time.monotonic(),
+                    interval_s=HEARTBEAT_INTERVAL_S,
+                )
+                if chunk_request_timeout is None
+                else contextlib.nullcontext()
             )
+            with heartbeat_ctx:
+                history = runner.execute_sequence(
+                    system_prompt=system_agent_prompt,
+                    passes=[chunk_pass],
+                    fallback_prompt=None,
+                )
             chunk_elapsed = time.time() - chunk_t0
 
             # Per-chunk wall-clock sanity check. The runner's internal retries
             # can stretch a stuck request past the request_timeout ceiling
             # (5x exponential backoff = ~6x the per-request budget). If a chunk
             # ate >2x its allotted budget we abort the run cleanly with what we
-            # have rather than burning hours on one stuck pass.
-            chunk_budget = chunk_request_timeout * 2
+            # have rather than burning hours on one stuck pass. When the cap is
+            # disabled (CHUNK_PASS_TIMEOUT_S=0) chunk_budget is inf and this
+            # check never fires — chunks run until the model returns.
             if chunk_elapsed > chunk_budget:
                 print(
                     f"\n⛔ CHUNK {idx} exceeded wall-clock budget "
-                    f"({chunk_elapsed/60:.1f}m > {chunk_budget/60:.1f}m). "
+                    f"({chunk_elapsed/60:.1f}m > "
+                    f"{chunk_budget/60:.1f}m). "
                     "Aborting remaining chunks to preserve elapsed work."
                 )
                 print(

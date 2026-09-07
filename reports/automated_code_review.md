@@ -2,269 +2,310 @@
 
 ## 1. Overall Architectural Verdict
 
-**APPROVED WITH CONDITIONS**
+**REQUEST CHANGES**
 
-This PR makes three coherent improvements: (1) renames `SessionCreateSerializer`/`SessionCreateView` to the `CourseSession*` naming convention and adds a proper retrieve/update view with an immutable-`ordinal` update serializer, (2) threads `metadata` through the `SimpleUserResponse` → `SimpleUserResponseSerializer` pipeline so the new metacognitive-awareness analysis can read per-response confidence ratings, and (3) introduces the `MetacognitiveAwarenessResults` scoring engine with comprehensive unit tests. The changes are well-structured and the test coverage is strong. Two conditions must be resolved before merge: the permission-class swap on the create view is a silent behavioral change that needs explicit sign-off, and the unused `serializer_class` on `CourseSessionCreateView` should be reconciled.
+The prompt-preview subsystem is well-structured: a dedicated constants module, a persona-seeding service, a preview service, a serializer with validation, and two admin API views with proper `IsStaffOrSuperUser` gating. The `results_analysis` edits (adding typed substitution keys with legacy aliases, wrapping `gettext` proxies in `str()`) are a clean backward-compatibility improvement. However, the PR **removes an existing setup step** (`ensure_report_baseline_schedules`) from `scripts/setup.sh`, introduces a **race condition** on a shared `PromptTemplate` row in the E2E path, and **silently swallows seeding failures** in the persona service. These must be fixed before merge.
 
 ## 2. Blast Radius & Coupling Assessment
 
-| Changed module | Downstream impact |
-|---|---|
-| `course_serializers.py` – rename `SessionCreateSerializer` → `CourseSessionCreateSerializer` | `content_manage_service.py` import updated in the same diff. The import-graph shows `course_serializers.py` is imported by ~30+ modules (admin, jobs, external adapters, forms). The rename is safe **only if** no other module still imports the old name. The diff updates the one known consumer (`content_manage_service.py`); a grep for `SessionCreateSerializer` across the repo is the only remaining risk. |
-| `response_serializers.py` – adds `metadata` to `SimpleUserResponseSerializer` | This serializer is consumed by `result_analysis.py` (which now passes `metadata=resp.metadata`) and potentially by any view that serialises `UserResponse` in list/detail responses. Adding a field is additive and backward-compatible for consumers that ignore unknown keys, but any client that does strict schema validation on the response will see a new key. |
-| `response_objects.py` – adds `metadata` slot to `SimpleUserResponse` | `__slots__` expansion is safe for existing callers because the new parameter defaults to `None`. `result_analysis.py` is the only construction site updated in this diff. |
-| `results_map.py` – registers `MetacognitiveAwarenessResults` | Adds a new key to the `get_results_class` dispatch dict. No existing key is modified. Safe. |
-| `views/management/content.py` – `SessionCreateView` → `CourseSessionCreateView`, new `CourseSessionRetrieveUpdateView` | `urls/management.py` is updated in the same diff. The old `SessionCreateView` class is removed; any external reference (e.g., a Celery task, a test fixture, a docs link) that imports the old name will break at import time. |
-| `metacognitive_awareness.py` (new) | No existing module imports it except `results_map.py` (added in this diff). Zero blast radius on existing code. |
+| Changed Module | Downstream Impact | Risk |
+|---|---|---|
+| `memores/constants/prompt_preview.py` | Transitively imported by nearly every module (per Pass 1 import-graph). A syntax error or circular import here crashes the entire app at boot. The file imports only from `memores.constants.constants` and `memores.utils.prompt_helpers`, both of which are leaf-level — **no circular risk**. | LOW |
+| `memores/services/prompt_preview_personas.py` | Consumed by the new `PromptPreviewView` and the seeding command. Creates `User`, `UserResponse`, `AnalysisResult`, `Course`, `Question`, `ResponseGroup`, `ResponseOption`, `AnalysableProfileQuestion` rows. A bug here pollutes the DB with synthetic data that can leak into production analytics. | MEDIUM |
+| `memores/services/prompt_preview_service.py` | Imports `_resolve_model_name` (private) from `memores.external.claude_api` and `llm_job` from `memores.jobs.llm_job`. Couples the preview service to the production LLM pipeline. | MEDIUM |
+| `memores/services/results_analysis/*.py` (7 files) | Invoked by `claude_ai_job` / `detailed_report_job` post-analysis. The `str(_("…"))` wrapping and new substitution keys are additive and backward-compatible. | LOW |
+| `memores/serializers/prompt_preview_serializers.py` | Consumed only by `PromptPreviewView`. No upstream impact. | LOW |
+| `memores/urls/admin.py` | Two new routes under the admin namespace. No existing routes modified. | LOW |
+| `memores/utils/prompt_helpers/substitute.py` | Adds `SOCIAL_STYLES` to the substitution registry. Any template using `{{social_styles}}` will now resolve. The f-string change to the log line is cosmetic. | LOW |
+| `scripts/setup.sh` | **Removes** `ensure_report_baseline_schedules` from the dev setup pipeline. All new dev environments will lack report baseline schedules. | **HIGH** |
 
 ## 3. Line-by-Line Code Critiques
 
-### 3.1 `memores/views/management/content.py` — Permission-class swap on create view
+### File: `scripts/setup.sh`
 
-- **File:** `memores/views/management/content.py` — lines ~427–430
-- **Issue Category:** Security / Behavioral Change
-- **The Defect:**
+- **Issue Category:** Regression / Infrastructure
+- **The Defect:** The diff **removes** an existing setup step and replaces it with the new seeder:
   ```diff
-  -class SessionCreateView(APIView):
-  -    permission_classes = (IsAuthenticated, IsCreator)
-  +class CourseSessionCreateView(CreateAPIView):
-  +    permission_classes = (IsAuthenticated, IsContentCreatorUser)
+  -python3 manage.py ensure_report_baseline_schedules
+  +python3 manage.py seed_prompt_preview_personas
   ```
-  The permission class changes from `IsCreator` to `IsContentCreatorUser`. The existing `CourseRetrieveUpdateView` (line ~365 in the same file) still uses `IsCreator`. If `IsCreator` and `IsContentCreatorUser` have different membership (e.g., `IsCreator` includes staff/superuser while `IsContentCreatorUser` does not, or vice-versa), this silently changes who can create sessions. The test `test_session_update_by_staff_returns_200` exercises the *update* path (which uses `IsContentCreatorUser` + `check_object_permission(..., IsCreatorOrStaff)`), but there is **no test that a staff user can *create* a session** through the new `CourseSessionCreateView`.
-- **Remediation:** Add a test that a staff/superuser can POST to `/api/v1/management/content/sessions/` and receives 201. If `IsContentCreatorUser` intentionally excludes staff, document that decision in a comment on the class. If it is a typo or oversight, revert to `IsCreator` to match the course-level view.
+  This means every new developer or CI environment that runs `scripts/setup.sh` will no longer have report baseline schedules created. This is a silent regression that will surface as missing cron-like schedules in dev/staging.
+- **Remediation:** Add the new command *without* removing the existing one:
+  ```diff
+   python3 manage.py migrate
+  +python3 manage.py ensure_report_baseline_schedules
+   python3 manage.py loaddata memores/fixtures/dev_data.yaml
+  +python3 manage.py seed_prompt_preview_personas
+  ```
 
 ---
 
-### 3.2 `memores/views/management/content.py` — Unused `serializer_class` on `CourseSessionCreateView`
+### File: `memores/services/prompt_preview_personas.py`
 
-- **File:** `memores/views/management/content.py` — lines ~431–432
-- **Issue Category:** Maintainability
+- **Line:** `+    except (ValueError, TypeError, KeyError) as e:` (in `_create_responses_for_course`)
+- **Issue Category:** Defensive Engineering / Silent Failure
 - **The Defect:**
-  ```diff
-  +class CourseSessionCreateView(CreateAPIView):
-  +    permission_classes = (IsAuthenticated, IsContentCreatorUser)
-  +    authentication_classes = (TokenAuthentication,)
-  +    queryset = CourseSession.objects.none()
-  +    serializer_class = CourseSessionCreateSerializer
-  ```
-  The `create()` method is fully overridden and calls `create_session_add_to_course(...)` directly, never invoking `self.get_serializer()` or `self.serializer_class`. The `serializer_class` attribute is dead configuration that misleads future readers into thinking the serializer participates in request validation.
-- **Remediation:** Either (a) remove `serializer_class` and `queryset` since neither is consumed, or (b) route the request through the serializer for validation before delegating to the service:
   ```python
-  def create(self, request, *args, **kwargs):
-      session_data = request.data or {}
-      course_id = session_data.get("course_id")
-      serializer = self.get_serializer(data=session_data)
-      serializer.is_valid(raise_exception=True)
-      return create_session_add_to_course(
-          course_id=course_id,
-          name=serializer.validated_data.get("name"),
-          instruction_message=serializer.validated_data.get("instruction_message"),
-          user=request.user,
+  except (ValueError, TypeError, KeyError) as e:
+      logging.warning(
+          f"[prompt_preview] analyze_answers failed course={course.course_key} user={user.id}: {e}"
       )
   ```
-  Option (b) is preferred because it gives the API a validation layer (e.g., `instruction_message` length constraints) that the current bypass skips entirely.
+  The `transaction.atomic()` block correctly rolls back `UserResponse` rows on failure, but the exception is **swallowed** — the caller `ensure_preview_profile` has no way to know that a course failed to seed. The persona will be **partially seeded** (some courses have answers, others don't), and the admin UI will show a preview that silently omits data. Additionally, the `except` tuple omits `django.db.IntegrityError` and `django.db.DatabaseError`, which are the most likely exceptions from a `create()` call.
+- **Remediation:** Either re-raise after logging, or propagate a structured failure signal to the caller:
+  ```python
+  except (ValueError, TypeError, KeyError, IntegrityError, DatabaseError) as e:
+      logging.warning(
+          f"[prompt_preview] analyze_answers failed course={course.course_key} user={user.id}: {e}",
+          exc_info=True,
+      )
+      raise  # let the outer transaction.atomic() in seed_prompt_preview_persona roll back
+  ```
+  If partial seeding is intentional, add a `failed_courses: list[str]` return value so the caller can surface the gap.
 
 ---
 
-### 3.3 `memores/views/management/content.py` — `CourseSessionRetrieveUpdateView.queryset` and soft-delete filtering
-
-- **File:** `memores/views/management/content.py` — line ~451
-- **Issue Category:** Defensive Engineering
-- **The Defect:**
-  ```diff
-  +    queryset = CourseSession.objects.all()
-  ```
-  The test `test_session_retrieve_filters_soft_deleted` asserts that a soft-deleted session returns 404. This only works if `CourseSession.objects` (the default manager) filters `is_deleted=False`. The `SoftDeleteQuerySet` shown in `models.py` overrides `delete()` but does **not** override `all()` or `__iter__` to exclude soft-deleted rows. If the filtering is done in a custom manager (e.g., `SoftDeleteManager.get_queryset()`), this is fine, but the dependency is invisible at the call site.
-- **Remediation:** No code change required if the manager does filter. Add a one-line comment on the `queryset` declaration to make the dependency explicit:
-  ```python
-  # Relies on CourseSession's default manager filtering is_deleted=False
-  queryset = CourseSession.objects.all()
-  ```
-  If the manager does **not** filter, the test will fail and the fix is to use `CourseSession.objects.filter(is_deleted=False)` or a dedicated `active` manager.
+- **Line:** `+    option = ResponseOption.objects.create(text=str(text), sentiment="0")` (in `_ensure_dummy_apq`)
+- **Issue Category:** Data Integrity
+- **The Defect:** `sentiment="0"` is a string literal. The retrieved `conflict_styles.py` source shows `sentiment = int(response.get("sentiment", 1))`, suggesting the field may be an `IntegerField` or a `CharField` that is later cast. If `sentiment` is an `IntegerField`, passing `"0"` will work in SQLite (dev) but may raise `DataError` in PostgreSQL (production) depending on the column type. **UNCERTAIN:** the `ResponseOption` model definition is not in the provided topography or key source files, so I cannot confirm the field type.
+- **Remediation:** Verify the `ResponseOption.sentiment` field type. If it is an `IntegerField`, use `sentiment=0`. If it is a `CharField`, the string is correct but add a comment explaining why.
 
 ---
 
-### 3.4 `memores/services/results_analysis/metacognitive_awareness.py` — `build_explanation_prompt` silently ignores `result_data`
-
-- **File:** `memores/services/results_analysis/metacognitive_awareness.py` — line ~285
-- **Issue Category:** Maintainability
+- **Line:** `+    user, _ = User.objects.get_or_create(` (in `ensure_preview_profile`)
+- **Issue Category:** Concurrency / Data Integrity
 - **The Defect:**
   ```python
-  def build_explanation_prompt(self, result_data: dict, prompt: str) -> str:
-      return substitute_values_into_prompt(prompt, user_profile=self.user)
+  user, _ = User.objects.get_or_create(
+      username=uname,
+      defaults={...},
+  )
+  user.email = defaults["email"]
+  user.is_active = True
+  ...
+  user.save()
   ```
-  The `result_data` parameter is accepted but never read. The test `test_prior_connection_index_placeholder_is_left_unresolved` confirms this is intentional (a phantom metric was removed). However, a future maintainer will likely assume `result_data` is used and add logic that depends on it being populated.
-- **Remediation:** Add a `# noqa`-style comment or use `_` for the unused parameter:
+  The `get_or_create` returns an existing user on the second call, but the code then **unconditionally overwrites** `email`, `is_active`, `user_type`, `first_name`, `last_name`, `gender`, `birthdate`, and `meta`. If a real user somehow has the same username (the `prompt_preview__` prefix makes this unlikely but not impossible), their profile is silently clobbered. The `meta` merge (`meta = dict(user.meta or {})`) is correct, but the top-level fields are not.
+- **Remediation:** Guard the overwrite with a check that the user is a preview persona:
   ```python
-  def build_explanation_prompt(self, result_data: dict, prompt: str) -> str:
-      # result_data is unused: the prior_connection_index metric was removed.
-      # Kept in the signature for BaseTestResults interface compatibility.
-      return substitute_values_into_prompt(prompt, user_profile=self.user)
+  user, created = User.objects.get_or_create(
+      username=uname,
+      defaults={**defaults, "is_active": True, "user_type": UserTypes.APP_USER.value},
+  )
+  if not created:
+      # Only overwrite if this is a known preview persona
+      if (user.meta or {}).get(PREVIEW_META_KEY) != persona.value:
+          raise ValueError(f"Username {uname} is not a preview persona; refusing to overwrite")
   ```
 
 ---
 
-### 3.5 `memores/services/results_analysis/metacognitive_awareness.py` — `normalize` return type vs. `confidence_avg`
+### File: `memores/services/prompt_preview_service.py`
 
-- **File:** `memores/services/results_analysis/metacognitive_awareness.py` — lines ~9–12, ~108
-- **Issue Category:** Correctness (minor)
+- **Line:** `+from memores.external.claude_api import _resolve_model_name`
+- **Issue Category:** Maintainability / Coupling
+- **The Defect:** `_resolve_model_name` is a **private** function (underscore prefix) in `memores.external.claude_api`. Importing it into a separate service module creates a hidden coupling: a rename or signature change in `claude_api.py` will silently break the preview service with no static-analysis warning (mypy/`ruff` typically skip underscore-prefixed cross-module imports).
+- **Remediation:** Either (a) promote `_resolve_model_name` to a public `resolve_model_name` in `claude_api.py`, or (b) duplicate the small resolution logic here with a comment referencing the source. Option (a) is preferred.
+
+---
+
+- **Line:** `+    template, _ = PromptTemplate.objects.get_or_create(` (in `_template_for_e2e`)
+- **Issue Category:** Concurrency / Data Integrity
 - **The Defect:**
   ```python
-  def normalize(score: int, max_score: int) -> int:
+  template, _ = PromptTemplate.objects.get_or_create(
+      name=PREVIEW_E2E_TEMPLATE_NAME,
+      defaults={"prompt": prompt or "preview", "is_active": False},
+  )
+  template.prompt = prompt
+  template.system_prompt = system_prompt or ""
+  template.model = model or template.model
+  template.output_limit = output_limit or template.output_limit or 1000
+  template.output_schema = output_schema
+  template.is_active = False
+  template.save()
+  ```
+  This is a **read-modify-write on a single shared row** (`name="__admin_prompt_preview_e2e__"`). Two concurrent admin preview requests will both `get_or_create` the same row, then both `save()`, with the second overwriting the first's `prompt`/`system_prompt`/`model`. The `llm_job.delay()` call that follows will then execute with whichever `template` object was saved last, not the one the caller intended.
+- **Remediation:** Use a per-request unique name (e.g., include a UUID) or use `select_for_update()` inside a transaction:
+  ```python
+  with transaction.atomic():
+      template, _ = PromptTemplate.objects.select_for_update().get_or_create(
+          name=PREVIEW_E2E_TEMPLATE_NAME,
+          defaults={"prompt": prompt or "preview", "is_active": False},
+      )
+      template.prompt = prompt
       ...
-      return round((score / max_score) * 100)
+      template.save()
   ```
-  `normalize` returns `int`. But `confidence_avg` is computed as:
+  Or, more cleanly, generate a unique template name per request: `name=f"{PREVIEW_E2E_TEMPLATE_NAME}_{uuid.uuid4().hex[:8]}"`.
+
+---
+
+### File: `memores/views/admin/prompt_template.py`
+
+- **Line:** `+        logging.info(` (in `PromptPreviewView.post`)
+- **Issue Category:** Potential ImportError
+- **The Defect:** The diff adds `logging.info(...)` calls in `PromptPreviewView.post` but does **not** add `import logging` to the file's import block. The existing context lines in the diff show imports from `rest_framework`, `memores.models`, `memores.permissions`, and the new service/serializer imports — but no `import logging`. **UNCERTAIN:** the full file may already import `logging` above the diff window. If it does not, this is a `NameError` at runtime.
+- **Remediation:** Verify that `import logging` exists at the top of `memores/views/admin/prompt_template.py`. If not, add it.
+
+---
+
+- **Line:** `+        job_status = get_job_status(job.id)` (in `PromptPreviewView.post`)
+- **Issue Category:** Performance / Latency
+- **The Defect:** After `enqueue_preview_e2e` returns a Celery `AsyncResult`, the view **synchronously** calls `get_job_status(job.id)`. If `get_job_status` polls the broker or waits for a result, this blocks the HTTP request thread. The test mocks this call, so the blocking behavior is untested.
+- **Remediation:** If `get_job_status` is a non-blocking snapshot (reads a cached status), this is acceptable. If it blocks, return the `job.id` immediately and let the client poll via the WebSocket URL (`build_ws_url`). Add a comment documenting the expected latency contract.
+
+---
+
+### File: `memores/serializers/prompt_preview_serializers.py`
+
+- **Line:** `+    preview_persona_key = serializers.CharField()`
+- **Issue Category:** API Contract
+- **The Defect:** The field is a bare `CharField` with a `validate_preview_persona_key` method that checks membership in `{p.value for p in PromptPreviewPersona}`. This is functionally correct but constructs the allowed-set on **every request**. A `ChoiceField(choices=PromptPreviewPersona)` would be more idiomatic and would produce a DRF-standard error message.
+- **Remediation:** This is a style preference, not a bug. The current approach is acceptable. If changing:
   ```python
-  confidence_avg = (confidence_sum / total_questions) if total_questions else 0
+  preview_persona_key = serializers.ChoiceField(choices=PromptPreviewPersona)
   ```
-  This is a **float** (Python 3 true division). The test asserts `self.assertEqual(scores["confidence_avg"], 70.0)`. The `bias_index` is then `round(confidence_avg - accuracy)` where `accuracy` is an `int` from `normalize` and `confidence_avg` is a `float`, so `bias_index` is an `int` (from `round`). This is internally consistent, but the mixed int/float types in the returned `scores` dict (`accuracy: int`, `confidence_avg: float`, `bias_index: int`, `brier_score: float`) will produce inconsistent JSON types depending on the key. This is not a bug but is a minor type-hygiene issue.
-- **Remediation:** No action required unless the consuming LLM prompt template or downstream JSON schema expects uniform types. If uniformity matters, cast `confidence_avg` to `int` or `float` explicitly.
+  and remove `validate_preview_persona_key`.
 
 ---
 
-### 3.6 `memores/serializers/response_serializers.py` — `metadata` field addition
-
-- **File:** `memores/serializers/response_serializers.py` — lines ~82, ~92
-- **Issue Category:** Correctness
-- **The Defect:**
-  ```diff
-  +    metadata = serializers.JSONField(required=False)
-  ```
-  and
-  ```diff
-  +             "metadata",
-  ```
-  This is additive and backward-compatible. The `UserResponse` model must have a `metadata` field (confirmed by the test `UserResponseFactory(metadata=...)` and the `result_analysis.py` change passing `resp.metadata`). Looks correct.
-
----
-
-### 3.7 `memores/serializers/course_serializers.py` — `CourseSessionUpdateSerializer`
-
-- **File:** `memores/serializers/course_serializers.py` — lines ~150–153
-- **Issue Category:** Correctness
-- **The Defect:**
+- **Line:** `+    report_question_type = serializers.CharField(` / `+        default=AnalysableProfileQuestionTypes.BASIC.value,`
+- **Issue Category:** Redundancy
+- **The Defect:** The field has `default=AnalysableProfileQuestionTypes.BASIC.value`, and `validate_report_question_type` also defaults to `AnalysableProfileQuestionTypes.BASIC.value` when the value is blank:
   ```python
-  class CourseSessionUpdateSerializer(serializers.ModelSerializer):
-      class Meta:
-          # ordinal is intentionally immutable post-creation; only the create serializer accepts it.
-          model = CourseSession
-          fields = ["name", "instruction_message"]
+  text = (value or "").strip() or AnalysableProfileQuestionTypes.BASIC.value
   ```
-  The comment clearly documents the design intent. The test `test_session_update_ignores_ordinal_immutability` validates that sending `ordinal: 999` in a PATCH is silently ignored (DRF ignores fields not in `Meta.fields`). Looks correct.
+  The default is applied twice. Not a bug, but the `validate` method's defaulting is dead code when the field's `default` is in effect.
+- **Remediation:** Remove the `default=` from the field declaration and let `validate_report_question_type` be the single source of truth, or remove the `or` fallback in the validator. Minor.
 
 ---
 
-### 3.8 `memores/services/results_analysis/results_map.py` — Registration
+### File: `memores/services/results_analysis/communication_styles.py`
 
-- **File:** `memores/services/results_analysis/results_map.py` — lines ~31–33, ~53
+- **Line:** `+                 "title": str(_("Passive")),` (and 3 similar lines)
 - **Issue Category:** Correctness
-- **The Defect:**
-  ```diff
-  +    from memores.services.results_analysis.metacognitive_awareness import (
-  +        MetacognitiveAwarenessResults,
-  +    )
-  ```
-  and
-  ```diff
-  +        CourseKeys.METACOGNITIVE_AWARENESS: MetacognitiveAwarenessResults,
-  ```
-  The lazy import inside `get_results_class` is consistent with the existing pattern (all other result classes are imported the same way). `CourseKeys.METACOGNITIVE_AWARENESS` must exist in `memores.constants.constants`; the test file uses the string `"metacognitive-awareness"` as the course key, which is consistent. Looks correct.
+- **The Defect:** The diff wraps `title` values in `str()` but the `text` fields in this module are all commented out (e.g., `# "tendencies": ...`). This is consistent — there are no `text` fields to wrap. **Looks correct.**
 
 ---
 
-### 3.9 `memores/services/results_analysis/response_objects.py` — `__slots__` expansion
+### File: `memores/services/results_analysis/conflict_styles.py`
 
-- **File:** `memores/services/results_analysis/response_objects.py` — lines ~13–22
+- **Line:** `+                 "title": str(_("Competing (Forcing/Power-Oriented)")),` and corresponding `text` wraps
 - **Issue Category:** Correctness
-- **The Defect:**
-  ```diff
-  -    __slots__ = ("id", "text", "sentiment", "response")
-  +    __slots__ = ("id", "text", "sentiment", "response", "metadata")
-  ```
-  and
-  ```diff
-  +        metadata: dict | None = None,
-  ```
-  Adding a slot with a `None` default is safe for all existing callers. The `result_analysis.py` change is the only construction site updated. Looks correct.
+- **The Defect:** All five `title` and `text` fields are wrapped in `str()`. This is the correct fix for `gettext` lazy-proxy serialization issues. **Looks correct.**
 
 ---
 
-### 3.10 `memores/urls/management.py` — URL ordering
+### File: `memores/services/results_analysis/big_five.py`, `enneagram.py`, `mbti.py`, `attachment_styles.py`
 
-- **File:** `memores/urls/management.py` — lines ~63–68
-- **Issue Category:** Correctness
-- **The Defect:**
-  ```diff
-  +    path(
-  +         "api/v1/management/content/sessions/<str:session_id>/",
-  +        CourseSessionRetrieveUpdateView.as_view(),
-  +     ),
-      path(
-           "api/v1/management/content/sessions/",
-  -        SessionCreateView.as_view(),
-  +        CourseSessionCreateView.as_view(),
-      ),
-  ```
-  The specific path (with `session_id`) is registered **before** the general path. Django's `URLResolver` matches in order, so this is correct — the detail route won't be shadowed by the list route. Looks correct.
+- **Line:** New substitution keys (`big_five`, `enneagram`, `mbti`, `attachment_styles`) with legacy aliases (`scores`, `results`, `type`, `percentages`)
+- **Issue Category:** Correctness / Maintainability
+- **The Defect:** The pattern is consistent across all four files: add a typed key, keep the legacy key as an alias. The `mbti.py` change also hoists `percentages_text` and `mbti_text` into local variables to avoid recomputing the join in two lambdas. **Looks correct.** The legacy aliases are well-commented.
 
 ---
 
-### 3.11 `memores/services/content_manage_service.py` — Import rename
+### File: `memores/services/results_analysis/love_languages.py`
 
-- **File:** `memores/services/content_manage_service.py` — lines ~25–27, ~354
+- **Line:** `+        return str(love_language_names.get(key, key))`
 - **Issue Category:** Correctness
-- **The Defect:**
-  ```diff
-  -    SessionCreateSerializer,
-  +    CourseSessionCreateSerializer,
+- **The Defect:** Wraps the return in `str()` to handle the `gettext` lazy proxy. **Looks correct.**
+
+---
+
+### File: `memores/utils/prompt_helpers/substitute.py`
+
+- **Line:** `+            f"[prompt_helpers] unresolved placeholders remain: {unresolved}"`
+- **Issue Category:** Minor / Logging
+- **The Defect:** Changes from lazy `%s` formatting to an f-string. The f-string is always constructed even when the log level is below `WARNING`, a negligible cost. Not a bug, but a minor regression in logging hygiene.
+- **Remediation:** Revert to the lazy form:
+  ```python
+  logging.warning("[prompt_helpers] unresolved placeholders remain: %s", unresolved)
   ```
-  and
-  ```diff
-  -    serializer = SessionCreateSerializer(
-  +    serializer = CourseSessionCreateSerializer(
-  ```
-  Straightforward rename. The only consumer of the old name is updated in the same diff. Looks correct.
+
+---
+
+### File: `memores/utils/prompt_helpers/constants.py`
+
+- **Line:** `+    SOCIAL_STYLES = CourseKeys.SOCIAL_STYLES.value`
+- **Issue Category:** Correctness
+- **The Defect:** Adds a new `SubKeys` enum member. The corresponding registry entry in `substitute.py` is also added. **Looks correct.**
+
+---
+
+### File: `memores/urls/admin.py`
+
+- **Line:** New routes for `PromptPreviewPersonasListView` and `PromptPreviewView`
+- **Issue Category:** Correctness
+- **The Defect:** Routes are added under the admin URL namespace. The views declare `permission_classes = (IsAuthenticated, IsStaffOrSuperUser)` and `authentication_classes = (TokenAuthentication,)`. **Looks correct.** No existing routes are modified.
+
+---
+
+### File: `memores/management/commands/seed_prompt_preview_personas.py`
+
+- **Line:** `+        seed_all_prompt_preview_personas()`
+- **Issue Category:** Correctness
+- **The Defect:** Thin wrapper around the service function. The command is idempotent because `ensure_preview_profile` uses `get_or_create` and clears prior state. **Looks correct.**
+
+---
+
+### File: `memores/constants/prompt_preview.py`
+
+- **Line:** Entire new file
+- **Issue Category:** Correctness
+- **The Defect:** The `PromptPreviewPersona` enum, label maps, variant-shift map, and dummy APQ specs are all self-contained. Imports are limited to `memores.constants.constants` and `memores.utils.prompt_helpers` — no circular-import risk. **Looks correct.**
+
+---
+
+### File: `memores/tests/test_prompt_preview.py`
+
+- **Line:** Entire new file (193 lines)
+- **Issue Category:** Test Coverage
+- **The Defect:** The test suite is reasonably comprehensive (auth, happy path, e2e enqueue, model override, unseeded persona, invalid input, personas list, current_user). However:
+  1. **No test for the `execute=True` error path** — what happens if `llm_job.delay` raises? The view has no `try/except` around `enqueue_preview_e2e`, so a Celery broker failure will 500.
+  2. **No test for `PromptPreviewPersonasListView` auth** — `test_preview_requires_staff_profile` tests the POST endpoint, but the GET `/preview-personas/` endpoint's auth is untested.
+  3. **`test_preview_personas_list_includes_labels`** asserts `len(rows) == 10` — a magic number that will break when a persona is added. Acceptable but fragile.
+  4. **No test for the `results_analysis` changes** — the seven `str(_("…"))` wraps and new substitution keys have no corresponding test. A regression in any of the seven modules would go undetected.
+- **Remediation:** Add at minimum:
+  - A test that `execute=True` with a mocked `llm_job.delay` that raises returns a 500 (or a structured error).
+  - A test that an unauthenticated GET to `/preview-personas/` returns 401.
+  - A parametrized test that instantiates each `BaseTestResults` subclass and asserts the new substitution key is present in the output.
 
 ## 4. Test Coverage Assessment
 
-| Changed source file | Test file | Coverage quality |
+| Changed Source File | Test File | Coverage |
 |---|---|---|
-| `metacognitive_awareness.py` (new, 287 lines) | `test_metacognitive_awareness.py` (new, 340 lines) | **Strong.** Covers `normalize` (zero-division, normal case), `build_results` (zero/two/three sessions), all six profile-classification branches (navigator, charger, overclaimer, underclaimer, fog, unclassified), confidence clamping, non-numeric input handling, and `build_explanation_prompt` (placeholder substitution, phantom-metric removal, pass-through). |
-| `response_objects.py` + `response_serializers.py` | `test_result_analysis.py` (added `SimpleUserResponseSerializerTests`) | **Adequate.** Tests populated metadata round-trips through the serializer and that `None` metadata serialises to `null`. |
-| `result_analysis.py` (one-line `metadata=resp.metadata`) | Covered indirectly by `SimpleUserResponseSerializerTests` | **Adequate.** The construction site is exercised. |
-| `results_map.py` (registration) | No direct test | **Acceptable.** The registration is a one-line dict entry; the `MetacognitiveAwarenessResults` class itself is tested. A direct test of `get_results_class(CourseKeys.METACOGNITIVE_AWARENESS)` would be nice-to-have but not critical. |
-| `course_serializers.py` (rename + new update serializer) | `test_content.py` (added 6 tests) | **Strong.** Tests create, retrieve, update, 404, 403-for-other-creator, staff-update, ordinal-immutability, and soft-delete-filtering. |
-| `content.py` (view rename + new view) | `test_content.py` | **Strong** for the new view. **Gap:** no test that a *staff* user can *create* a session (only update is tested for staff). See §3.1. |
-| `urls/management.py` | Covered by `test_content.py` view tests | **Adequate.** |
+| `memores/constants/prompt_preview.py` | `test_prompt_preview.py` | Indirectly tested via persona seeding. No direct unit test of the enum/label maps. Acceptable. |
+| `memores/serializers/prompt_preview_serializers.py` | `test_prompt_preview.py` | Tested via the view (integration). No direct serializer unit test. Acceptable for a thin serializer. |
+| `memores/services/prompt_preview_personas.py` | `test_prompt_preview.py` | `setUp` calls `seed_prompt_preview_persona(EMPTY_PROFILE)`. `test_preview_supporting_questions_include_dummy_basic_answers` seeds `PROFILE_ONLY`. `test_preview_supporting_questions_include_dummy_advanced_on_full` seeds `FULL_1`. **Missing:** `PARTIAL_1/2/3`, `FULL_2/3/4`, and the `CURRENT_USER` raise path. |
+| `memores/services/prompt_preview_service.py` | `test_prompt_preview.py` | `test_preview_e2e_enqueues_llm_job` mocks `llm_job.delay` and `get_job_status`. **Missing:** error path when `llm_job.delay` raises. |
+| `memores/services/results_analysis/*.py` (7 files) | **None** | **No test file for `results_analysis` is in the changed files.** The `str(_("…"))` wraps and new substitution keys are untested. |
+| `memores/views/admin/prompt_template.py` | `test_prompt_preview.py` | Well-covered for the happy path. **Missing:** `execute=True` error path, `PromptPreviewPersonasListView` auth. |
+| `memores/urls/admin.py` | `test_prompt_preview.py` | Routes are exercised by the view tests. Acceptable. |
+| `memores/utils/prompt_helpers/substitute.py` | **None** | The `SOCIAL_STYLES` registry entry and the f-string log change are untested. |
+| `scripts/setup.sh` | N/A | Shell script; not unit-testable. |
 
-**Weak assertion flagged:**
-- In `test_non_numeric_confidence_rating_is_handled_gracefully` (line ~325 of `test_metacognitive_awareness.py`):
-  ```python
-  self.assertIn("confidence_avg", scores)
-  ```
-  This is a tautological key-existence check. The subsequent `assertLessEqual(scores["confidence_avg"], 50)` is the meaningful assertion. The `assertIn` line adds no signal and should be removed or replaced with a concrete value assertion (e.g., `self.assertEqual(scores["confidence_avg"], 40.0)` given one valid rating of 80 and one defaulted to 0 over 2 questions).
+**Assertion quality:** The existing assertions are generally strong — they check response body content (`assertIn("Can we move the review to Friday", data["populatedPrompt"])`), not just status codes. The `test_preview_unseeded_persona_returns_seed_hint` test asserts on the detail message content, which is good. No tautological assertions found.
 
-**Untested edge case:**
-- `CourseSessionRetrieveUpdateView.update()` with a `PUT` (full update, `partial=False`) is not tested. All update tests use `PATCH`. A `PUT` with a missing `instruction_message` should return 400 (since `CourseSessionUpdateSerializer` does not mark it `required=False` explicitly, but `ModelSerializer` defaults to `required=True` for model fields). This is a minor gap.
+**Summary:** The test coverage for the new preview subsystem is solid for the happy path. The gaps are: (1) no tests for the seven `results_analysis` modules, (2) no error-path test for `execute=True`, (3) no auth test for the GET personas endpoint, (4) partial coverage of the nine non-`CURRENT_USER` personas.
 
 ---
 
 ## 5. Automated Claim Verification
 
-Claim Verification: 17/17 verified (100% accuracy)
+Claim Verification: 26/26 verified (100% accuracy)
 
 
 ---
 
 ## 📊 Review Reliability Scores
 
-- architectural_soundness: 4
+- architectural_soundness: 3
 - claim_grounding: 2
-- concision: 3
+- concision: 2
 - confidence_calibration: 3
-- diff_adherence: 3
-- factual_accuracy: 3
-- remediation_utility: 4
+- diff_adherence: 2
+- factual_accuracy: 2
+- remediation_utility: 3
 - test_scrutiny: 4
 - verdict_clarity: 5
